@@ -30,12 +30,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install nuitka pillow zstandard
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
-
-    - name: Install Dependency Walker (Required by Nuitka)
-      run: |
-        choco install depends
-        echo "C:\Program Files (x86)\Dependency Walker" >> $env:GITHUB_PATH
-        
+  
     - name: Build with Nuitka
       # --assume-yes-for-downloads ensures Nuitka downloads MinGW/ccache if needed without hanging
       run: |
