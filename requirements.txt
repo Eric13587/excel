@@ -1,0 +1,6 @@
+PyQt6>=6.4.0
+PyQt6-WebEngine>=6.4.0
+pandas>=1.5.0
+XlsxWriter>=3.0.0
+python-dateutil>=2.8.2
+pyinstaller>=5.0
