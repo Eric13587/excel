@@ -39,6 +39,10 @@ def build():
         "loan.py"                          # Entry Point
     ]
     
+    # Forward any arguments passed to this script (e.g. --assume-yes-for-downloads)
+    if len(sys.argv) > 1:
+        cmd.extend(sys.argv[1:])
+    
     if icon_ico and os.path.exists(icon_ico):
         cmd.append(f"--windows-icon-from-ico={icon_ico}")
 

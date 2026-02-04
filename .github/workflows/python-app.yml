@@ -2,37 +2,44 @@
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: Windows Build
+
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+
 permissions:
   contents: read
+
 jobs:
   build-windows:
     name: Build Windows Application
     runs-on: windows-latest
+
     steps:
     - uses: actions/checkout@v4
     
-    - name: Set up Python 3.9
+    - name: Set up Python 3.10
       uses: actions/setup-python@v3
       with:
-        python-version: "3.9"
+        python-version: "3.10"
         
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # Install build dependencies explicitly
         pip install nuitka pillow zstandard
-        
-        # Install app dependencies
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+    - name: Install Dependency Walker (Required by Nuitka)
+      run: |
+        choco install depends --version=2.2.0.1
+        echo "C:\Program Files (x86)\Dependency Walker" >> $env:GITHUB_PATH
         
     - name: Build with Nuitka
+      # --assume-yes-for-downloads ensures Nuitka downloads MinGW/ccache if needed without hanging
       run: |
-        python build.py
+        python build.py --assume-yes-for-downloads
         
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
