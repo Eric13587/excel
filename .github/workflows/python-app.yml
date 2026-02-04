@@ -33,7 +33,7 @@ jobs:
 
     - name: Install Dependency Walker (Required by Nuitka)
       run: |
-        choco install depends --version=2.2.0.1
+        choco install depends
         echo "C:\Program Files (x86)\Dependency Walker" >> $env:GITHUB_PATH
         
     - name: Build with Nuitka
