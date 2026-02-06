@@ -15,7 +15,7 @@ except ImportError:
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QMessageBox, 
                              QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QWidget)
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QAction, QKeySequence
 from PyQt6.QtCore import Qt, QDate
 
 from .database import DatabaseManager
@@ -104,6 +104,66 @@ class MainApp(QMainWindow):
         self.stack.addWidget(self.ledger_view)
         
         self.show_dashboard()
+        
+        self.create_menus()
+
+    def create_menus(self):
+        """Create application menus."""
+        menubar = self.menuBar()
+        
+        # Global Undo/Redo Actions (No Edit Menu)
+        
+        # Undo Action
+        undo_action = QAction("Undo", self)
+        undo_action.setShortcut(QKeySequence("Ctrl+Alt+Z"))
+        undo_action.setStatusTip("Undo last operation")
+        undo_action.triggered.connect(self.undo_operation)
+        self.addAction(undo_action)
+        
+        # Redo Action
+        redo_action = QAction("Redo", self)
+        redo_action.setShortcut(QKeySequence("Ctrl+Alt+Y"))
+        redo_action.setStatusTip("Redo last operation")
+        redo_action.triggered.connect(self.redo_operation)
+        self.addAction(redo_action)
+
+    def undo_operation(self):
+        """Perform undo."""
+        # Check if engine exists (it should)
+        if hasattr(self.dashboard, 'engine') and self.dashboard.engine:
+            undo_mgr = self.dashboard.engine.undo_manager
+            cmd = undo_mgr.undo() # This returns the command if success, None if stack empty
+            
+            if cmd:
+                QMessageBox.information(self, "Undo", f"Undid: {cmd.description}")
+                # Refresh UI
+                if self.stack.currentWidget() == self.dashboard:
+                    self.dashboard.refresh_list()
+                elif self.stack.currentWidget() == self.ledger_view:
+                    # Refresh ledger logic?
+                    # LedgerView usually needs reload for specific individual.
+                    # We can just check which ledger is open?
+                    # LedgerView has self.current_individual_id
+                    if hasattr(self.ledger_view, 'current_individual_id') and self.ledger_view.current_individual_id:
+                        self.ledger_view.refresh_ledger()
+            else:
+                QMessageBox.information(self, "Undo", "Nothing to undo.")
+
+    def redo_operation(self):
+        """Perform redo."""
+        if hasattr(self.dashboard, 'engine') and self.dashboard.engine:
+            undo_mgr = self.dashboard.engine.undo_manager
+            cmd = undo_mgr.redo()
+            
+            if cmd:
+                QMessageBox.information(self, "Redo", f"Redone: {cmd.description}")
+                if self.stack.currentWidget() == self.dashboard:
+                    self.dashboard.refresh_list()
+                elif self.stack.currentWidget() == self.ledger_view:
+                    if hasattr(self.ledger_view, 'current_individual_id') and self.ledger_view.current_individual_id:
+                        self.ledger_view.refresh_ledger()
+            else:
+                QMessageBox.information(self, "Redo", "Nothing to redo.")
 
     def show_dashboard(self):
         self.dashboard.refresh_list()

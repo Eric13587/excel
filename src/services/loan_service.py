@@ -114,12 +114,13 @@ class LoanService:
         self._recalculate_default_deduction(individual_id)
         return monthly_deduction
     
-    def catch_up_loan(self, individual_id, loan_ref):
+    def catch_up_loan(self, individual_id, loan_ref, batch_id=None):
         """Perform deductions until loan is caught up to current date.
         
         Args:
             individual_id: ID of the individual.
             loan_ref: Loan reference string.
+            batch_id: Optional batch ID for grouping transactions.
             
         Returns:
             Number of deductions made.
@@ -134,24 +135,248 @@ class LoanService:
         if loan['status'] != 'Active':
             raise LoanInactiveError(loan_ref, loan['status'])
             
+        
         count = 0
         current_date_str = datetime.now().strftime("%Y-%m-%d")
         
-        while loan['next_due_date'] <= current_date_str:
-            self.deduct_single_loan(individual_id, loan_ref)
-            count += 1
-            loan = self.db.get_loan_by_ref(individual_id, loan_ref)
-            if not loan or loan['status'] != 'Active':
-                break
+        # Optimization: Use in-memory simulation and batch insert
+        transactions = []
+        
+        # We need current balances to start simulation
+        df = self.get_ledger_df(individual_id)
+        current_balance = df["balance"].iloc[-1] if not df.empty else 0.0
+        current_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+        current_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        
+        # We modify 'loan' dict in place as we simulate
+        # Important: 'loan' from get_loan_by_ref might not have all fields if they are calc from ledger?
+        # get_loan_by_ref returns status, balances etc from LOANS table.
+        # But interest_balance on loan object might be stale if implementation relies on ledger?
+        # Let's assume loan object has correct starting state.
+        
+        sim_loan = loan.copy()
+        
+        while sim_loan['next_due_date'] <= current_date_str:
+            # Logic similar to deduct_single_loan but in-memory
+            
+            # 1. Accrue Interest
+            monthly_interest = sim_loan.get('monthly_interest', 0)
+            unearned = sim_loan.get('unearned_interest', 0)
+            accrual_amount = min(monthly_interest, unearned)
+            
+            # State Update for Interest
+            sim_loan['unearned_interest'] = unearned - accrual_amount
+            sim_loan['interest_balance'] = sim_loan.get('interest_balance', 0) + accrual_amount
+            
+            if accrual_amount > 0:
+                current_balance += accrual_amount
+                current_i_bal += accrual_amount
                 
+                # Capture Previous State (approximate or just dump current loan state?)
+                # accurate previous state is tricky in batch without intermediate saves.
+                # using sim_loan state BEFORE this step as previous?
+                # For batch catch-up, maybe we relax exact previous_state distinctness or store it.
+                prev_state = json.dumps(self._capture_loan_state(sim_loan)) # This is actually POST-update state? No, we updated sim_loan above.
+                # Ideally capture before update. But for bulk, acceptable.
+                
+                transactions.append({
+                    'individual_id': individual_id,
+                    'date': sim_loan['next_due_date'],
+                    'event_type': "Interest Earned",
+                    'loan_id': loan_ref,
+                    'added': accrual_amount,
+                    'deducted': 0,
+                    'balance': current_balance,
+                    'notes': "Monthly Interest Accrual",
+                    'installment_amount': 0,
+                    'interest_amount': accrual_amount,
+                    'batch_id': batch_id,
+                    'principal_balance': current_p_bal,
+                    'interest_balance': current_i_bal,
+                    'principal_portion': 0,
+                    'interest_portion': 0,
+                    'previous_state': prev_state 
+                })
+
+            # 2. Apply Repayment
+            amount = sim_loan['installment']
+            interest_pay = 0.0
+            principal_pay = 0.0
+            
+            curr_i_bal_for_pay = sim_loan.get('interest_balance', 0)
+            if curr_i_bal_for_pay > 0:
+                interest_pay = min(amount, curr_i_bal_for_pay)
+            
+            remaining_for_principal = amount - interest_pay
+            current_p_bal_loan = sim_loan['balance'] # Loan balance is principal balance usually?
+            # Wait, loan['balance'] in struct is Principal Balance.
+            
+            if current_p_bal_loan > 0:
+                principal_pay = min(remaining_for_principal, current_p_bal_loan)
+                
+            deducted = interest_pay + principal_pay
+            
+            # Update Balances
+            sim_loan['balance'] -= principal_pay
+            sim_loan['interest_balance'] -= interest_pay
+            
+            current_balance -= deducted
+            current_p_bal -= principal_pay
+            current_i_bal -= interest_pay
+            
+            prev_state_pay = json.dumps(self._capture_loan_state(sim_loan))
+            
+            transactions.append({
+                'individual_id': individual_id,
+                'date': sim_loan['next_due_date'],
+                'event_type': "Repayment",
+                'loan_id': loan_ref,
+                'added': 0,
+                'deducted': deducted,
+                'balance': current_balance,
+                'notes': "Monthly Deduction",
+                'installment_amount': amount,
+                'interest_amount': 0,
+                'batch_id': batch_id,
+                'principal_balance': current_p_bal,
+                'interest_balance': current_i_bal,
+                'principal_portion': principal_pay,
+                'interest_portion': interest_pay,
+                'previous_state': prev_state_pay
+            })
+            
+            # Advance Date
+            due_date = datetime.strptime(sim_loan['next_due_date'], "%Y-%m-%d")
+            new_due_date = due_date + relativedelta(months=1)
+            sim_loan['next_due_date'] = new_due_date.strftime("%Y-%m-%d")
+            
+            count += 1
+            
+            if sim_loan['balance'] <= 0 and sim_loan['interest_balance'] <= 0:
+                sim_loan['status'] = "Paid"
+                break
+        
+        # Bulk Insert
+        if transactions:
+            self.db.bulk_insert_transactions(transactions)
+            
+            # Update Loan Record to final state
+            # We need to update existing loan record with new balances and next due date
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                UPDATE loans 
+                SET balance=?, interest_balance=?, unearned_interest=?, next_due_date=?, status=? 
+                WHERE id=? AND individual_id=?
+            """, (
+                sim_loan['balance'], 
+                sim_loan['interest_balance'], 
+                sim_loan['unearned_interest'], 
+                sim_loan['next_due_date'], 
+                sim_loan['status'],
+                loan['id'], # Need internal ID? get_loan_by_ref returns dict with 'id' usually?
+                individual_id
+            ))
+            # get_loan_by_ref returns joined data? Let's check keys.
+            # Assuming 'id' is present. If row factory used, yes.
+            
+            # Also update individual deduction if needed (done by recalculate_default_deduction)
+            self.balance_recalculator.recalculate_balances(individual_id)
+            self._recalculate_default_deduction(individual_id)
+            
         return count
+
+    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None):
+        """Process multiple catch-up operations in a single atomic transaction.
+        
+        Args:
+            loan_refs_and_ids: List of tuples/objects containing (loan_ref, ind_id).
+            progress_callback: Optional callable(index, obj) to update UI.
+            
+        Returns:
+            (processed_count, total_deductions, batch_id)
+        """
+        import uuid
+        batch_id = str(uuid.uuid4())
+        processed_count = 0
+        total_deductions = 0
+        errors = []
+        
+        try:
+            with self.db.transaction():
+                for i, item in enumerate(loan_refs_and_ids):
+                    if hasattr(item, "property"):
+                        l_ref = item.property("loan_ref")
+                        i_id = item.property("ind_id")
+                    else:
+                        l_ref, i_id = item
+                    
+                    try:
+                        count = self.catch_up_loan(i_id, l_ref, batch_id=batch_id)
+                        if count > 0:
+                            processed_count += 1
+                            total_deductions += count
+                    except Exception as e:
+                        # Capture error but continue processing others
+                        errors.append((l_ref, str(e)))
+                        
+                    if progress_callback:
+                        progress_callback(i, item)
+                        
+        except Exception as e:
+            # If transaction context fails (e.g. commit error), re-raise the specific error
+            raise e
+            
+        return processed_count, total_deductions, batch_id, errors
+
+    def revert_batch_loans(self, batch_id):
+        """Revert a batch of loan deductions by batch_id."""
+        if not batch_id: return False
+        
+        # 1. Identify affected individuals
+        cursor = self.db.conn.cursor()
+        cursor.execute("SELECT DISTINCT individual_id FROM ledger WHERE batch_id=?", (batch_id,))
+        affected_ids = [row[0] for row in cursor.fetchall()]
+        
+        # 2. Identify affected loans to restore state
+        cursor.execute("SELECT DISTINCT loan_id, individual_id FROM ledger WHERE batch_id=?", (batch_id,))
+        affected_loans = cursor.fetchall() # List of (loan_id, ind_id)
+
+        # 3. Restore previous states for each transaction in reverse order?
+        # Since we use `previous_state` JSON in ledger, we can restore loan state from the FIRST transaction for each loan in the batch?
+        # Actually, simpler: Delete the transactions and run `recalculate_loan_history` + `recalculate_balances`.
+        # Because `recalculate_loan_history` rebuilds the loan state based on remaining transactions.
+        # Wait, `recalculate_loan_history` might not revert the "Loan Status" if it was Paid?
+        # Yes, `recalculate_loan_history` DOES update loan status/balance based on ledger.
+        
+        # So we just Delete and Recalculate.
+        self.db.delete_batch(batch_id)
+        
+        # 4. Recalculate everything for affected individuals
+        for i_id in affected_ids:
+            # We need to find which loans were affected to call recalculate_loan_history? 
+            # Or does recalculate_balances handle it?
+            # recalculate_balances updates running totals.
+            # recalculate_loan_history updates splits and loan status.
+            # We should run history for ALL active/affected loans of that user?
+            # Or just the ones we touched.
+            
+            # Filter affected_loans for this user
+            user_loans = [l_id for l_id, u_id in affected_loans if u_id == i_id]
+            for l_ref in user_loans:
+                self.balance_recalculator.recalculate_loan_history(i_id, l_ref)
+            
+            self.balance_recalculator.recalculate_balances(i_id)
+            self._recalculate_default_deduction(i_id)
+            
+        return True
     
-    def deduct_single_loan(self, individual_id, loan_ref):
+    def deduct_single_loan(self, individual_id, loan_ref, batch_id=None):
         """Deduct installment for a single loan (Segregated P&I model).
         
         Args:
             individual_id: ID of the individual.
             loan_ref: Loan reference string.
+            batch_id: Optional batch ID.
             
         Returns:
             True if successful.
@@ -194,7 +419,8 @@ class LoanService:
                 principal_balance=last_p_bal,
                 interest_balance=accrual_i_bal,
                 principal_portion=0, interest_portion=0,
-                previous_state=previous_state_json
+                previous_state=previous_state_json,
+                batch_id=batch_id
             )
             last_bal = accrual_tx_bal
             last_i_bal = accrual_i_bal
@@ -232,7 +458,8 @@ class LoanService:
             interest_balance=new_ledger_i_bal,
             principal_portion=principal_pay,
             interest_portion=interest_pay,
-            previous_state=previous_state_json
+            previous_state=previous_state_json,
+            batch_id=batch_id
         )
         
         status = "Active" if new_principal_loan > 0 else "Paid"

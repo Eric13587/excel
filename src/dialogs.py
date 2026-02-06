@@ -207,3 +207,122 @@ class ImportDialog(QDialog):
             "import_loans": self.chk_loans.isChecked(),
             "import_savings": self.chk_savings.isChecked()
         }
+
+
+from .data_structures import StatementConfig
+from PyQt6.QtWidgets import QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox
+from PyQt6.QtCore import QDate
+
+class StatementConfigDialog(QDialog):
+    """Dialog for configuring statement generation options."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Generate Statements")
+        self.setMinimumWidth(400)
+        self.layout = QVBoxLayout(self)
+        
+        # 1. Date Range Section
+        date_group = QGroupBox("Period")
+        date_layout = QFormLayout()
+        
+        self.from_date = QDateEdit()
+        self.from_date.setCalendarPopup(True)
+        self.from_date.setDate(QDate.currentDate().addMonths(-1)) # Default 1 month back
+        
+        self.to_date = QDateEdit()
+        self.to_date.setCalendarPopup(True)
+        self.to_date.setDate(QDate.currentDate())
+        
+        date_layout.addRow("From:", self.from_date)
+        date_layout.addRow("To:", self.to_date)
+        date_group.setLayout(date_layout)
+        self.layout.addWidget(date_group)
+        
+        # 2. Options Section
+        opts_group = QGroupBox("Content Options")
+        opts_layout = QVBoxLayout()
+        
+        self.chk_savings = QCheckBox("Include Savings Section")
+        self.chk_savings.setChecked(True)
+        
+        self.chk_gross = QCheckBox("Show Gross Balance Column")
+        self.chk_gross.setChecked(True)
+        self.chk_gross.setToolTip("Show the running gross balance (Principal + Interest) if available")
+        
+        self.chk_notes = QCheckBox("Show Notes Column")
+        self.chk_notes.setChecked(True)
+        
+        opts_layout.addWidget(self.chk_savings)
+        opts_layout.addWidget(self.chk_gross)
+        opts_layout.addWidget(self.chk_notes)
+        opts_group.setLayout(opts_layout)
+        self.layout.addWidget(opts_group)
+        
+        # 3. Column Selection (Advanced)
+        # For now, let's keep it simple: Just checkboxes for optional columns?
+        # The user asked for "specify which column...".
+        # Let's add a list for columns to be explicit.
+        
+        col_group = QGroupBox("Visible Columns")
+        col_layout = QVBoxLayout()
+        self.col_list = QListWidget()
+        self.col_list.setFixedHeight(120)
+        
+        # Default columns from StatementConfig
+        # We need to manually define them here to allow re-ordering or selection
+        # "Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"
+        # "Gross" and "Notes" are controlled by checkboxes above? Or list? 
+        # Overlap. Let's make the checkboxes control the *presence* of key optional columns,
+        # and the list control the *entire* set if they want fine-grained control.
+        # Actually, simplifies to just use the list.
+        
+        all_cols = ["Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"]
+        for col in all_cols:
+            item = QListWidgetItem(col)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.col_list.addItem(item)
+            
+        col_layout.addWidget(self.col_list)
+        col_group.setLayout(col_layout)
+        
+        # Sync logic: Unchecking "Show Gross" unchecks "Gross" in list, etc.
+        self.chk_gross.stateChanged.connect(lambda s: self.set_col_state("Gross", s))
+        self.chk_notes.stateChanged.connect(lambda s: self.set_col_state("Notes", s))
+        
+        # Also list change should update checkbox? Optional.
+        
+        self.layout.addWidget(col_group)
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        self.layout.addWidget(btns)
+        
+    def set_col_state(self, col_name, state):
+        for i in range(self.col_list.count()):
+            item = self.col_list.item(i)
+            if item.text() == col_name:
+                item.setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
+                
+    def get_config(self):
+        """Return (from_date, to_date, StatementConfig)."""
+        f_date = self.from_date.date()
+        t_date = self.to_date.date()
+        
+        # Get columns
+        cols = []
+        for i in range(self.col_list.count()):
+            item = self.col_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                cols.append(item.text())
+        
+        config = StatementConfig(
+            show_savings=self.chk_savings.isChecked(),
+            show_gross_balance=self.chk_gross.isChecked(),
+            show_notes=self.chk_notes.isChecked(),
+            columns=cols
+        )
+        
+        return f_date, t_date, config

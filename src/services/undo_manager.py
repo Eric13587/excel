@@ -504,3 +504,65 @@ class UndoManager:
         """Clear both undo and redo stacks."""
         self._undo_stack.clear()
         self._redo_stack.clear()
+
+
+class MassLoanCatchUpCommand(UndoableCommand):
+    """Command for mass loan catch-up operation."""
+    
+    def __init__(self, loan_service, loan_refs_and_ids, progress_callback=None):
+        self.service = loan_service
+        self.items = loan_refs_and_ids
+        self.callback = progress_callback
+        self.batch_id = None
+        self.result = (0, 0, []) # processed, total, errors
+        
+    @property
+    def description(self) -> str:
+        count = self.result[0] if self.result else "?"
+        errors = len(self.result[2]) if self.result and len(self.result) > 2 else 0
+        desc = f"Mass Loan Deduction ({count} processed"
+        if errors > 0:
+            desc += f", {errors} failed"
+        desc += ")"
+        return desc
+        
+    def execute(self) -> bool:
+        processed, total, batch_id, errors = self.service.mass_catch_up_loans(self.items, self.callback)
+        self.batch_id = batch_id
+        self.result = (processed, total, errors)
+        return True
+            
+    def undo(self) -> bool:
+        if not self.batch_id: return False
+        return self.service.revert_batch_loans(self.batch_id)
+
+
+class MassSavingsCatchUpCommand(UndoableCommand):
+    """Command for mass savings catch-up operation."""
+    
+    def __init__(self, savings_service, ind_ids_or_objects, progress_callback=None):
+        self.service = savings_service
+        self.items = ind_ids_or_objects
+        self.callback = progress_callback
+        self.batch_id = None
+        self.result = (0, 0, [])
+        
+    @property
+    def description(self) -> str:
+        count = self.result[0] if self.result else "?"
+        errors = len(self.result[2]) if self.result and len(self.result) > 2 else 0
+        desc = f"Mass Savings Increment ({count} processed"
+        if errors > 0:
+            desc += f", {errors} failed"
+        desc += ")"
+        return desc
+        
+    def execute(self) -> bool:
+        processed, total, batch_id, errors = self.service.mass_catch_up_savings(self.items, self.callback)
+        self.batch_id = batch_id
+        self.result = (processed, total, errors)
+        return True
+            
+    def undo(self) -> bool:
+        if not self.batch_id: return False
+        return self.service.revert_batch_savings(self.batch_id)

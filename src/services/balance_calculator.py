@@ -49,6 +49,7 @@ class BalanceRecalculator:
             running_balance = 0.0
             running_p = 0.0
             running_i = 0.0
+            running_gross = 0.0
             last_repayment_date = None
             issue_date = None
             
@@ -64,29 +65,38 @@ class BalanceRecalculator:
                 
                 if event == "Loan Issued":
                     running_p += added
+                    running_gross += added * (1 + DEFAULT_INTEREST_RATE)
                     if issue_date is None:
                         issue_date = row['date']
                 elif event == "Loan Top-Up":
                     running_p += added
+                    # Use stored interest amount if available, else derive
+                    interest_amount = float(row.get('interest_amount', 0))
+                    if interest_amount > 0:
+                        running_gross += added + interest_amount
+                    else:
+                        running_gross += added * (1 + DEFAULT_INTEREST_RATE)
                 elif event == "Interest Earned":
                     running_i += added
                 elif event == "Repayment" or event == "Loan Buyoff":
                     running_p -= p_portion
                     running_i -= i_portion
+                    running_gross -= deducted
                     if event == "Repayment":
                         last_repayment_date = row['date']
                 
                 running_balance = running_p + running_i
                 
-                # Check for floating point drift
                 if abs(running_p) < 0.01:
                     running_p = 0
                 if abs(running_i) < 0.01:
                     running_i = 0
                 if abs(running_balance) < 0.01:
                     running_balance = 0
+                if abs(running_gross) < 0.01:
+                    running_gross = 0
                 
-                self.db.update_ledger_balances(row['id'], running_balance, running_p, running_i)
+                self.db.update_ledger_balances(row['id'], running_balance, running_p, running_i, running_gross)
             
             if loan_id != "-" and loan_id is not None:
                 loan = self.db.get_loan_by_ref(individual_id, loan_id)

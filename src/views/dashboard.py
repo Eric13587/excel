@@ -11,7 +11,7 @@ import os
 import sys
 
 
-from ..dialogs import IndividualDialog, ImportDialog
+from ..dialogs import IndividualDialog, ImportDialog, StatementConfigDialog
 from ..theme import ThemeManager
 
 
@@ -589,7 +589,9 @@ class Dashboard(QWidget):
                 break
                 
             progress.setLabelText(f"Generating Statement for {ind[1]}...")
-            if self._statement_generator.generate_pdf_statement(ind[0], ind[1], folder, date_range[0], date_range[1]):
+            success, path, fmt = self._statement_generator.generate_pdf_statement(ind[0], ind[1], folder, date_range[0], date_range[1])
+            
+            if success:
                 count += 1
             progress.setValue(i + 1)
             QApplication.processEvents() # Ensure UI remains responsive
@@ -654,41 +656,38 @@ class Dashboard(QWidget):
         btn_layout.addWidget(clear_btn)
         layout.addLayout(btn_layout)
         
-        # Date range inputs
-        layout.addWidget(QLabel("<b>Statement Period:</b>"))
-        from PyQt6.QtWidgets import QDateEdit
-        from PyQt6.QtCore import QDate
-        
-        date_layout = QHBoxLayout()
-        from_date = QDateEdit()
-        from_date.setCalendarPopup(True)
-        from_date.setDate(QDate.currentDate().addMonths(-12))
-        to_date = QDateEdit()
-        to_date.setCalendarPopup(True)
-        to_date.setDate(QDate.currentDate())
-        date_layout.addWidget(QLabel("From:"))
-        date_layout.addWidget(from_date)
-        date_layout.addWidget(QLabel("To:"))
-        date_layout.addWidget(to_date)
-        layout.addLayout(date_layout)
+        # Date Range removed from here, moving to config dialog
+        # layout.addWidget(QLabel("<b>Statement Period:</b>"))
+        pass
         
         # Helper to handle execution
         self.print_mode = "pdf" # default
+        self.print_config_data = None # Store config here
         
-        def set_mode_and_accept(mode):
+        def set_mode_and_configure(mode):
             self.print_mode = mode
-            dialog.accept()
+            # Open Config Dialog
+            conf_dialog = StatementConfigDialog(dialog)
+            if conf_dialog.exec() == QDialog.DialogCode.Accepted:
+                # Capture data
+                f_date, t_date, config = conf_dialog.get_config()
+                self.print_config_data = {
+                    "from": f_date.toString("yyyy-MM-dd"),
+                    "to": t_date.toString("yyyy-MM-dd"),
+                    "config": config
+                }
+                dialog.accept()
             
-        print_btn = QPushButton("Print Statements")
+        print_btn = QPushButton("Configure & Print")
         # Create Menu
         menu = QMenu(print_btn)
         
         pdf_action = QAction("Print to PDF", dialog)
-        pdf_action.triggered.connect(lambda: set_mode_and_accept("pdf"))
+        pdf_action.triggered.connect(lambda: set_mode_and_configure("pdf"))
         menu.addAction(pdf_action)
         
         excel_action = QAction("Print to Excel", dialog)
-        excel_action.triggered.connect(lambda: set_mode_and_accept("excel"))
+        excel_action.triggered.connect(lambda: set_mode_and_configure("excel"))
         menu.addAction(excel_action)
         
         print_btn.setMenu(menu)
@@ -700,13 +699,14 @@ class Dashboard(QWidget):
         action_layout.addWidget(cancel_btn)
         layout.addLayout(action_layout)
         
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted and self.print_config_data:
             folder = QFileDialog.getExistingDirectory(self, "Select Folder to Save Statements")
             if not folder:
                 return
             
-            from_str = from_date.date().toString("yyyy-MM-dd")
-            to_str = to_date.date().toString("yyyy-MM-dd")
+            from_str = self.print_config_data["from"]
+            to_str = self.print_config_data["to"]
+            config = self.print_config_data["config"]
             
             count = 0
             
@@ -731,9 +731,14 @@ class Dashboard(QWidget):
                     
                     success = False
                     if self.print_mode == "pdf":
-                        success = self._statement_generator.generate_pdf_statement(ind_id, name, folder, from_str, to_str)
+                        # Updated signature returns (success, path, format)
+                        res = self._statement_generator.generate_pdf_statement(ind_id, name, folder, from_str, to_str, config=config)
+                        if isinstance(res, tuple):
+                             success = res[0]
+                        else:
+                             success = res
                     elif self.print_mode == "excel":
-                        success = self._statement_generator.generate_excel_statement(ind_id, name, folder, from_str, to_str)
+                        success = self._statement_generator.generate_excel_statement(ind_id, name, folder, from_str, to_str, config=config)
                         
                     if success:
                         count += 1
@@ -840,6 +845,11 @@ class Dashboard(QWidget):
             layout.addWidget(btns)
             dialog.exec()
             return
+
+        # Filter Input
+        filter_input = QLineEdit()
+        filter_input.setPlaceholderText("Filter by name or loan ref...")
+        layout.addWidget(filter_input)
             
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -874,10 +884,28 @@ class Dashboard(QWidget):
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
         
-        # Select/Deselect All
+        # Filter Logic
+        def filter_items(text):
+            text = text.lower()
+            for cb in checkboxes:
+                if text in cb.text().lower():
+                    cb.setVisible(True)
+                else:
+                    cb.setVisible(False)
+        
+        filter_input.textChanged.connect(filter_items)
+        
+        # Select/Deselect All (Respects Filter)
         btn_layout = QHBoxLayout()
-        sel_all = QPushButton("Select All")
-        sel_all.clicked.connect(lambda: [cb.setChecked(True) for cb in checkboxes if cb.isEnabled()])
+        sel_all = QPushButton("Select All Visible")
+        
+        def select_visible():
+            for cb in checkboxes:
+                if cb.isVisible() and cb.isEnabled():
+                    cb.setChecked(True)
+                    
+        sel_all.clicked.connect(select_visible)
+        
         clr_all = QPushButton("Clear All")
         clr_all.clicked.connect(lambda: [cb.setChecked(False) for cb in checkboxes])
         btn_layout.addWidget(sel_all)
@@ -899,7 +927,7 @@ class Dashboard(QWidget):
                 return
             
             confirm = QMessageBox.question(dialog, "Confirm", 
-                                           f"Are you sure you want to deduct/catch up for {len(selected)} loans?\nThis cannot be easily undone en masse.",
+                                           f"Are you sure you want to deduct/catch up for {len(selected)} loans?\n\nThis can be undone via Edit > Undo.",
                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             
             if confirm == QMessageBox.StandardButton.Yes:
@@ -909,16 +937,51 @@ class Dashboard(QWidget):
                 # Progress bar? For simplicity, synchronous loop.
                 # If list is huge, UI might freeze.
                 
-                for cb in selected:
-                     l_ref = cb.property("loan_ref")
-                     i_id = cb.property("ind_id")
+                # Setup Progress Dialog
+                progress = QProgressDialog("Processing Loans...", "Cancel", 0, len(selected), dialog)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                progress.show()
+
+                def progress_cb(i, cb_item):
+                     if progress.wasCanceled():
+                         # In a real generator/callback, we need to signal stop.
+                         # But here we just break update? 
+                         # Actually if we raise Exception in callback it stops the engine loop?
+                         raise Exception("Operation Canceled by User")
                      
-                     count = engine.catch_up_loan(i_id, l_ref)
-                     if count > 0:
-                         processed_count += 1
-                         total_deductions += count
+                     # Extract name from checkbox text for feedback
+                     # Use selected[i] because cb_item might be normalized tuple/id
+                     current_cb = selected[i]
+                     current_name = current_cb.text().split("|")[0].strip()
+                     progress.setLabelText(f"Processing {current_name}...")
+                     progress.setValue(i + 1)
+                     QApplication.processEvents()
+
+                try:
+                    result = engine.mass_catch_up_loans(selected, progress_cb)
+                    if len(result) == 3:
+                        processed_count, total_deductions, errors = result
+                    else:
+                        processed_count, total_deductions = result
+                        errors = []
+                except Exception as e:
+                    if "Canceled" in str(e):
+                        QMessageBox.information(dialog, "Canceled", "Operation canceled. No changes were made (Transaction Rolled Back).")
+                        progress.close()
+                        return
+                    else:
+                        QMessageBox.critical(dialog, "Error", f"An error occurred: {e}")
+                        progress.close()
+                        return
                 
-                QMessageBox.information(dialog, "Success", f"Process Complete.\nLoans Updated: {processed_count}\nTotal Deduction Transactions: {total_deductions}")
+                progress.close()
+                
+                if errors:
+                    self.show_error_report(errors)
+                
+                QMessageBox.information(dialog, "Result", f"Process Complete.\nLoans Updated: {processed_count}\nTotal Deduction Transactions: {total_deductions}")
                 dialog.accept()
         
         run_btn.clicked.connect(run_process)
@@ -1035,7 +1098,8 @@ class Dashboard(QWidget):
         
         layout.addWidget(QLabel("<b>Select individuals to increment savings:</b>"))
         layout.addWidget(QLabel("Checked individuals will be processed to catch up savings contributions."))
-        layout.addWidget(QLabel("<i>Amt will be auto-detected from each user's last transaction (Deafult: 2500).</i>"))
+        default_amount = self.db.get_setting("default_savings_increment", "2500")
+        layout.addWidget(QLabel(f"<i>Amt will be auto-detected from each user's last transaction (Default: {default_amount}).</i>"))
         
         # Get all individuals
         individuals = self.db.get_individuals()
@@ -1048,6 +1112,11 @@ class Dashboard(QWidget):
             layout.addWidget(btns)
             dialog.exec()
             return
+            
+        # Filter Input
+        filter_input = QLineEdit()
+        filter_input.setPlaceholderText("Filter by name...")
+        layout.addWidget(filter_input)
             
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1085,10 +1154,28 @@ class Dashboard(QWidget):
         scroll.setWidget(scroll_widget)
         layout.addWidget(scroll)
         
+        # Filter Logic
+        def filter_items(text):
+            text = text.lower()
+            for cb in checkboxes:
+                if text in cb.text().lower():
+                    cb.setVisible(True)
+                else:
+                    cb.setVisible(False)
+        
+        filter_input.textChanged.connect(filter_items)
+        
         # Select/Deselect All
         btn_layout = QHBoxLayout()
-        sel_all = QPushButton("Select All")
-        sel_all.clicked.connect(lambda: [cb.setChecked(True) for cb in checkboxes])
+        sel_all = QPushButton("Select All Visible")
+        
+        def select_visible():
+            for cb in checkboxes:
+                if cb.isVisible():
+                    cb.setChecked(True)
+        
+        sel_all.clicked.connect(select_visible)
+        
         clr_all = QPushButton("Clear All")
         clr_all.clicked.connect(lambda: [cb.setChecked(False) for cb in checkboxes])
         btn_layout.addWidget(sel_all)
@@ -1109,22 +1196,65 @@ class Dashboard(QWidget):
                 return
             
             confirm = QMessageBox.question(dialog, "Confirm", 
-                                           f"Are you sure you want to catch up savings for {len(selected)} individuals?\nAmounts will be based on last deposit.",
+                                           f"Are you sure you want to catch up savings for {len(selected)} individuals?\nAmounts will be based on last deposit.\n\nThis can be undone via Edit > Undo.",
                                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             
             if confirm == QMessageBox.StandardButton.Yes:
                 processed_count = 0
                 total_tx = 0
                 
-                for cb in selected:
-                     i_id = cb.property("ind_id")
-                     # Pass None to trigger auto-detection
-                     count = engine.catch_up_savings(i_id, None)
-                     if count > 0:
-                         processed_count += 1
-                         total_tx += count
+                # Setup Progress Dialog
+                progress = QProgressDialog("Processing Savings...", "Cancel", 0, len(selected), dialog)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                progress.show()
+
+                def progress_cb(i, cb_item):
+                     if progress.wasCanceled():
+                         raise Exception("Operation Canceled by User")
+
+                     # Extract name 
+                     # Use selected[i] because cb_item might be normalized tuple/id
+                     current_cb = selected[i]
+                     current_name = current_cb.text().split("(")[0].split("[")[0].strip()
+                     progress.setLabelText(f"Processing {current_name}...")
+                     
+                     progress.setValue(i + 1)
+                     QApplication.processEvents()
+
+                try:
+                    result = engine.mass_catch_up_savings(selected, progress_cb)
+                    if len(result) == 3:
+                        processed_count, total_tx, errors = result
+                    else:
+                        processed_count, total_tx = result
+                        errors = []
+                    
+                    progress.close()
+                    
+                    if errors:
+                        self.show_error_report(errors)
+                    
+                    QMessageBox.information(dialog, "Result", f"Process Complete.\nIndividuals Funded: {processed_count}\nTotal Transactions: {total_tx}")
+                    dialog.accept()
+                except Exception as e:
+                    if "Canceled" in str(e):
+                         QMessageBox.information(dialog, "Canceled", "Operation canceled. No changes were made (Transaction Rolled Back).")
+                         progress.close()
+                         return
+                    else:
+                         QMessageBox.critical(dialog, "Error", f"An error occurred: {e}")
+                         progress.close()
+                         return
                 
-                QMessageBox.information(dialog, "Success", f"Process Complete.\nIndividuals Updated: {processed_count}\nTotal Deposits Created: {total_tx}")
+                progress.close()
+                
+                if total_tx == 0:
+                     QMessageBox.information(dialog, "Up to Date", "Savings are already up to date for selected individuals.")
+                else:    
+                     QMessageBox.information(dialog, "Success", f"Process Complete.\nIndividuals Updated: {processed_count}\nTotal Deposits Created: {total_tx}")
+                
                 dialog.accept()
         
         run_btn.clicked.connect(run_process)
@@ -1236,3 +1366,17 @@ class Dashboard(QWidget):
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An unexpected error occurred: {str(e)}")
+    def show_error_report(self, errors):
+        """Show error report dialog."""
+        if not errors: return
+        
+        msg = f"Operation completed with {len(errors)} errors:\n\n"
+        # Limit to first 10 errors to avoid huge msg box
+        shown_errors = errors[:10]
+        for ref, err in shown_errors:
+            msg += f"- {ref}: {err}\n"
+            
+        if len(errors) > 10:
+            msg += f"\n... and {len(errors) - 10} more."
+            
+        QMessageBox.warning(self, "Partial Failures", msg)

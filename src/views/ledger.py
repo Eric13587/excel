@@ -276,12 +276,17 @@ class LedgerView(QWidget):
             QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 3px; }}
         """)
 
+    def refresh_ledger(self):
+        """Refresh all ledger views (table, active loans, savings)."""
+        if self.current_individual_id:
+            self.refresh_table()
+            self.refresh_loans_list()
+            self.refresh_savings_balance()
+
     def load_individual(self, ind_id, name):
         self.current_individual_id = ind_id
         self.title_label.setText(f"<b>Ledger for {name}</b>")
-        self.refresh_table()
-        self.refresh_loans_list()
-        self.refresh_savings_balance()
+        self.refresh_ledger()
 
 
     def refresh_loans_list(self):
@@ -1004,8 +1009,9 @@ class LedgerView(QWidget):
             if self.engine.undo_transaction_with_state(self.current_individual_id, trans_id):
                 self.refresh_table()
                 self.refresh_loans_list()
-                QMessageBox.information(self, "Deleted", 
-                    f"Transaction deleted. Press Ctrl+Z to restore if needed.")
+                # QMessageBox.information(self, "Deleted", 
+                #     f"Transaction deleted. Press Ctrl+Z to restore if needed.")
+                pass
             else:
                 QMessageBox.warning(self, "Warning", "Failed to undo transaction.")
         except ValueError as e:
@@ -1513,7 +1519,16 @@ class LedgerView(QWidget):
         
         date_input = QDateEdit()
         date_input.setCalendarPopup(True)
-        date_input.setDate(self.main_window.last_operation_date)
+        
+        # Determine default date (use date of last transaction if available)
+        savings_df = self.db.get_savings_transactions(self.current_individual_id)
+        if not savings_df.empty:
+            last_date_str = savings_df.iloc[-1]['date']
+            default_date = QDate.fromString(last_date_str, "yyyy-MM-dd")
+        else:
+            default_date = QDate.currentDate()
+            
+        date_input.setDate(default_date)
         layout.addRow("Date:", date_input)
         
         notes_input = QLineEdit()
