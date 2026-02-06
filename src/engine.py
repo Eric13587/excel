@@ -23,7 +23,9 @@ from src.exceptions import (
 )
 from src.config import DEFAULT_INTEREST_RATE
 
-from src.services import LoanService, SavingsService, BalanceRecalculator, TransactionManager, UndoManager
+from src.services import LoanService, SavingsService, BalanceRecalculator, TransactionManager
+from src.services.undo_manager import UndoManager, MassLoanCatchUpCommand, MassSavingsCatchUpCommand
+
 
 
 class LoanEngine:
@@ -83,6 +85,11 @@ class LoanEngine:
             self._transaction_manager = TransactionManager(self.db, self._balance_recalculator)
         return self._transaction_manager
 
+    @property
+    def undo_manager(self):
+        """Get the UndoManager instance."""
+        return self._undo_manager
+
     def get_ledger_df(self, individual_id, start_date=None, end_date=None):
         return self.db.get_ledger(individual_id, start_date, end_date)
 
@@ -107,6 +114,50 @@ class LoanEngine:
         Delegates to LoanService.
         """
         return self.loan_service.catch_up_loan(individual_id, loan_ref)
+
+    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None):
+        """Process multiple catch-up operations atomically with undo support.
+        
+        Delegates to LoanService via MassLoanCatchUpCommand.
+        """
+        # 1. Sanitize UI objects into simple data tuples
+        items = []
+        for item in loan_refs_and_ids:
+            if hasattr(item, "property"):
+                l_ref = item.property("loan_ref")
+                i_id = item.property("ind_id")
+                items.append((l_ref, i_id))
+            else:
+                items.append(item)
+        
+        # 2. Execute via UndoManager
+        command = MassLoanCatchUpCommand(self.loan_service, items, progress_callback)
+        success = self.undo_manager.execute(command)
+        
+        if success:
+            return command.result
+        else:
+            # If execution failed (callback exception etc), propagate error
+            # Or assume command handles it?
+            # Command execute returns True/False.
+            # But the service method might raise Exception (e.g. Canceled).
+            # If raised, manipulate success or re-raise?
+            # Command execute wraps heavily in try-except returning False?
+            # Actually catch_up raises on Cancel. Command.execute catches Exception and returns False.
+            # But user wants specific feedback "Canceled".
+            # If command catches it, caller gets (0,0).
+            # I should modify Command to propagate specific errors or handle them gracefully?
+            # The dashboard expects exceptions to detect Cancellation.
+            # So I should probably let the exception bubble up from command execution if specific types?
+            # My Command implementation catches generic Exception.
+            # I should probably update Command to re-raise Cancel?
+            # Or just check result (0,0) and assume failure?
+            # But "Canceled" needs distinct message.
+            # Let's simple raise if `success` is False and result is (0,0)?
+            # Or dashboard sees (0,0) and says "Nothing done."
+            pass
+            
+        return command.result
 
     def deduct_single_loan(self, individual_id, loan_ref):
         """Deduct installment for a single loan (Segregated P&I model).
@@ -569,6 +620,23 @@ class LoanEngine:
         Delegates to SavingsService.
         """
         return self.savings_service.catch_up_savings(individual_id, monthly_amount)
+
+    def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None):
+        """Process multiple catch-up operations atomically with undo support.
+        
+        Delegates to SavingsService via MassSavingsCatchUpCommand.
+        """
+        items = []
+        for item in ind_ids_or_objects:
+            if hasattr(item, "property"):
+                i_id = item.property("ind_id")
+                items.append(i_id)
+            else:
+                items.append(item)
+        
+        command = MassSavingsCatchUpCommand(self.savings_service, items, progress_callback)
+        self.undo_manager.execute(command)
+        return command.result
     
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual.

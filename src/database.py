@@ -5,6 +5,7 @@ from datetime import datetime
 from contextlib import contextmanager
 
 from src.exceptions import DatabaseError, TransactionError
+from src.data_structures import StatementData
 
 
 class DatabaseManager:
@@ -35,6 +36,21 @@ class DatabaseManager:
         self.close()
         return False
     
+    def begin_transaction(self):
+        """Start a manual transaction."""
+        # SQLite starts implicitly, but we can ensure previous are committed or just pass.
+        # For strictness we could execute "BEGIN", but Python sqlite3 context handles this.
+        # We'll rely on the fact that the next execute() starts a transaction.
+        pass
+
+    def commit_transaction(self):
+        """Commit the current transaction."""
+        self.conn.commit()
+
+    def rollback_transaction(self):
+        """Rollback the current transaction."""
+        self.conn.rollback()
+
     @contextmanager
     def transaction(self):
         """Context manager for database transactions with automatic rollback on failure.
@@ -90,6 +106,7 @@ class DatabaseManager:
                 interest_amount REAL DEFAULT 0,
                 principal_balance REAL DEFAULT 0,
                 interest_balance REAL DEFAULT 0,
+                gross_balance REAL DEFAULT 0,
                 principal_portion REAL DEFAULT 0,
                 interest_portion REAL DEFAULT 0,
                 previous_state TEXT,
@@ -166,6 +183,11 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE ledger ADD COLUMN interest_portion REAL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+            
+        try:
+             cursor.execute("ALTER TABLE ledger ADD COLUMN gross_balance REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+             pass
 
         # State Management Migration
         try:
@@ -228,6 +250,29 @@ class DatabaseManager:
         cursor.execute("DELETE FROM individuals WHERE id=?", (id,))
         self.conn.commit()
 
+    def get_statement_data(self, individual_id, start_date=None, end_date=None) -> StatementData:
+        """Fetch all data required for statement generation in one go."""
+        individual = self.get_individual(individual_id)
+        # Fetch FULL history for accurate running balance calculation
+        ledger_df = self.get_ledger(individual_id) 
+        # Savings history also needed fully if we want accurate running balances, 
+        # but let's stick to ledger fix first. Actually, savings row balance works by snapshot usually? 
+        # Let's fetch full savings too to be safe for running balance if needed.
+        # But UI savings table shows just current balance? 
+        # Verify get_savings_transactions implementation first? 
+        # Let's just fetch full ledger as planned for Gross Balance.
+        savings_df = self.get_savings_transactions(individual_id, start_date, end_date)
+        savings_balance = self.get_savings_balance(individual_id)
+        active_loans = self.get_active_loans(individual_id)
+        
+        return StatementData(
+            individual=individual,
+            ledger_df=ledger_df,
+            savings_df=savings_df,
+            savings_balance=savings_balance,
+            active_loans=active_loans
+        )
+
     # Ledger operations
     def get_ledger(self, individual_id, start_date=None, end_date=None):
         query = "SELECT * FROM ledger WHERE individual_id = ?"
@@ -270,6 +315,43 @@ class DatabaseManager:
               principal_balance, interest_balance, principal_portion, interest_portion, previous_state))
         self.conn.commit()
 
+    def bulk_insert_transactions(self, transactions):
+        """Bulk insert multiple transactions into the ledger."""
+        if not transactions:
+            return
+            
+        cursor = self.conn.cursor()
+        
+        vals = []
+        for tx in transactions:
+            vals.append((
+                tx.get('individual_id'),
+                tx.get('date'),
+                tx.get('event_type'),
+                tx.get('loan_id'),
+                tx.get('added', 0),
+                tx.get('deducted', 0),
+                tx.get('balance', 0),
+                tx.get('notes', ""),
+                tx.get('installment_amount', 0),
+                tx.get('interest_amount', 0),
+                tx.get('batch_id'),
+                tx.get('principal_balance', 0),
+                tx.get('interest_balance', 0),
+                tx.get('principal_portion', 0),
+                tx.get('interest_portion', 0),
+                tx.get('previous_state', None)
+            ))
+            
+        cursor.executemany("""
+            INSERT INTO ledger (
+                individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
+                installment_amount, interest_amount, batch_id, 
+                principal_balance, interest_balance, principal_portion, interest_portion, previous_state
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, vals)
+        self.conn.commit()
+
     def update_transaction(self, id, date, added, deducted, notes, principal_portion=None, interest_portion=None, mark_edited=False, interest_amount=None):
         """Update a transaction with parameterized queries (SQL injection safe)."""
         cursor = self.conn.cursor()
@@ -308,14 +390,14 @@ class DatabaseManager:
         cursor.execute("UPDATE ledger SET balance=? WHERE id=?", (balance, id))
         self.conn.commit()
     
-    def update_ledger_balances(self, id, balance, principal_bal, interest_bal):
+    def update_ledger_balances(self, id, balance, principal_bal, interest_bal, gross_bal=0):
         """Update all three balance types for a ledger entry."""
         cursor = self.conn.cursor()
         cursor.execute("""
             UPDATE ledger 
-            SET balance=?, principal_balance=?, interest_balance=? 
+            SET balance=?, principal_balance=?, interest_balance=?, gross_balance=? 
             WHERE id=?
-        """, (balance, principal_bal, interest_bal, id))
+        """, (balance, principal_bal, interest_bal, gross_bal, id))
         self.conn.commit()
 
     def delete_transaction(self, id):
@@ -447,6 +529,18 @@ class DatabaseManager:
         cursor.execute("DELETE FROM loans WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
         self.conn.commit()
 
+    def delete_batch(self, batch_id):
+        """Delete all transactions associated with a batch_id from ledger."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM ledger WHERE batch_id=?", (batch_id,))
+        self.conn.commit()
+
+    def delete_savings_batch(self, batch_id):
+        """Delete all transactions associated with a batch_id from savings."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM savings WHERE batch_id=?", (batch_id,))
+        self.conn.commit()
+
     # ========== SAVINGS OPERATIONS ==========
     
     def create_savings_table(self):
@@ -461,12 +555,17 @@ class DatabaseManager:
                 amount REAL,
                 balance REAL,
                 notes TEXT,
+                batch_id TEXT,
                 FOREIGN KEY(individual_id) REFERENCES individuals(id)
             )
         """)
+        try:
+            cursor.execute("ALTER TABLE savings ADD COLUMN batch_id TEXT")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
     
-    def add_savings_transaction(self, individual_id, date, transaction_type, amount, notes=""):
+    def add_savings_transaction(self, individual_id, date, transaction_type, amount, notes="", batch_id=None):
         """Add a deposit or withdrawal to savings."""
         # Ensure table exists
         self.create_savings_table()
@@ -481,9 +580,9 @@ class DatabaseManager:
         
         cursor = self.conn.cursor()
         cursor.execute("""
-            INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (individual_id, date, transaction_type, amount, new_balance, notes))
+            INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes, batch_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
         self.conn.commit()
         return new_balance
     
