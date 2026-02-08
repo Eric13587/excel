@@ -604,6 +604,124 @@ class LoanService:
         self.db.delete_loan(individual_id, loan_ref)
         self.balance_recalculator.recalculate_balances(individual_id)
         self._recalculate_default_deduction(individual_id)
+
+    def buyoff_loan(self, individual_id, loan_ref, date_str=None):
+        """Perform a loan buyoff (settlement).
+        
+        Calculates total outstanding debt (Principal + Interest Balance) and creates
+        a single 'Loan Buyoff' transaction to settle it. Updates status to Paid.
+        
+        Args:
+            individual_id: ID of the individual.
+            loan_ref: Loan reference string.
+            date_str: Optional date string for the transaction. If None, defaults to next due date.
+            
+        Returns:
+            buyoff_amount: The total amount paid to settle the loan.
+            
+        Raises:
+            LoanNotFoundError: If the loan doesn't exist.
+            LoanInactiveError: If the loan is not active.
+        """
+        loan = self.db.get_loan_by_ref(individual_id, loan_ref)
+        if not loan:
+            raise LoanNotFoundError(loan_ref, individual_id)
+        if loan['status'] != 'Active':
+            raise LoanInactiveError(loan_ref, loan['status'])
+            
+        previous_state_json = json.dumps(self._capture_loan_state(loan))
+        
+        # Calculate Total Debt
+        # In segregated model: Principal Balance + Accrued Interest Balance.
+        # Unearned Interest is typically foregone/waived or paid depending on policy.
+        # Standard implementation: Pay Outstanding Principal + Accrued Interest.
+        # Unearned Interest remains unearned (waived).
+        
+        df = self.get_ledger_df(individual_id)
+        
+        # Get latest accurate balances from DataFrame (ledger source of truth)
+        # Note: loan dict might be stale if strict ledger recalculation just happened?
+        # But get_loan_by_ref pulls from DB 'loans' table which should be synced.
+        # Let's trust loan dict for 'principal_balance' concept if it maps to 'balance'.
+        
+        # Ledger way:
+        current_tx_bal = df["balance"].iloc[-1] if not df.empty else 0.0
+        current_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+        current_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        
+        if current_p_bal <= 0 and current_i_bal <= 0:
+            # Already paid?
+            return 0.0
+
+        buyoff_amount = current_p_bal + current_i_bal
+        
+        # consistent with user request: "assume it Occured a month after the last/previous date of deduction"
+        # Since deduction advances next_due_date, using next_due_date satisfies this.
+        if date_str is None:
+            date_str = loan.get('next_due_date')
+            if not date_str:
+                 date_str = datetime.now().strftime("%Y-%m-%d")
+
+        # Step 1: Realize Unearned Future Interest
+        # If we are paying off the full future debt, we must "earn" that interest now.
+        future_interest = loan.get('unearned_interest', 0.0)
+        
+        if future_interest > 0:
+            tr_note = f"Buyoff: Realizing unearned interest"
+            
+            # We need to add this to the ledger so the balance exists to be paid
+            new_tx_bal_1 = current_tx_bal + future_interest
+            new_i_bal_1 = current_i_bal + future_interest
+            
+            self.db.add_transaction(
+                individual_id, date_str, "Interest Earned", loan_ref,
+                future_interest, 0, new_tx_bal_1,
+                tr_note,
+                interest_amount=future_interest,
+                interest_balance=new_i_bal_1,
+                principal_balance=current_p_bal,
+                principal_portion=0,
+                interest_portion=0,
+                previous_state=previous_state_json
+            )
+            
+            # Update local variables for next step
+            current_tx_bal = new_tx_bal_1
+            current_i_bal = new_i_bal_1
+            # principal balance remains same
+
+        buyoff_amount = current_p_bal + current_i_bal
+        
+        new_tx_bal = current_tx_bal - buyoff_amount
+        new_p_bal = 0.0
+        new_i_bal = 0.0
+        
+        self.db.add_transaction(
+            individual_id, date_str, "Loan Buyoff", loan_ref,
+            0, buyoff_amount, new_tx_bal,
+            "Full Loan Settlement (Buyoff)",
+            installment_amount=0,
+            principal_balance=new_p_bal,
+            interest_balance=new_i_bal,
+            principal_portion=current_p_bal,
+            interest_portion=current_i_bal,
+            previous_state=previous_state_json
+        )
+        
+        # Update Loan Status
+        # Status -> Paid
+        # Balance -> 0
+        # Interest Balance -> 0
+        # Unearned Interest -> 0 (Waived/Cleared)
+        
+        self.db.update_loan_status(loan['id'], 0, "", "Paid",
+                                   interest_balance=0,
+                                   unearned_interest=0)
+        
+        self.balance_recalculator.recalculate_balances(individual_id)
+        self._recalculate_default_deduction(individual_id)
+        
+        return buyoff_amount
     
     def _capture_loan_state(self, loan):
         """Capture current loan terms into a dictionary."""

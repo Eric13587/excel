@@ -686,12 +686,8 @@ class LedgerView(QWidget):
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                                        
         if confirm == QMessageBox.StandardButton.Yes:
-            # Optional: Ask for Date? Assumed Today for now or usage of Last Op Date?
-            # Let's use today. OR provide a date picker?
-            # For simplicity: Use main_window.last_operation_date or Today.
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            
-            if self.engine.buyoff_loan(self.current_individual_id, loan_ref, date_str):
+            # Use default date logic (Next Due Date) from LoanService
+            if self.engine.buyoff_loan(self.current_individual_id, loan_ref, None):
                 QMessageBox.information(self, "Success", "Loan Paid Off Successfully!")
                 self.refresh_table()
                 self.refresh_loans_list()
@@ -718,27 +714,37 @@ class LedgerView(QWidget):
         progress.setMinimumDuration(0)
         progress.show()
         
-        success_count = 0
-        for i in range(count):
-            if progress.wasCanceled():
-                break
+        try:
+            success_count = 0
+            for i in range(count):
+                if progress.wasCanceled():
+                    break
+                    
+                progress.setLabelText(f"Deduction {i + 1} of {count}...")
+                if self.engine.deduct_single_loan(self.current_individual_id, loan_ref):
+                    success_count += 1
+                else:
+                    break # Stop if loan finished or error
                 
-            progress.setLabelText(f"Deduction {i + 1} of {count}...")
-            if self.engine.deduct_single_loan(self.current_individual_id, loan_ref):
-                success_count += 1
-            else:
-                break # Stop if loan finished or error
+                progress.setValue(i + 1)
+                QApplication.processEvents()
             
-            progress.setValue(i + 1)
-            QApplication.processEvents()
-        
-        progress.close()
-        
-        if success_count > 0:
-            self.refresh_table()
-            self.refresh_loans_list()
-        else:
-            QMessageBox.warning(self, "Error", "Could not deduct.")
+            progress.close()
+            
+            if success_count > 0:
+                self.refresh_table()
+                self.refresh_loans_list()
+                QMessageBox.information(self, "Success", f"Successfully processed {success_count} deduction(s).")
+            else:
+                QMessageBox.warning(self, "No Effect", "No deductions were processed (Loan might be Paid or fully caught up).")
+                
+        except Exception as e:
+            progress.close()
+            # Check for LoanInactiveError in string representation
+            if "LoanInactiveError" in str(type(e)) or "not active" in str(e).lower():
+                QMessageBox.warning(self, "Loan is Paid", f"Cannot process deduction: Loan is already Paid.")
+            else:
+                 QMessageBox.critical(self, "Error", f"Failed to deduct: {str(e)}")
 
 
     def on_item_changed(self, item):
