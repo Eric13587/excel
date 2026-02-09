@@ -115,7 +115,7 @@ class LoanEngine:
         """
         return self.loan_service.catch_up_loan(individual_id, loan_ref)
 
-    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None):
+    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None, target_date=None):
         """Process multiple catch-up operations atomically with undo support.
         
         Delegates to LoanService via MassLoanCatchUpCommand.
@@ -131,7 +131,7 @@ class LoanEngine:
                 items.append(item)
         
         # 2. Execute via UndoManager
-        command = MassLoanCatchUpCommand(self.loan_service, items, progress_callback)
+        command = MassLoanCatchUpCommand(self.loan_service, items, progress_callback, target_date=target_date)
         success = self.undo_manager.execute(command)
         
         if success:
@@ -371,63 +371,7 @@ class LoanEngine:
         """
         return self.balance_recalculator.recalculate_loan_history(individual_id, loan_ref)
 
-    def update_loan_terms(self, individual_id, loan_ref, new_principal, new_duration, new_interest_rate, new_date_str):
-        """Edit initial conditions of a loan and recompute."""
-        loan = self.db.get_loan_by_ref(individual_id, loan_ref)
-        if not loan: return False
-        
-        # 1. Update Loan Record
-        interest_total = new_principal * new_interest_rate
-        total_repayment = new_principal + interest_total
-        monthly_deduction = math.ceil(total_repayment / new_duration)
-        monthly_interest = math.ceil(interest_total / new_duration)
-        
-        # Calculate Unearned: Total Interest - (Accrued So Far)
-        # We assume history of accruals is valid for the OLD rate/principal until this edit?
-        # OR does the user expect the loan to be redefined from day 1?
-        # User said "edit the initial conditions ... and the recomputation happens".
-        # This implies redefining.
-        # But we can't change history easily.
-        # However, checking accrued so far is the safest way to prevent negative unearned.
-        
-        df = self.get_ledger_df(individual_id)
-        accrued_so_far = df[
-            (df['loan_id'] == loan_ref) & 
-            (df['event_type'] == 'Interest Earned')
-        ]['added'].sum()
-        
-        new_unearned = interest_total - accrued_so_far
-        if new_unearned < 0: new_unearned = 0
-        
-        # Find "Loan Issued" transaction to update Principal "Added"
-        issued_tx = df[(df['loan_id'] == loan_ref) & (df['event_type'] == 'Loan Issued')]
-        
-        if not issued_tx.empty:
-            tx_id = int(issued_tx.iloc[0]['id'])
-            note = f"Principal: {new_principal}, Total Interest: {interest_total} (Edited)"
-            self.db.update_transaction(tx_id, new_date_str, new_principal, 0, note)
-            
-        # Update Loan Object
-        self.db.update_loan_details(
-            loan['id'],
-            total_repayment,
-            0, # placeholder
-            monthly_deduction,
-            monthly_interest,
-            loan['next_due_date'],
-            unearned_interest=new_unearned,
-            principal_update=new_principal
-        )
-        
-        # Recompute historical splits based on new terms
-        self.recalculate_loan_history(individual_id, loan_ref)
-        
-        # Recalculate balances (will be redundant if recalculate_loan_history does it?
-        # But recalculate_balances does the running sum. recalculate_loan_history updates the splits.
-        # We need both.
-        self.recalculate_balances(individual_id)
-        self.recalculate_default_deduction(individual_id)
-        return True
+
 
     def edit_transaction(self, individual_id, trans_id, date, added, deducted, notes, mark_edited=False):
         """Edit a transaction."""
@@ -510,7 +454,7 @@ class LoanEngine:
         """
         return self.savings_service.catch_up_savings(individual_id, monthly_amount)
 
-    def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None):
+    def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None, target_date=None):
         """Process multiple catch-up operations atomically with undo support.
         
         Delegates to SavingsService via MassSavingsCatchUpCommand.
@@ -523,7 +467,7 @@ class LoanEngine:
             else:
                 items.append(item)
         
-        command = MassSavingsCatchUpCommand(self.savings_service, items, progress_callback)
+        command = MassSavingsCatchUpCommand(self.savings_service, items, progress_callback, target_date=target_date)
         self.undo_manager.execute(command)
         return command.result
     

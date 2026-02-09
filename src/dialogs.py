@@ -1,9 +1,10 @@
-"""Dialog components for LoanMaster."""
-import re
 from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton, 
                              QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, 
-                             QFileDialog, QGroupBox)
-from PyQt6.QtCore import Qt
+                             QFileDialog, QGroupBox, QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox,
+                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView)
+from PyQt6.QtCore import Qt, QDate
+from .data_structures import StatementConfig
+import re
 
 
 class IndividualDialog(QDialog):
@@ -209,10 +210,6 @@ class ImportDialog(QDialog):
         }
 
 
-from .data_structures import StatementConfig
-from PyQt6.QtWidgets import QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox
-from PyQt6.QtCore import QDate
-
 class StatementConfigDialog(QDialog):
     """Dialog for configuring statement generation options."""
     
@@ -260,22 +257,10 @@ class StatementConfigDialog(QDialog):
         self.layout.addWidget(opts_group)
         
         # 3. Column Selection (Advanced)
-        # For now, let's keep it simple: Just checkboxes for optional columns?
-        # The user asked for "specify which column...".
-        # Let's add a list for columns to be explicit.
-        
         col_group = QGroupBox("Visible Columns")
         col_layout = QVBoxLayout()
         self.col_list = QListWidget()
         self.col_list.setFixedHeight(120)
-        
-        # Default columns from StatementConfig
-        # We need to manually define them here to allow re-ordering or selection
-        # "Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"
-        # "Gross" and "Notes" are controlled by checkboxes above? Or list? 
-        # Overlap. Let's make the checkboxes control the *presence* of key optional columns,
-        # and the list control the *entire* set if they want fine-grained control.
-        # Actually, simplifies to just use the list.
         
         all_cols = ["Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"]
         for col in all_cols:
@@ -286,11 +271,9 @@ class StatementConfigDialog(QDialog):
         col_layout.addWidget(self.col_list)
         col_group.setLayout(col_layout)
         
-        # Sync logic: Unchecking "Show Gross" unchecks "Gross" in list, etc.
+        # Sync logic
         self.chk_gross.stateChanged.connect(lambda s: self.set_col_state("Gross", s))
         self.chk_notes.stateChanged.connect(lambda s: self.set_col_state("Notes", s))
-        
-        # Also list change should update checkbox? Optional.
         
         self.layout.addWidget(col_group)
         
@@ -326,3 +309,80 @@ class StatementConfigDialog(QDialog):
         )
         
         return f_date, t_date, config
+
+
+class DuplicateResolutionDialog(QDialog):
+    """Dialog to resolve duplicates during import."""
+    
+    def __init__(self, conflicts, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Review Potential Duplicates")
+        self.resize(700, 500)
+        self.conflicts = conflicts
+        self.decision_map = {}
+        
+        layout = QVBoxLayout(self)
+        
+        info = QLabel(f"Found {len(conflicts)} potential duplicates. Please select an action for each.")
+        layout.addWidget(info)
+        
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Source Individual", "Matched Against", "Reason", "Action"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setRowCount(len(conflicts))
+        
+        for row, conflict in enumerate(conflicts):
+            src = conflict['src']
+            matches = conflict['matches']
+            
+            # Source Info
+            src_text = f"{src['name']}\n(ID: {src['id']})"
+            self.table.setItem(row, 0, QTableWidgetItem(src_text))
+            
+            # Match Info (Multi-line if multiple matches)
+            match_texts = []
+            reasons = []
+            for m in matches:
+                match_texts.append(f"{m['name']} (ID: {m['id']})")
+                reasons.append(m.get('reason', 'Match'))
+            
+            self.table.setItem(row, 1, QTableWidgetItem("\n".join(match_texts)))
+            self.table.setItem(row, 2, QTableWidgetItem("\n".join(reasons)))
+            
+            # Action Dropdown
+            combo = QComboBox()
+            combo.addItem("Create New (Keep Both)", "new")
+            combo.addItem("Skip (Do Not Import)", "skip")
+            
+            # Add merge options for each match
+            for m in matches:
+                combo.addItem(f"Merge with {m['name']} (ID: {m['id']})", m['id'])
+                
+            # Default to Merge if exactly 1 match
+            if len(matches) == 1:
+                combo.setCurrentIndex(2) # 0=New, 1=Skip, 2=Merge
+            
+            combo.setProperty("src_id", src['id'])
+            self.table.setCellWidget(row, 3, combo)
+            
+        self.table.resizeRowsToContents()
+        layout.addWidget(self.table)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+    def get_decisions(self):
+        """Return a map of {src_id: action}."""
+        decisions = {}
+        for row in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row, 3)
+            src_id = combo.property("src_id")
+            action = combo.currentData()
+            decisions[src_id] = action
+        return decisions
+

@@ -1,284 +1,194 @@
-# Mass Operations Improvements
+# Import Data Feature - Improvements & Enhancements
 
-An analysis of the mass deduction and mass savings increment functionality in the LoanMaster application.
-
----
-
-## Overview
-
-The mass operations are implemented in two main dialogs:
-- `open_mass_deduction_dialog()` - Mass loan catch-up (lines 827-935 in dashboard.py)
-- `open_mass_savings_dialog()` - Mass savings increment (lines 1035-1139 in dashboard.py)
-
-These delegate to:
-- `LoanService.catch_up_loan()` - Individual loan catch-up
-- `SavingsService.catch_up_savings()` - Individual savings catch-up
+This document outlines potential improvements and enhancements for the **Import Data** feature in LoanMaster.
 
 ---
 
-## 1. No Progress Indicator During Processing
+## 1. Missing Transaction Safety / Rollback on Partial Failure
 
-**Current Issue**: Both mass operations process loans/savings in a synchronous loop without any progress feedback. For large numbers of records, the UI freezes completely.
+**Current Issue:** The `import_selected_data` method commits all changes at the end (`self.conn.commit()`) but if an error occurs mid-import (e.g., after importing individuals but before completing loans), the partial data is lost via `self.conn.rollback()`. However, there's no per-entity transaction handling.
 
-**Location**: `dashboard.py` lines 919-926 (loans) and 1126-1132 (savings)
-
-**Code**:
-```python
-for cb in selected:
-     l_ref = cb.property("loan_ref")
-     i_id = cb.property("ind_id")
-     count = engine.catch_up_loan(i_id, l_ref)
-     # No progress update!
-```
-
-**Improvement**: Add a `QProgressDialog` similar to `batch_print_selected()`. Include `QApplication.processEvents()` calls to keep the UI responsive.
+**Improvement:** 
+- Implement granular checkpoints or savepoints so that if loans fail to import, individuals are still retained.
+- Consider using SQLite's `SAVEPOINT` mechanism.
+- Add a "Partial Import" status return to inform the user exactly what was imported before failure.
 
 ---
 
-## 2. No Transaction Safety (Batch Atomicity)
+## 2. No Progress Indicator for Large Imports
 
-**Current Issue**: Mass operations process each loan/individual independently. If the operation fails midway (e.g., power loss, crash), some records are updated while others are not, leaving the database in an inconsistent state.
+**Current Issue:** The `import_individuals` method in `dashboard.py` performs the entire import synchronously without any progress feedback. For databases with hundreds or thousands of individuals/loans, the UI will freeze.
 
-**Location**: `loan_service.py` `catch_up_loan()` and `savings_service.py` `catch_up_savings()`
-
-**Improvement**: Wrap the entire mass operation in a single database transaction with proper commit/rollback:
-
-```python
-def mass_catch_up_loans(self, loan_refs_and_ids):
-    try:
-        self.db.begin_transaction()
-        for loan_ref, ind_id in loan_refs_and_ids:
-            self.catch_up_loan(ind_id, loan_ref)
-        self.db.commit_transaction()
-    except Exception as e:
-        self.db.rollback_transaction()
-        raise
-```
+**Improvement:**
+- Add a `QProgressDialog` or progress bar showing:
+  - "Importing individuals... (X of Y)"
+  - "Importing loans... (X of Y)"
+  - "Importing ledger entries..."
+- Run the import in a `QThread` to prevent UI blocking.
 
 ---
 
-## 3. No Undo Capability for Mass Operations
+## 3. No Duplicate Detection Beyond Name Matching
 
-**Current Issue**: The warning dialog says "This cannot be easily undone en masse" - there's no undo functionality at all for mass operations.
+**Current Issue:** Duplicates are detected solely by matching `name` strings (case-sensitive). This is fragile:
+- "John Doe" vs "john doe" would create duplicate entries.
+- Different people with the same name would be incorrectly merged.
 
-**Location**: `dashboard.py` line 909
-
-**Improvement**: 
-- Create a `MassOperationCommand` that implements the undo pattern
-- Store the list of affected loans/individuals before execution
-- For undo, either:
-  - Store snapshots of each affected record
-  - Or provide a "reverse" operation (mass delete of auto-generated transactions)
+**Improvement:**
+- Implement case-insensitive name matching as a baseline.
+- Add optional matching by phone or email for more robust deduplication.
+- Show a "Potential Duplicates" review step before importing, letting users choose merge/skip/create-new.
 
 ---
 
-## 4. No Error Handling / Partial Failure Reporting
+## 4. No Conflict Resolution UI for Existing Records
 
-**Current Issue**: If `catch_up_loan()` or `catch_up_savings()` raises an exception for one record, the loop silently continues or crashes. No detailed error report is shown.
+**Current Issue:** When an individual already exists (by name), the import silently uses the existing record's ID without informing the user or allowing them to review the merge.
 
-**Location**: The for-loops don't have try-except blocks around individual operations.
-
-**Improvement**:
-```python
-errors = []
-for cb in selected:
-    try:
-        count = engine.catch_up_loan(i_id, l_ref)
-    except Exception as e:
-        errors.append((l_ref, str(e)))
-        
-if errors:
-    show_error_report_dialog(errors)
-```
+**Improvement:**
+- Add a "Conflict Resolution" step showing:
+  - Source record details vs. existing record details
+  - Options: "Merge", "Skip", "Create as New"
+- Allow users to decide per-record or apply a blanket policy.
 
 ---
 
-## 5. Redundant Database Queries in Mass Savings Dialog
+## 5. No Dry Run / Preview of Changes
 
-**Current Issue**: The mass savings dialog fetches `get_suggested_savings_increment()` for every individual during dialog setup, even for individuals that won't be selected.
+**Current Issue:** Users can only see a list of individuals to import but have no visibility into:
+- Which individuals already exist (will be matched)
+- How many loans/ledger entries will be imported
+- Potential data conflicts
 
-**Location**: `dashboard.py` lines 1072-1086
-
-**Code**:
-```python
-for ind in individuals:
-    bal = self.db.get_savings_balance(ind[0])
-    auto_amt = engine.get_suggested_savings_increment(ind[0])  # Extra query per user!
-```
-
-**Improvement**: 
-- Lazy-load the suggested amount only when the checkbox is hovered or checked
-- Or batch-fetch all amounts in a single optimized query
-- Consider caching with `functools.lru_cache` if the data doesn't change during dialog lifetime
+**Improvement:**
+- Add a "Preview Import" button that shows:
+  - New individuals to be created
+  - Existing individuals that will be matched
+  - Number of loans, ledger entries, and savings records per person
+- Show warnings for any data inconsistencies detected.
 
 ---
 
-## 6. No Date Range Selection for Mass Deduction
+## 6. Savings Import Does Not Recalculate Running Balances
 
-**Current Issue**: Mass deduction always catches up to "today". There's no option to catch up to a specific past date (e.g., end of last quarter for reporting purposes).
+**Current Issue:** When importing savings, the method directly inserts the `balance` value from the source database. If the target database already has savings entries for a matched individual, this creates incorrect running balance sequences.
 
-**Location**: `open_mass_deduction_dialog()` - no date inputs
-
-**Improvement**: Add date range inputs similar to the batch print dialog:
-```python
-# Add to dialog
-from_date_edit = QDateEdit()
-to_date_edit = QDateEdit()  # Default: today
-# Pass to engine
-engine.catch_up_loan_to_date(i_id, l_ref, target_date)
-```
+**Improvement:**
+- After importing savings, call `recalculate_savings_balances(individual_id)` for each affected individual.
+- Alternatively, import only amounts and transaction types, then let the system recalculate all balances.
 
 ---
 
-## 7. No Preview/Dry-Run Mode
+## 7. Loan Reference (ref) Collision Not Handled
 
-**Current Issue**: Users cannot see what transactions will be created before committing. This is risky for financial data.
+**Current Issue:** Loan references are imported as-is. If the target database already has a loan with the same `ref` for an individual, this could cause confusion or data integrity issues (duplicate refs).
 
-**Improvement**: Add a "Preview" button that shows:
-- Number of transactions that will be created per loan
-- Total deduction amounts
-- Projected new balances
-
-```python
-def preview_mass_catch_up(self, loan_refs):
-    results = []
-    for loan_ref, ind_id in loan_refs:
-        count = self._simulate_catch_up(ind_id, loan_ref)
-        results.append({'loan': loan_ref, 'tx_count': count})
-    return results
-```
+**Improvement:**
+- Check for existing loan refs before import.
+- Either:
+  - Append a suffix to the imported ref (e.g., `L-001` → `L-001-IMP`)
+  - Prompt the user to resolve the conflict
+  - Skip loans with duplicate refs and report them
 
 ---
 
-## 8. Inefficient One-by-One Processing in catch_up_loan
+## 8. No Validation of Source Database Schema
 
-**Current Issue**: `catch_up_loan()` processes deductions one-by-one in a while loop, each time:
-1. Fetching the loan from DB
-2. Calling `deduct_single_loan()`
-3. Re-fetching the loan again
+**Current Issue:** The import methods attempt to query expected columns but silently fail or skip data if columns are missing. For example, `default_deduction`, `unearned_interest`, `interest_balance` are all optional with fallbacks to 0.
 
-**Location**: `loan_service.py` lines 137-147
-
-**Code**:
-```python
-while loan['next_due_date'] <= current_date_str:
-    self.deduct_single_loan(individual_id, loan_ref)  # Full roundtrip!
-    count += 1
-    loan = self.db.get_loan_by_ref(individual_id, loan_ref)  # Another query!
-```
-
-**Improvement**: Use batch processing similar to `auto_deduct_range()` in engine.py which processes in-memory and only persists at the end:
-```python
-def catch_up_loan_batch(self, individual_id, loan_ref):
-    loan = self.db.get_loan_by_ref(individual_id, loan_ref)
-    transactions_to_create = []
-    
-    # Simulate all deductions in memory
-    while loan_state['next_due_date'] <= current_date_str:
-        tx = self._simulate_deduction(loan_state)
-        transactions_to_create.append(tx)
-        loan_state = self._apply_deduction(loan_state, tx)
-    
-    # Batch insert all transactions
-    self.db.bulk_insert_transactions(transactions_to_create)
-    # Single loan update
-    self.db.update_loan_status(...)
-```
+**Improvement:**
+- Perform upfront schema validation:
+  - Check source database version or structure
+  - Warn user about missing columns and what data will be defaulted
+- Consider adding a "Database Version" setting that import can check.
 
 ---
 
-## 9. No Filtering/Search in Mass Dialogs
+## 9. No Import Log or Audit Trail
 
-**Current Issue**: Mass deduction dialog shows all active loans in a flat list. For users with many loans, finding specific ones is difficult.
+**Current Issue:** After import completes, users only see summary counts. There's no detailed log of:
+- Which individuals were created vs. matched
+- Which loans were imported and their IDs
+- Any errors or warnings encountered
 
-**Location**: `open_mass_deduction_dialog()` - no filter input (unlike `batch_print_selected()` which has one)
-
-**Improvement**: Add filter input like in other dialogs:
-```python
-filter_input = QLineEdit()
-filter_input.setPlaceholderText("Filter by name or loan ref...")
-filter_input.textChanged.connect(filter_checkboxes)
-```
-
----
-
-## 10. Hardcoded UI Text and Typos
-
-**Current Issue**: 
-- Typo: "Deafult: 2500" should be "Default: 2500"
-- Hardcoded default amount (2500) should come from configuration
-
-**Location**: `dashboard.py` line 1045
-
-**Code**:
-```python
-layout.addWidget(QLabel("<i>Amt will be auto-detected from each user's last transaction (Deafult: 2500).</i>"))
-```
-
-**Improvement**:
-```python
-default_amount = self.db.get_setting("default_savings_increment", "2500")
-layout.addWidget(QLabel(f"<i>Amt will be auto-detected from each user's last transaction (Default: {default_amount}).</i>"))
-```
+**Improvement:**
+- Generate an import log file or display a detailed report dialog.
+- Include:
+  - Timestamp of import
+  - Source file path
+  - Per-entity status (Created/Matched/Skipped/Error)
+- Optionally save to a `logs/` directory.
 
 ---
 
-## 11. BONUS: Missing Catch-Up To Specific Date in SavingsService
+## 10. No Undo for Import Operations
 
-**Current Issue**: `catch_up_savings()` always catches up to `current_month_start`. There's no parameter to catch up to a specific target date.
+**Current Issue:** Once an import is completed, there's no way to undo it. If a user accidentally imports wrong data or from the wrong database, they must manually delete records.
 
-**Location**: `savings_service.py` lines 89-96
-
-**Improvement**: Add an optional `target_date` parameter:
-```python
-def catch_up_savings(self, individual_id, monthly_amount=None, target_date=None):
-    if target_date is None:
-        target_date = datetime.now().replace(day=1)
-    # Use target_date instead of current_month_start
-```
+**Improvement:**
+- Tag all imported records with a `batch_id` (similar to mass operations).
+- Add an "Undo Last Import" action that:
+  - Identifies records by `import_batch_id`
+  - Deletes all imported individuals, loans, ledger entries, and savings
+- Store import metadata in a separate table for tracking.
 
 ---
 
-## 12. BONUS: Engine Creates New Instance Each Time
+## 11. Limited File Format Support
 
-**Current Issue**: Both mass dialogs create a new `LoanEngine` instance inside the dialog method:
+**Current Issue:** Only SQLite `.db` files are supported for import.
 
-**Location**: `dashboard.py` lines 899-900, 1069-1070
-
-**Code**:
-```python
-from ..engine import LoanEngine
-engine = LoanEngine(self.db)
-```
-
-**Improvement**: The Dashboard should have a single shared engine instance to:
-- Avoid redundant initialization
-- Enable shared undo stack across operations
-- Improve memory efficiency
-
-```python
-# In __init__
-self._engine = LoanEngine(self.db)
-
-# In dialogs
-engine = self._engine
-```
+**Improvement:**
+- Add support for:
+  - CSV import with column mapping UI
+  - Excel (`.xlsx`) import using `openpyxl`
+- This would make migration from other systems easier.
 
 ---
 
-## Summary Table
+## 12. No Date Range Filter for Ledger/Savings Import
 
-| # | Issue | Severity | Effort |
-|---|-------|----------|--------|
-| 1 | No progress indicator | High | Low |
-| 2 | No batch transaction safety | Critical | Medium |
-| 3 | No undo capability | High | High |
-| 4 | No error handling/reporting | High | Low |
-| 5 | Redundant DB queries | Medium | Medium |
-| 6 | No date range selection | Medium | Low |
-| 7 | No preview/dry-run | Medium | Medium |
-| 8 | Inefficient one-by-one processing | Medium | High |
-| 9 | No filtering in dialogs | Low | Low |
-| 10 | Hardcoded text/typos | Low | Low |
-| 11 | No target date for savings | Low | Low |
-| 12 | Engine instance per dialog | Low | Low |
+**Current Issue:** When importing loans/ledger, ALL historical transactions are imported. For large databases, this may be unnecessary (e.g., user only wants last 12 months).
+
+**Improvement:**
+- Add date range filters to the `ImportDialog`:
+  - "Import transactions from: [date] to: [date]"
+- Apply these filters when querying the source ledger and savings tables.
+
+---
+
+## 13. Savings Statistics Missing from Import Summary
+
+**Current Issue:** The `import_selected_data` returns a stats dict with `savings` count, but the dashboard's completion message does not display savings:
+```python
+msg += f"Individuals: {count['individuals']}\n"
+msg += f"Loans: {count['loans']}\n"
+msg += f"Ledger Entries: {count['ledger']}"
+# Savings count is ignored!
+```
+
+**Improvement:**
+- Update the success message in `dashboard.py` to include:
+  ```python
+  msg += f"\nSavings Entries: {count['savings']}"
+  ```
+
+---
+
+## Summary
+
+| # | Improvement | Priority |
+|---|-------------|----------|
+| 1 | Transaction Safety / Rollback | High |
+| 2 | Progress Indicator | High |
+| 3 | Better Duplicate Detection | High |
+| 4 | Conflict Resolution UI | Medium |
+| 5 | Dry Run / Preview | High |
+| 6 | Savings Balance Recalculation | Medium |
+| 7 | Loan Ref Collision Handling | Medium |
+| 8 | Schema Validation | Medium |
+| 9 | Import Log / Audit Trail | Medium |
+| 10 | Undo Import Operations | High |
+| 11 | CSV/Excel Import Support | Low |
+| 12 | Date Range Filter | Low |
+| 13 | Savings Stats in Summary | Low |

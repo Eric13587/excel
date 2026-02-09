@@ -198,15 +198,16 @@ class SavingsService:
         return count
 
 
-    def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None):
+    def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None, target_date=None):
         """Process multiple catch-up operations in a single atomic transaction.
         
         Args:
             ind_ids_or_objects: List of ind_ids (integers) OR Qt objects with 'ind_id' property.
             progress_callback: Optional callable(index, obj) to update UI.
+            target_date: Optional limit date for catch-up.
             
         Returns:
-            (processed_count, total_transactions, batch_id)
+            (processed_count, total_transactions, batch_id, errors)
         """
         import uuid
         batch_id = str(uuid.uuid4())
@@ -223,7 +224,7 @@ class SavingsService:
                         i_id = item
                     
                     try:
-                        count = self.catch_up_savings(i_id, None, batch_id=batch_id)
+                        count = self.catch_up_savings(i_id, None, batch_id=batch_id, target_date=target_date)
                         if count > 0:
                             processed_count += 1
                             total_tx += count

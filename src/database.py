@@ -731,17 +731,135 @@ class DatabaseManager:
                 return None
         except Exception:
             return None
-
-    def import_selected_data(self, source_db_path, selected_ids, options):
+    def check_import_conflicts(self, source_db_path, selected_ids):
         """
-        Import ONLY selected individuals from external database.
-        selected_ids: list of source IDs to import.
-        options: dict with keys 'import_loans', 'import_savings'
+        Check for potential duplicates between source and destination DBs.
+        
+        Args:
+            source_db_path: Path to source DB.
+            selected_ids: List of source individual IDs to check.
+            
+        Returns:
+            List of conflict dicts:
+            [
+                {
+                    "src": {"id": 1, "name": "John", "phone": "123", "email": "a@b.com"},
+                    "matches": [
+                        {"id": 5, "name": "john", "phone": "123", "email": "a@b.com", "reasons": ["Name", "Phone"]}
+                    ]
+                }, ...
+            ]
+        """
+        import sqlite3
+        conflicts = []
+        
+        try:
+            # 1. Get Source Data
+            src_conn = sqlite3.connect(source_db_path)
+            src_conn.row_factory = sqlite3.Row
+            src_cur = src_conn.cursor()
+            
+            placeholders = ','.join(['?'] * len(selected_ids))
+            query = f"SELECT id, name, phone, email FROM individuals WHERE id IN ({placeholders})"
+            src_cur.execute(query, selected_ids)
+            src_inds = src_cur.fetchall()
+            src_conn.close()
+            
+            if not src_inds:
+                return []
+
+            # 2. Get Dest Data
+            # Use a local connection to ensure row_factory is set without affecting global state
+            dest_conn = sqlite3.connect(self.db_name)
+            dest_conn.row_factory = sqlite3.Row
+            dest_cur = dest_conn.cursor()
+            
+            try:
+                for src_ind in src_inds:
+                    matches = []
+                    
+                    # Check Name (Case-insensitive)
+                    dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE name LIKE ?", (src_ind['name'],))
+                    name_matches = dest_cur.fetchall()
+                    
+                    for m in name_matches:
+                        matches.append({
+                            "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
+                            "reason": "Name (Case-insensitive)"
+                        })
+
+                    # Check Phone (if exists)
+                    if src_ind['phone']:
+                        # Simple check: exact string match
+                        dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE phone = ?", (src_ind['phone'],))
+                        phone_matches = dest_cur.fetchall()
+                        for m in phone_matches:
+                            # Avoid duplicates in matches list
+                            if not any(x['id'] == m['id'] for x in matches):
+                                matches.append({
+                                    "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
+                                    "reason": "Phone Match"
+                                })
+                            else:
+                                # Update reason if already matched by name
+                                for x in matches:
+                                    if x['id'] == m['id'] and "Phone" not in x['reason']:
+                                        x['reason'] += ", Phone Match"
+
+                    # Check Email (if exists)
+                    if src_ind['email']:
+                         dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE email LIKE ?", (src_ind['email'],))
+                         email_matches = dest_cur.fetchall()
+                         for m in email_matches:
+                            if not any(x['id'] == m['id'] for x in matches):
+                                matches.append({
+                                    "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
+                                    "reason": "Email Match"
+                                })
+                            else:
+                                 for x in matches:
+                                    if x['id'] == m['id'] and "Email" not in x['reason']:
+                                        x['reason'] += ", Email Match"
+                    
+                    if matches:
+                        conflicts.append({
+                            "src": {"id": src_ind['id'], "name": src_ind['name'], "phone": src_ind['phone'], "email": src_ind['email']},
+                            "matches": matches
+                        })
+            finally:
+                dest_conn.close()
+                    
+        except Exception as e:
+            print(f"Error checking conflicts: {e}")
+            return []
+            
+        return conflicts
+
+    def import_selected_data(self, source_db_path, selected_ids, options, progress_callback=None, decision_map=None):
+        """
+        Import ONLY selected individuals from external database with granular checkpoints.
+        
+        Args:
+            source_db_path: Path to source DB
+            selected_ids: List of individual IDs to import
+            options: Dict with import options
+            progress_callback: Callable(current, total, message)
+            decision_map: Dict {src_id: "new" | "skip" | int(dest_id)}
+            
+        Returns a dict:
+        {
+            "status": "success" | "partial" | "failed",
+            "stats": { "individuals": 0, "loans": 0, ... },
+            "errors": ["Error message 1", ...]
+        }
         """
         import sqlite3
         
         # summary stats
         stats = {"individuals": 0, "loans": 0, "ledger": 0, "savings": 0}
+        errors = []
+        status = "success"
+        src_conn = None
         
         try:
             # Connect to Source
@@ -749,66 +867,130 @@ class DatabaseManager:
             src_conn.row_factory = sqlite3.Row
             src_cur = src_conn.cursor()
             
-            # 1. Map Individuals
+            # Pre-check tables existence/creation to avoid DDL inside transaction
+            if options.get("import_savings", False):
+                self.create_savings_table()
+
+            # --- PHASE 1: INDIVIDUALS ---
             try:
                 # Filter by selected_ids
                 if not selected_ids:
-                    return stats 
+                    return {"status": "success", "stats": stats, "errors": []}
                     
                 placeholders = ','.join(['?'] * len(selected_ids))
                 query = f"SELECT * FROM individuals WHERE id IN ({placeholders})"
                 src_cur.execute(query, selected_ids)
                 src_inds = src_cur.fetchall()
-            except sqlite3.OperationalError:
-                src_conn.close()
-                return -1
+            except sqlite3.OperationalError as e:
+                if src_conn: src_conn.close()
+                return {"status": "failed", "stats": stats, "errors": [f"Source DB Error: {e}"]}
+            
+            # Start Manual Transaction
+            original_isolation = self.conn.isolation_level
+            self.conn.isolation_level = None 
+            
+            dest_cur = self.conn.cursor()
+            dest_cur.execute("BEGIN") # Start transaction explicitly
+            dest_cur.execute("SAVEPOINT import_start")
             
             # Map Source ID -> Dest ID
             id_map = {} 
             
-            # Get current individuals to check for duplicates
-            dest_cur = self.conn.cursor()
+            # Get current individuals for fallback matching
             dest_cur.execute("SELECT name, id FROM individuals")
             existing_inds = {row[0]: row[1] for row in dest_cur.fetchall()}
             
-            for src_ind in src_inds:
-                name = src_ind['name']
-                src_id = src_ind['id']
-                
-                if name in existing_inds:
-                    # Match existing
-                    id_map[src_id] = existing_inds[name]
-                else:
-                    # Create new
-                    phone = src_ind['phone'] if src_ind['phone'] else ""
-                    email = src_ind['email'] if src_ind['email'] else ""
-                    # Handle handle missing column in older DBs gracefully or use dict get
-                    keys = src_ind.keys()
-                    def_ded = src_ind['default_deduction'] if 'default_deduction' in keys and src_ind['default_deduction'] else 0
-                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    dest_cur.execute("""
-                        INSERT INTO individuals (name, phone, email, default_deduction, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (name, phone, email, def_ded, created_at))
-                    new_id = dest_cur.lastrowid
-                    id_map[src_id] = new_id
-                    stats["individuals"] += 1
+            # Estimate Total Steps
+            total_steps = len(src_inds) 
             
-            # 2. Import Loans & Ledger
+            # Let's query counts first for better progress bar
+            loan_count = 0
+            ledger_count = 0
+            savings_count = 0
+            
             if options.get("import_loans", False):
-                loan_id_map = {} # Source Loan ID -> Dest Loan ID
-                
-                # --- Loans ---
                 try:
-                    # We need to filter loans that belong to selected individuals
-                    # If we filtered src_inds, id_map only contains selected keys.
-                    # So we can just check if individual_id is in id_map.
+                    src_cur.execute("SELECT COUNT(*) FROM loans")
+                    loan_count = src_cur.fetchone()[0]
+                    src_cur.execute("SELECT COUNT(*) FROM ledger")
+                    ledger_count = src_cur.fetchone()[0]
+                except: pass
+            
+            if options.get("import_savings", False):
+                 try:
+                    src_cur.execute("SELECT COUNT(*) FROM savings")
+                    savings_count = src_cur.fetchone()[0]
+                 except: pass
+
+            total_operations = len(src_inds) + loan_count + ledger_count + savings_count
+            current_op = 0
+            
+            try:
+                for i, src_ind in enumerate(src_inds):
+                    if progress_callback:
+                        progress_callback(current_op, total_operations, f"Importing Individual: {src_ind['name']}")
                     
+                    name = src_ind['name']
+                    src_id = src_ind['id']
+                    
+                    # Determine Action
+                    action = "new"
+                    if decision_map and src_id in decision_map:
+                        action = decision_map[src_id]
+                    elif name in existing_inds:
+                        # Fallback: Merge by exact name
+                        action = existing_inds[name]
+                    
+                    if action == "skip":
+                        current_op += 1
+                        continue
+                        
+                    if isinstance(action, int):
+                        # Merge with existing
+                        id_map[src_id] = action
+                        # stats["individuals"] += 1 # Count merged as imported? Maybe no.
+                    else:
+                        # Create new
+                        phone = src_ind['phone'] if src_ind['phone'] else ""
+                        email = src_ind['email'] if src_ind['email'] else ""
+                        keys = src_ind.keys()
+                        def_ded = src_ind['default_deduction'] if 'default_deduction' in keys and src_ind['default_deduction'] else 0
+                        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        dest_cur.execute("""
+                            INSERT INTO individuals (name, phone, email, default_deduction, created_at)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (name, phone, email, def_ded, created_at))
+                        new_id = dest_cur.lastrowid
+                        id_map[src_id] = new_id
+                        stats["individuals"] += 1
+                    
+                    current_op += 1
+                
+                # Checkpoint: Individuals Imported Successfully
+                dest_cur.execute("SAVEPOINT individuals_imported")
+                
+            except Exception as e:
+                dest_cur.execute("ROLLBACK TO import_start")
+                self.conn.commit() # Nothing happened effectively
+                self.conn.isolation_level = original_isolation # Restore
+                if src_conn: src_conn.close()
+                print(f"Import Error (Individuals): {e}")
+                return {"status": "failed", "stats": stats, "errors": [f"Failed to import individuals: {e}"]}
+
+            # --- PHASE 2: LOANS & LEDGER ---
+            if options.get("import_loans", False):
+                try:
+                    loan_id_map = {} # Source Loan ID -> Dest Loan ID
+                    
+                    # --- Loans ---
                     src_cur.execute("SELECT * FROM loans")
                     src_loans = src_cur.fetchall()
                     
                     for ln in src_loans:
+                        if progress_callback and current_op % 5 == 0:
+                             progress_callback(current_op, total_operations, "Importing Loans...")
+                        
                         old_ind_id = ln['individual_id']
                         if old_ind_id not in id_map:
                             continue 
@@ -835,68 +1017,75 @@ class DatabaseManager:
                         new_loan_id = dest_cur.lastrowid
                         loan_id_map[src_loan_id] = new_loan_id
                         stats["loans"] += 1
+                        current_op += 1
                         
-                except sqlite3.OperationalError:
-                     pass # Table might not exist in source
+                    # --- Ledger ---
+                    try:
+                        src_cur.execute("SELECT * FROM ledger")
+                        src_entries = src_cur.fetchall()
+                        
+                        for entry in src_entries:
+                            if progress_callback and current_op % 10 == 0:
+                                 progress_callback(current_op, total_operations, "Importing Ledger...")
+                                 
+                            old_ind_id = entry['individual_id']
+                            if old_ind_id not in id_map:
+                                continue
+                            
+                            new_ind_id = id_map[old_ind_id]
+                            
+                            # Handle Loan ID mapping
+                            old_loan_id = entry['loan_id']
+                            new_loan_id_val = None
+                            
+                            try:
+                                old_lid_int = int(old_loan_id)
+                                if old_lid_int in loan_id_map:
+                                    new_loan_id_val = str(loan_id_map[old_lid_int])
+                            except (ValueError, TypeError):
+                                new_loan_id_val = old_loan_id
+                            
+                            keys = entry.keys()
+                            inst_amt = entry['installment_amount'] if 'installment_amount' in keys and entry['installment_amount'] else 0
+                            batch_id = entry['batch_id'] if 'batch_id' in keys else None
+                            int_amt = entry['interest_amount'] if 'interest_amount' in keys and entry['interest_amount'] else 0
+                            p_bal = entry['principal_balance'] if 'principal_balance' in keys and entry['principal_balance'] else 0
+                            i_bal = entry['interest_balance'] if 'interest_balance' in keys and entry['interest_balance'] else 0
+                            p_port = entry['principal_portion'] if 'principal_portion' in keys and entry['principal_portion'] else 0
+                            i_port = entry['interest_portion'] if 'interest_portion' in keys and entry['interest_portion'] else 0
+                            
+                            dest_cur.execute("""
+                                INSERT INTO ledger (
+                                    individual_id, date, event_type, loan_id, added, deducted, balance, notes,
+                                    installment_amount, batch_id, interest_amount,
+                                    principal_balance, interest_balance, principal_portion, interest_portion
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                new_ind_id, entry['date'], entry['event_type'], new_loan_id_val, 
+                                entry['added'], entry['deducted'], entry['balance'], entry['notes'],
+                                inst_amt, batch_id, int_amt,
+                                p_bal, i_bal, p_port, i_port
+                            ))
+                            stats["ledger"] += 1
+                            current_op += 1
+                    except sqlite3.OperationalError:
+                        pass # Ledger might be missing or different schema in very old backups
 
-                # --- Ledger ---
-                try:
-                    src_cur.execute("SELECT * FROM ledger")
-                    src_entries = src_cur.fetchall()
-                    
-                    for entry in src_entries:
-                        old_ind_id = entry['individual_id']
-                        if old_ind_id not in id_map:
-                            continue
+                    # Checkpoint: Loans & Ledger Imported
+                    dest_cur.execute("SAVEPOINT loans_imported")
                         
-                        new_ind_id = id_map[old_ind_id]
-                        
-                        # Handle Loan ID mapping
-                        old_loan_id = entry['loan_id']
-                        new_loan_id_val = None
-                        
-                        # Check if loan_id is an integer (standard ID) or text
-                        # We try to map it if it exists in our loan_map
-                        try:
-                            old_lid_int = int(old_loan_id)
-                            if old_lid_int in loan_id_map:
-                                new_loan_id_val = str(loan_id_map[old_lid_int])
-                        except (ValueError, TypeError):
-                            # It might be None or a string ref that we can't map easily if it's not an ID
-                            # or it's a legacy generic entry. Keep as is or None?
-                            # If it's a loan payment, we need the link.
-                            new_loan_id_val = old_loan_id
-                        
-                        keys = entry.keys()
-                        # handle optional columns
-                        inst_amt = entry['installment_amount'] if 'installment_amount' in keys and entry['installment_amount'] else 0
-                        batch_id = entry['batch_id'] if 'batch_id' in keys else None
-                        int_amt = entry['interest_amount'] if 'interest_amount' in keys and entry['interest_amount'] else 0
-                        p_bal = entry['principal_balance'] if 'principal_balance' in keys and entry['principal_balance'] else 0
-                        i_bal = entry['interest_balance'] if 'interest_balance' in keys and entry['interest_balance'] else 0
-                        p_port = entry['principal_portion'] if 'principal_portion' in keys and entry['principal_portion'] else 0
-                        i_port = entry['interest_portion'] if 'interest_portion' in keys and entry['interest_portion'] else 0
-                        
-                        dest_cur.execute("""
-                            INSERT INTO ledger (
-                                individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-                                installment_amount, batch_id, interest_amount,
-                                principal_balance, interest_balance, principal_portion, interest_portion
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            new_ind_id, entry['date'], entry['event_type'], new_loan_id_val, 
-                            entry['added'], entry['deducted'], entry['balance'], entry['notes'],
-                            inst_amt, batch_id, int_amt,
-                            p_bal, i_bal, p_port, i_port
-                        ))
-                        stats["ledger"] += 1
-                        
-                except sqlite3.OperationalError:
-                     pass
+                except Exception as e:
+                    # Partial Failure: Rollback loans but KEEP individuals
+                    dest_cur.execute("ROLLBACK TO individuals_imported") 
+                    status = "partial"
+                    errors.append(f"Failed to import loans/ledger: {e}")
+                    stats["loans"] = 0
+                    stats["ledger"] = 0
+                    print(f"Import Error (Loans): {e}")
 
-            # 3. Import Savings
+            # --- PHASE 3: SAVINGS ---
             if options.get("import_savings", False):
-                self.create_savings_table() # Ensure table exists
+                # self.create_savings_table() # MOVED TO START to avoid DDL commit
                 try:
                     # Check for savings table
                     src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='savings'")
@@ -905,6 +1094,9 @@ class DatabaseManager:
                         src_savings = src_cur.fetchall()
                         
                         for sav in src_savings:
+                            if progress_callback and current_op % 5 == 0:
+                                 progress_callback(current_op, total_operations, "Importing Savings...")
+                                 
                             old_ind_id = sav['individual_id']
                             if old_ind_id not in id_map:
                                 continue
@@ -915,19 +1107,54 @@ class DatabaseManager:
                                 VALUES (?, ?, ?, ?, ?, ?)
                             """, (new_ind_id, sav['date'], sav['transaction_type'], sav['amount'], sav['balance'], sav['notes']))
                             stats["savings"] += 1
-                except sqlite3.OperationalError:
-                    pass
+                            current_op += 1
+                        
+                        # Checkpoint: Savings Imported
+                        dest_cur.execute("SAVEPOINT savings_imported")
+                        
+                except Exception as e:
+                    # Partial Failure recovery
+                    # Rollback to just before savings started
+                    # This depends on if loans succeeded or not.
+                    # Simple approach: Release 'loans_imported' if we made it there?
+                    # SQLite SAVEPOINTs stack.
+                    # If we are here, we failed savings phase.
+                    # We want to keep everything before this phase.
+                    
+                    if status == "success" and options.get("import_loans", False):
+                         # Loans succeeded
+                         dest_cur.execute("ROLLBACK TO loans_imported")
+                    else:
+                         # Loans failed OR were not attempted, so rollback to individuals
+                         dest_cur.execute("ROLLBACK TO individuals_imported")
+                         
+                    status = "partial"
+                    errors.append(f"Failed to import savings: {e}")
+                    stats["savings"] = 0
+                    print(f"Import Error (Savings): {e}")
             
+            # Final Commit - Release the initial savepoint and commit the transaction
+            dest_cur.execute("RELEASE import_start")
             self.conn.commit()
-            src_conn.close()
             
-            # Return total processed count (sum of all records)
-            total_ops = sum(stats.values())
-            return total_ops
+            if src_conn:
+                src_conn.close()
+            
+            return {
+                "status": status,
+                "stats": stats,
+                "errors": errors
+            }
             
         except Exception as e:
+            # Catastrophic failure (e.g. DB lock, disk full)
+            if 'dest_cur' in locals():
+                try:
+                     dest_cur.execute("ROLLBACK TO import_start")
+                except:
+                     pass
             self.conn.rollback()
             print(f"Deep Import Error: {e}")
-            if 'src_conn' in locals():
+            if src_conn:
                 src_conn.close()
-            return -1
+            return {"status": "failed", "stats": stats, "errors": [str(e)]}

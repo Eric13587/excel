@@ -11,7 +11,7 @@ import os
 import sys
 
 
-from ..dialogs import IndividualDialog, ImportDialog, StatementConfigDialog
+from ..dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog
 from ..theme import ThemeManager
 
 
@@ -147,6 +147,9 @@ class Dashboard(QWidget):
         from ..ui_state_manager import UIStateManager
         from ..loan_action_controller import LoanActionController
         from ..statement_generator import StatementGenerator
+        from ..engine import LoanEngine
+        
+        self.engine = LoanEngine(self.db)
         
         self._ui_state = UIStateManager(on_selection_changed=self._on_selection_changed)
         self._statement_generator = StatementGenerator(
@@ -342,6 +345,15 @@ class Dashboard(QWidget):
         savings_action = QAction("Mass Savings (Increments)", self)
         savings_action.triggered.connect(self.open_mass_savings_dialog)
         mass_menu.addAction(savings_action)
+        
+        mass_menu.addSeparator()
+        
+        self.undo_mass_action = QAction("Undo Last Mass Operation", self)
+        self.undo_mass_action.triggered.connect(self.undo_mass_operation)
+        self.undo_mass_action.setEnabled(True) # Always enabled, check in handler?
+        # Or better: Context menu 'aboutToShow' capable?
+        # For simplicity: Keep enabled, show message if nothing to undo.
+        mass_menu.addAction(self.undo_mass_action)
         
         self.mass_ops_btn.setMenu(mass_menu)
         
@@ -917,8 +929,7 @@ class Dashboard(QWidget):
         run_btn.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; padding: 10px;")
         layout.addWidget(run_btn)
         
-        from ..engine import LoanEngine
-        engine = LoanEngine(self.db)
+        engine = self.engine
         
         def run_process():
             selected = [cb for cb in checkboxes if cb.isChecked()]
@@ -926,11 +937,36 @@ class Dashboard(QWidget):
                 QMessageBox.warning(dialog, "Warning", "No loans selected.")
                 return
             
-            confirm = QMessageBox.question(dialog, "Confirm", 
-                                           f"Are you sure you want to deduct/catch up for {len(selected)} loans?\n\nThis can be undone via Edit > Undo.",
-                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            # Ask for Target Date instead of simple Confirm
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QDateEdit, QDialogButtonBox, QFormLayout
+            from PyQt6.QtCore import QDate
+            from datetime import datetime
             
-            if confirm == QMessageBox.StandardButton.Yes:
+            # Default to Current Date
+            default_target = datetime.now()
+            
+            d = QDialog(dialog)
+            d.setWindowTitle("Confirm Mass Deduction")
+            
+            layout = QVBoxLayout(d)
+            layout.addWidget(QLabel(f"Selected: {len(selected)} loans.\n\nLoans will be caught up until the specified date.\nThis operation can be undone."))
+            
+            form = QFormLayout()
+            date_edit = QDateEdit()
+            date_edit.setCalendarPopup(True)
+            date_edit.setDate(QDate(default_target.year, default_target.month, default_target.day))
+            date_edit.setDisplayFormat("yyyy-MM-dd")
+            form.addRow("Catch up until (inclusive):", date_edit)
+            layout.addLayout(form)
+            
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(d.accept)
+            buttons.rejected.connect(d.reject)
+            layout.addWidget(buttons)
+            
+            if d.exec() == QDialog.DialogCode.Accepted:
+                target_date_q = date_edit.date()
+                target_date = datetime(target_date_q.year(), target_date_q.month(), target_date_q.day())
                 processed_count = 0
                 total_deductions = 0
                 
@@ -960,7 +996,7 @@ class Dashboard(QWidget):
                      QApplication.processEvents()
 
                 try:
-                    result = engine.mass_catch_up_loans(selected, progress_cb)
+                    result = engine.mass_catch_up_loans(selected, progress_cb, target_date=target_date)
                     if len(result) == 3:
                         processed_count, total_deductions, errors = result
                     else:
@@ -989,6 +1025,28 @@ class Dashboard(QWidget):
         dialog.exec()
         # Maybe refresh list/ledger if open?
         # Dashboard doesn't show loan status directly so list refresh not strictly needed, but good practice.
+
+    def undo_mass_operation(self):
+        """Undo the last mass operation."""
+        if not self.engine.can_undo():
+            QMessageBox.information(self, "Undo", "Nothing to undo.")
+            return
+            
+        # Optional: Check if the top item is a Mass Operation?
+        desc = self.engine.get_undo_description()
+        if not desc or not desc.startswith("Mass"):
+             reply = QMessageBox.question(self, "Undo", 
+                                          f"The last operation was '{desc}', not a Mass Operation.\nUndo anyway?",
+                                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+             if reply == QMessageBox.StandardButton.No:
+                 return
+
+        cmd = self.engine.undo()
+        if cmd:
+            QMessageBox.information(self, "Undo", f"Undid: {cmd.description}")
+            self.refresh_list()
+        else:
+             QMessageBox.warning(self, "Undo", "Failed to undo.")
 
     def generate_quarterly_report(self):
         """Generate quarterly interest report."""
@@ -1128,8 +1186,7 @@ class Dashboard(QWidget):
         # Helper to get suggested amount efficiently? 
         # get_suggested_savings_increment does a query. Might be slow if N is large.
         # But for local app < 1000 users it's fine.
-        from ..engine import LoanEngine
-        engine = LoanEngine(self.db)
+        engine = self.engine
         
         for ind in individuals:
             label_text = f"{ind[1]}"
@@ -1195,11 +1252,36 @@ class Dashboard(QWidget):
                 QMessageBox.warning(dialog, "Warning", "No individuals selected.")
                 return
             
-            confirm = QMessageBox.question(dialog, "Confirm", 
-                                           f"Are you sure you want to catch up savings for {len(selected)} individuals?\nAmounts will be based on last deposit.\n\nThis can be undone via Edit > Undo.",
-                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            # Ask for Target Date instead of simple Confirm
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QDateEdit, QDialogButtonBox, QFormLayout
+            from PyQt6.QtCore import QDate
+            from datetime import datetime
             
-            if confirm == QMessageBox.StandardButton.Yes:
+            # Default to Current Month
+            default_target = datetime.now()
+            
+            d = QDialog(dialog)
+            d.setWindowTitle("Confirm Mass Catch-Up")
+            
+            layout = QVBoxLayout(d)
+            layout.addWidget(QLabel(f"Selected: {len(selected)} individuals.\n\nAmounts will be based on last deposit.\nThis operation can be undone."))
+            
+            form = QFormLayout()
+            date_edit = QDateEdit()
+            date_edit.setCalendarPopup(True)
+            date_edit.setDate(QDate(default_target.year, default_target.month, default_target.day))
+            date_edit.setDisplayFormat("yyyy-MM-dd")
+            form.addRow("Catch up until (inclusive):", date_edit)
+            layout.addLayout(form)
+            
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(d.accept)
+            buttons.rejected.connect(d.reject)
+            layout.addWidget(buttons)
+            
+            if d.exec() == QDialog.DialogCode.Accepted:
+                target_date_q = date_edit.date()
+                target_date = datetime(target_date_q.year(), target_date_q.month(), target_date_q.day())
                 processed_count = 0
                 total_tx = 0
                 
@@ -1224,7 +1306,7 @@ class Dashboard(QWidget):
                      QApplication.processEvents()
 
                 try:
-                    result = engine.mass_catch_up_savings(selected, progress_cb)
+                    result = engine.mass_catch_up_savings(selected, progress_cb, target_date=target_date)
                     if len(result) == 3:
                         processed_count, total_tx, errors = result
                     else:
@@ -1262,7 +1344,7 @@ class Dashboard(QWidget):
         dialog.exec()
 
     def import_individuals(self):
-        """Import individuals from another database with selection."""
+        """Import individuals from another database with selection and progress."""
         try:
             dialog = ImportDialog(self)
             if dialog.exec():
@@ -1344,28 +1426,96 @@ class Dashboard(QWidget):
                     if not selected_ids:
                         return
 
-                    # 3. Perform Import
-                    count = self.db.import_selected_data(file_path, selected_ids, options)
+                    # Check for Conflicts
+                    decision_map = None
+                    conflicts = self.db.check_import_conflicts(file_path, selected_ids)
                     
-                    if isinstance(count, dict):
-                         # New return format is stats dict? Or did I leave it returning int/dict mixed?
-                         # import_selected_data returns 'start' dict usually?
-                         # Let's check db implementation again.
-                         # It returns 'stats' dict.
-                         msg = "Import Complete.\n\n"
-                         msg += f"Individuals: {count['individuals']}\n"
-                         msg += f"Loans: {count['loans']}\n"
-                         msg += f"Ledger Entries: {count['ledger']}"
-                         QMessageBox.information(self, "Success", msg)
-                         self.refresh_list()
-                    elif count >= 0: # Fallback if I messed up return
-                        QMessageBox.information(self, "Success", f"Import Process Completed.")
-                        self.refresh_list()
-                    else:
-                        QMessageBox.critical(self, "Error", "Failed to import.")
-            
+                    if conflicts:
+                        dlg = DuplicateResolutionDialog(conflicts, self)
+                        if dlg.exec() == QDialog.DialogCode.Accepted:
+                            decision_map = dlg.get_decisions()
+                        else:
+                            return # Abort import
+                    
+                    # 3. Perform Import IN THREAD
+                    
+                    # Create Progress Dialog
+                    progress = QProgressDialog("Starting Import...", None, 0, 100, self)
+                    progress.setWindowTitle("Importing Data")
+                    progress.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress.setMinimumDuration(0)
+                    progress.setCancelButton(None) # Disable cancel for now as DB thread is hard to kill safely
+                    progress.show()
+                    
+                    # Worker
+                    self.import_worker = ImportWorker(self.db, file_path, selected_ids, options, decision_map)
+                    
+                    def on_progress(current, total, msg):
+                        progress.setLabelText(msg)
+                        progress.setMaximum(total)
+                        progress.setValue(current)
+                        
+                    def on_finished(result):
+                        progress.close()
+                        self.handle_import_result(result, options)
+                        
+                    def on_error(err_msg):
+                        progress.close()
+                        QMessageBox.critical(self, "Error", f"Import Error: {err_msg}")
+                    
+                    self.import_worker.progress.connect(on_progress)
+                    self.import_worker.finished.connect(on_finished)
+                    self.import_worker.error.connect(on_error)
+                    
+                    self.import_worker.start()
+
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An unexpected error occurred: {str(e)}")
+
+    def handle_import_result(self, result, options):
+        """Handle the result dict from import worker."""
+        if isinstance(result, dict) and "status" in result:
+             stats = result.get("stats", {})
+             status = result.get("status", "failed")
+             errors = result.get("errors", [])
+             
+             msg = ""
+             if status == "success":
+                 msg = "Import Process Completed Successfully.\n\n"
+                 msg += f"Individuals: {stats.get('individuals', 0)}\n"
+                 if options.get("import_loans"):
+                     msg += f"Loans: {stats.get('loans', 0)}\n"
+                     msg += f"Ledger Entries: {stats.get('ledger', 0)}\n"
+                 if options.get("import_savings"):
+                     msg += f"Savings Entries: {stats.get('savings', 0)}"
+                 
+                 QMessageBox.information(self, "Success", msg)
+                 self.refresh_list()
+                 
+             elif status == "partial":
+                 msg = "Import Completed with Warnings (Partial Import).\n\n"
+                 msg += f"Individuals: {stats.get('individuals', 0)} (Saved)\n"
+                 msg += f"Loans: {stats.get('loans', 0)} (Failed/Rolled Back)\n"
+                 msg += f"Savings: {stats.get('savings', 0)}\n\n"
+                 msg += "Errors encountered:\n" + "\n".join(errors[:5])
+                 
+                 QMessageBox.warning(self, "Partial Import", msg)
+                 self.refresh_list()
+                 
+             else: # failed
+                 msg = "Import Failed.\n\nErrors:\n" + "\n".join(errors[:5])
+                 QMessageBox.critical(self, "Error", msg)
+                 
+        # Fallback for legacy or unexpected return (should not happen with new db code)
+        elif isinstance(result, int): 
+            if result >= 0:
+                QMessageBox.information(self, "Success", f"Import Process Completed (Legacy Mode). Items: {result}")
+                self.refresh_list()
+            else:
+                QMessageBox.critical(self, "Error", "Failed to import (Unknown Error).")
+        else:
+             QMessageBox.critical(self, "Error", "Unexpected response from database.")
+
     def show_error_report(self, errors):
         """Show error report dialog."""
         if not errors: return
@@ -1380,3 +1530,36 @@ class Dashboard(QWidget):
             msg += f"\n... and {len(errors) - 10} more."
             
         QMessageBox.warning(self, "Partial Failures", msg)
+
+from PyQt6.QtCore import QThread, pyqtSignal
+
+class ImportWorker(QThread):
+    """Worker thread for running imports."""
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    
+    
+    def __init__(self, db, file_path, selected_ids, options, decision_map=None):
+        super().__init__()
+        self.db = db
+        self.file_path = file_path
+        self.selected_ids = selected_ids
+        self.options = options
+        self.decision_map = decision_map
+        
+    def run(self):
+        try:
+            def callback(current, total, msg):
+                self.progress.emit(current, total, msg)
+                
+            result = self.db.import_selected_data(
+                self.file_path, 
+                self.selected_ids, 
+                self.options, 
+                progress_callback=callback,
+                decision_map=self.decision_map
+            )
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
