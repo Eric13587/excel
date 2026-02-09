@@ -509,10 +509,11 @@ class UndoManager:
 class MassLoanCatchUpCommand(UndoableCommand):
     """Command for mass loan catch-up operation."""
     
-    def __init__(self, loan_service, loan_refs_and_ids, progress_callback=None):
+    def __init__(self, loan_service, loan_refs_and_ids, progress_callback=None, target_date=None):
         self.service = loan_service
         self.items = loan_refs_and_ids
         self.callback = progress_callback
+        self.target_date = target_date
         self.batch_id = None
         self.result = (0, 0, []) # processed, total, errors
         
@@ -527,7 +528,7 @@ class MassLoanCatchUpCommand(UndoableCommand):
         return desc
         
     def execute(self) -> bool:
-        processed, total, batch_id, errors = self.service.mass_catch_up_loans(self.items, self.callback)
+        processed, total, batch_id, errors = self.service.mass_catch_up_loans(self.items, self.callback, target_date=self.target_date)
         self.batch_id = batch_id
         self.result = (processed, total, errors)
         return True
@@ -540,10 +541,11 @@ class MassLoanCatchUpCommand(UndoableCommand):
 class MassSavingsCatchUpCommand(UndoableCommand):
     """Command for mass savings catch-up operation."""
     
-    def __init__(self, savings_service, ind_ids_or_objects, progress_callback=None):
+    def __init__(self, savings_service, ind_ids_or_objects, progress_callback=None, target_date=None):
         self.service = savings_service
         self.items = ind_ids_or_objects
         self.callback = progress_callback
+        self.target_date = target_date
         self.batch_id = None
         self.result = (0, 0, [])
         
@@ -558,7 +560,7 @@ class MassSavingsCatchUpCommand(UndoableCommand):
         return desc
         
     def execute(self) -> bool:
-        processed, total, batch_id, errors = self.service.mass_catch_up_savings(self.items, self.callback)
+        processed, total, batch_id, errors = self.service.mass_catch_up_savings(self.items, self.callback, target_date=self.target_date)
         self.batch_id = batch_id
         self.result = (processed, total, errors)
         return True

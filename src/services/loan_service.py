@@ -114,13 +114,14 @@ class LoanService:
         self._recalculate_default_deduction(individual_id)
         return monthly_deduction
     
-    def catch_up_loan(self, individual_id, loan_ref, batch_id=None):
-        """Perform deductions until loan is caught up to current date.
+    def catch_up_loan(self, individual_id, loan_ref, batch_id=None, target_date=None):
+        """Perform deductions until loan is caught up to current date (or target date).
         
         Args:
             individual_id: ID of the individual.
             loan_ref: Loan reference string.
             batch_id: Optional batch ID for grouping transactions.
+            target_date: Optional datetime object or YYYY-MM-DD string as limit.
             
         Returns:
             Number of deductions made.
@@ -137,7 +138,13 @@ class LoanService:
             
         
         count = 0
-        current_date_str = datetime.now().strftime("%Y-%m-%d")
+        if target_date:
+            if isinstance(target_date, str):
+                limit_date_str = target_date
+            else:
+                limit_date_str = target_date.strftime("%Y-%m-%d")
+        else:
+            limit_date_str = datetime.now().strftime("%Y-%m-%d")
         
         # Optimization: Use in-memory simulation and batch insert
         transactions = []
@@ -156,7 +163,13 @@ class LoanService:
         
         sim_loan = loan.copy()
         
-        while sim_loan['next_due_date'] <= current_date_str:
+        # Check for invalid next_due_date
+        next_due = sim_loan.get('next_due_date')
+        if not next_due or next_due.strip() == "":
+            print(f"Warning: Loan {loan_ref} has invalid next_due_date '{next_due}'. Skipping catch-up.")
+            return 0
+        
+        while sim_loan['next_due_date'] <= limit_date_str:
             # Logic similar to deduct_single_loan but in-memory
             
             # 1. Accrue Interest
@@ -285,15 +298,16 @@ class LoanService:
             
         return count
 
-    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None):
+    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None, target_date=None):
         """Process multiple catch-up operations in a single atomic transaction.
         
         Args:
             loan_refs_and_ids: List of tuples/objects containing (loan_ref, ind_id).
             progress_callback: Optional callable(index, obj) to update UI.
+            target_date: Optional limit date.
             
         Returns:
-            (processed_count, total_deductions, batch_id)
+            (processed_count, total_deductions, batch_id, errors)
         """
         import uuid
         batch_id = str(uuid.uuid4())
@@ -311,13 +325,14 @@ class LoanService:
                         l_ref, i_id = item
                     
                     try:
-                        count = self.catch_up_loan(i_id, l_ref, batch_id=batch_id)
+                        # Pass target_date to catch_up_loan
+                        count = self.catch_up_loan(i_id, l_ref, batch_id=batch_id, target_date=target_date)
                         if count > 0:
                             processed_count += 1
                             total_deductions += count
                     except Exception as e:
-                        # Capture error but continue processing others
                         errors.append((l_ref, str(e)))
+
                         
                     if progress_callback:
                         progress_callback(i, item)

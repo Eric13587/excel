@@ -1921,8 +1921,35 @@ class LedgerView(QWidget):
         last_date_str = savings_df.iloc[-1]['date']
         last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
         
-        # Target: first day of current month (exclusive)
-        current_month_start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Ask for Target Date
+        # Default to Current Month
+        default_target = datetime.now()
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Catch Up Savings")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Catch up savings deposits until:"))
+        
+        date_edit = QDateEdit()
+        date_edit.setCalendarPopup(True)
+        date_edit.setDate(QDate(default_target.year, default_target.month, default_target.day))
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        layout.addWidget(date_edit)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+            
+        target_date_q = date_edit.date()
+        target_date = datetime(target_date_q.year(), target_date_q.month(), target_date_q.day())
+        
+        # Target Limit: specific date provided + 1 month (to include the target month)
+        # E.g. Target Feb 2025 -> Limit Mar 1 2025 (Exclusive)
+        current_month_start = (target_date + relativedelta(months=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         
         # Calculate how many months to process
         current_date = last_date + relativedelta(months=1)
