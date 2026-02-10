@@ -1,194 +1,173 @@
-# Import Data Feature - Improvements & Enhancements
+# Quarterly Report Feature — Improvements
 
-This document outlines potential improvements and enhancements for the **Import Data** feature in LoanMaster.
-
----
-
-## 1. Missing Transaction Safety / Rollback on Partial Failure
-
-**Current Issue:** The `import_selected_data` method commits all changes at the end (`self.conn.commit()`) but if an error occurs mid-import (e.g., after importing individuals but before completing loans), the partial data is lost via `self.conn.rollback()`. However, there's no per-entity transaction handling.
-
-**Improvement:** 
-- Implement granular checkpoints or savepoints so that if loans fail to import, individuals are still retained.
-- Consider using SQLite's `SAVEPOINT` mechanism.
-- Add a "Partial Import" status return to inform the user exactly what was imported before failure.
+Below are **12** concrete improvements / enhancements identified from an analysis of
+[`src/reports.py`](file:///home/yhazadek/Desktop/excel/src/reports.py) and the
+[`Dashboard.generate_quarterly_report`](file:///home/yhazadek/Desktop/excel/src/views/dashboard.py#L1051-L1147)
+UI entry-point.
 
 ---
 
-## 2. No Progress Indicator for Large Imports
+## 1. Silent Error Swallowing — Surface Failures to the User
 
-**Current Issue:** The `import_individuals` method in `dashboard.py` performs the entire import synchronously without any progress feedback. For databases with hundreds or thousands of individuals/loans, the UI will freeze.
+**File:** `src/reports.py` — lines 283-287
+
+The entire `generate_quarterly_report` method is wrapped in a bare `except Exception`
+that prints to the console and returns `False`. The user sees a generic "Failed to
+generate report" message box with no detail. Stack traces are invisible in a packaged
+application.
+
+**Improvement:** Propagate the exception (or at least its message) to the caller so the
+UI can display a meaningful error dialog. Consider a structured result object
+`(success, message)` instead of a bare `bool`.
+
+---
+
+## 2. Massive Single-Method Complexity (God Method)
+
+**File:** `src/reports.py` — lines 15-287
+
+The entire report logic — date math, data retrieval, interest calculation, balance
+derivation, rounding, DataFrame construction, Excel formatting — lives in a **single
+270-line method**. This makes the method extremely difficult to test, debug, or extend.
+
+**Improvement:** Decompose into focused helper methods:
+- `_compute_quarter_boundaries(start_date_str)` → date ranges
+- `_collect_loan_report_row(ind_id, loan_ref, ...)` → per-loan data
+- `_build_dataframe(report_data, ...)` → DataFrame assembly
+- `_write_excel(df, output_path)` → formatting & export
+
+---
+
+## 3. No Input Validation on the Start Date
+
+**File:** `src/reports.py` — line 27 & `dashboard.py` — line 1132
+
+The user can pick *any* date from the calendar widget (e.g., the 15th of a month).
+The code silently treats it as a quarter start, producing a misleadingly-labelled report.
+
+**Improvement:** Validate that the chosen date is the 1st of a month and that it aligns
+with a valid quarter boundary for the configured financial year. Show a warning or
+auto-snap to the nearest valid quarter start.
+
+---
+
+## 4. Financial-Year Quarter Calculation Is Fragile & Duplicated
+
+**Files:** `src/reports.py` lines 99-121, `dashboard.py` lines 1058-1111
+
+The FY-quarter logic is implemented **twice** — once in the report generator and once in
+the dashboard — using different algorithms.  The dashboard version contains dead code
+(`q_starts` list is built but never properly consumed before being replaced by a second
+loop, lines 1073-1090 vs 1097-1108).
+
+**Improvement:** Extract a shared `QuarterHelper` utility that both the UI and the report
+generator import, ensuring consistent behaviour and eliminating dead code.
+
+---
+
+## 5. Legacy / New-Model Balance Fallback Logic Is Brittle
+
+**File:** `src/reports.py` — lines 151-184
+
+The code tries `principal_balance`, then falls back to `balance` with a heuristic
+`principal_ratio` estimation. The heuristic divides by `installment` (risking division issues)
+and can silently produce inaccurate principal figures for loans that don't fit the
+assumed model.
 
 **Improvement:**
-- Add a `QProgressDialog` or progress bar showing:
-  - "Importing individuals... (X of Y)"
-  - "Importing loans... (X of Y)"
-  - "Importing ledger entries..."
-- Run the import in a `QThread` to prevent UI blocking.
+- Document the expected schema version and fail fast if columns are missing.
+- If legacy data is detected, log a clear warning and consider a separate migration path
+  rather than embedding approximation logic inside the report.
 
 ---
 
-## 3. No Duplicate Detection Beyond Name Matching
+## 6. No Progress Indication for Large Datasets
 
-**Current Issue:** Duplicates are detected solely by matching `name` strings (case-sensitive). This is fragile:
-- "John Doe" vs "john doe" would create duplicate entries.
-- Different people with the same name would be incorrectly merged.
+**Files:** `dashboard.py` and `src/reports.py`
 
-**Improvement:**
-- Implement case-insensitive name matching as a baseline.
-- Add optional matching by phone or email for more robust deduplication.
-- Show a "Potential Duplicates" review step before importing, letting users choose merge/skip/create-new.
+Report generation iterates over *every* individual and *every* loan synchronously on the
+UI thread. With hundreds of borrowers the app freezes with no feedback.
 
----
-
-## 4. No Conflict Resolution UI for Existing Records
-
-**Current Issue:** When an individual already exists (by name), the import silently uses the existing record's ID without informing the user or allowing them to review the merge.
-
-**Improvement:**
-- Add a "Conflict Resolution" step showing:
-  - Source record details vs. existing record details
-  - Options: "Merge", "Skip", "Create as New"
-- Allow users to decide per-record or apply a blanket policy.
+**Improvement:** Run the generation in a `QThread` or `QRunnable` with a progress dialog
+(`QProgressDialog`) showing `"Processing borrower 34 / 210…"`.
 
 ---
 
-## 5. No Dry Run / Preview of Changes
+## 7. Hardcoded Excel Formatting — No Theme / Customisation
 
-**Current Issue:** Users can only see a list of individuals to import but have no visibility into:
-- Which individuals already exist (will be matched)
-- How many loans/ledger entries will be imported
-- Potential data conflicts
+**File:** `src/reports.py` — lines 237-247
 
-**Improvement:**
-- Add a "Preview Import" button that shows:
-  - New individuals to be created
-  - Existing individuals that will be matched
-  - Number of loans, ledger entries, and savings records per person
-- Show warnings for any data inconsistencies detected.
+Colours (`#D7E4BC`, `#f0f0f0`), column widths (25, 15), and number formats (`#,##0`)
+are hardcoded. Users cannot adjust currency symbols, decimal places, or branding colours.
+
+**Improvement:** Move formatting constants into a `ReportConfig` dataclass (or pull from
+user settings) so organisations can customise the look of generated reports without code
+changes.
 
 ---
 
-## 6. Savings Import Does Not Recalculate Running Balances
+## 8. Rounding Uses `math.ceil` — Inconsistent with Financial Standards
 
-**Current Issue:** When importing savings, the method directly inserts the `balance` value from the source database. If the target database already has savings entries for a matched individual, this creates incorrect running balance sequences.
+**File:** `src/reports.py` — lines 194-198
 
-**Improvement:**
-- After importing savings, call `recalculate_savings_balances(individual_id)` for each affected individual.
-- Alternatively, import only amounts and transaction types, then let the system recalculate all balances.
+All monetary values are rounded **up** using `math.ceil`. This means even ₹100.01 becomes
+₹101, which inflates totals. Standard financial rounding uses banker's rounding
+(`ROUND_HALF_EVEN`) or at least `round()`.
 
----
-
-## 7. Loan Reference (ref) Collision Not Handled
-
-**Current Issue:** Loan references are imported as-is. If the target database already has a loan with the same `ref` for an individual, this could cause confusion or data integrity issues (duplicate refs).
-
-**Improvement:**
-- Check for existing loan refs before import.
-- Either:
-  - Append a suffix to the imported ref (e.g., `L-001` → `L-001-IMP`)
-  - Prompt the user to resolve the conflict
-  - Skip loans with duplicate refs and report them
+**Improvement:** Use `Decimal` with an explicit rounding mode from the `decimal` module,
+or at minimum use Python's built-in `round()` with a configurable precision.
 
 ---
 
-## 8. No Validation of Source Database Schema
+## 9. Report Only Supports Excel — No PDF / CSV Export
 
-**Current Issue:** The import methods attempt to query expected columns but silently fail or skip data if columns are missing. For example, `default_deduction`, `unearned_interest`, `interest_balance` are all optional with fallbacks to 0.
+**File:** `src/reports.py` — line 230
 
-**Improvement:**
-- Perform upfront schema validation:
-  - Check source database version or structure
-  - Warn user about missing columns and what data will be defaulted
-- Consider adding a "Database Version" setting that import can check.
+The report is exclusively exported as `.xlsx`. Users who need a quick PDF for printing or
+a CSV for further processing have no option.
 
----
-
-## 9. No Import Log or Audit Trail
-
-**Current Issue:** After import completes, users only see summary counts. There's no detailed log of:
-- Which individuals were created vs. matched
-- Which loans were imported and their IDs
-- Any errors or warnings encountered
-
-**Improvement:**
-- Generate an import log file or display a detailed report dialog.
-- Include:
-  - Timestamp of import
-  - Source file path
-  - Per-entity status (Created/Matched/Skipped/Error)
-- Optionally save to a `logs/` directory.
+**Improvement:** Add format selection in the save dialog (`Excel / PDF / CSV`) and
+implement corresponding writers. For PDF, the existing `StatementGenerator` HTML→PDF
+pipeline could be reused.
 
 ---
 
-## 10. No Undo for Import Operations
+## 10. No Report Preview Before Export
 
-**Current Issue:** Once an import is completed, there's no way to undo it. If a user accidentally imports wrong data or from the wrong database, they must manually delete records.
+**File:** `dashboard.py` — lines 1117-1147
 
-**Improvement:**
-- Tag all imported records with a `batch_id` (similar to mass operations).
-- Add an "Undo Last Import" action that:
-  - Identifies records by `import_batch_id`
-  - Deletes all imported individuals, loans, ledger entries, and savings
-- Store import metadata in a separate table for tracking.
+After the user selects a date and file path the report is generated immediately with no
+opportunity to preview the data.
 
----
-
-## 11. Limited File Format Support
-
-**Current Issue:** Only SQLite `.db` files are supported for import.
-
-**Improvement:**
-- Add support for:
-  - CSV import with column mapping UI
-  - Excel (`.xlsx`) import using `openpyxl`
-- This would make migration from other systems easier.
+**Improvement:** Show a read-only `QTableView` (or an HTML preview dialog) of the report
+data **before** asking for a save path. This lets users verify the quarter, catch obvious
+data issues, and optionally cancel.
 
 ---
 
-## 12. No Date Range Filter for Ledger/Savings Import
+## 11. Quarter Selector UX — Raw Date Picker Instead of Dropdown
 
-**Current Issue:** When importing loans/ledger, ALL historical transactions are imported. For large databases, this may be unnecessary (e.g., user only wants last 12 months).
+**File:** `dashboard.py` — lines 1118-1123
 
-**Improvement:**
-- Add date range filters to the `ImportDialog`:
-  - "Import transactions from: [date] to: [date]"
-- Apply these filters when querying the source ledger and savings tables.
+The user is presented with a generic `QDateEdit` calendar widget. They must know which
+dates are valid quarter starts — there's no guidance.
 
----
-
-## 13. Savings Statistics Missing from Import Summary
-
-**Current Issue:** The `import_selected_data` returns a stats dict with `savings` count, but the dashboard's completion message does not display savings:
-```python
-msg += f"Individuals: {count['individuals']}\n"
-msg += f"Loans: {count['loans']}\n"
-msg += f"Ledger Entries: {count['ledger']}"
-# Savings count is ignored!
-```
-
-**Improvement:**
-- Update the success message in `dashboard.py` to include:
-  ```python
-  msg += f"\nSavings Entries: {count['savings']}"
-  ```
+**Improvement:** Replace the date picker with a `QComboBox` listing the available quarters
+in human-readable form (e.g., *"Q1 Nov 2025 – Jan 2026"*, *"Q2 Feb 2026 – Apr 2026"*).
+This eliminates invalid date selection entirely.
 
 ---
 
-## Summary
+## 12. No Unit Tests for the Report Generator
 
-| # | Improvement | Priority | Status |
-|---|-------------|----------|--------|
-| 1 | Transaction Safety / Rollback | High | **Completed** |
-| 2 | Progress Indicator | High | **Completed** |
-| 3 | Better Duplicate Detection | High | **Completed** |
-| 4 | Conflict Resolution UI | Medium | **Completed** |
-| 5 | Dry Run / Preview | High | **Completed** |
-| 6 | Savings Balance Recalculation | Medium | **Completed** |
-| 7 | Loan Ref Collision Handling | Medium | **Completed** |
-| 8 | Schema Validation | Medium | **Completed** |
-| 9 | Import Log / Audit Trail | Medium | **Completed** |
-| 10 | Undo Import Operations | High | **Completed** |
-| 11 | CSV/Excel Import Support | Low | Pending |
-| 12 | Date Range Filter | Low | **Completed** |
-| 13 | Savings Stats in Summary | Low | **Completed** |
+**Directory:** `tests/`
+
+There are no test files covering `ReportGenerator`. Any refactoring or bug-fix risks
+introducing regressions silently.
+
+**Improvement:** Add unit tests that exercise:
+- Correct monthly interest bucketing
+- B/F calculation across quarter boundaries
+- Legacy vs new-model balance fallback
+- Empty dataset handling
+- Total-row arithmetic

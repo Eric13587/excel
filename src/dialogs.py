@@ -2,8 +2,9 @@ import json
 from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton, 
                              QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, 
                              QFileDialog, QGroupBox, QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox,
-                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView)
+                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView, QColorDialog)
 from PyQt6.QtCore import Qt, QDate
+from PyQt6.QtGui import QColor
 from .data_structures import StatementConfig
 import re
 
@@ -632,4 +633,81 @@ class ImportPreviewDialog(QDialog):
             
     def get_decisions(self):
         return self.decision_map
+
+
+class ExcelFormatDialog(QDialog):
+    """Dialog for customizing Excel report colors."""
+    
+    def __init__(self, db_manager, parent=None):
+        super().__init__(parent)
+        self.db = db_manager
+        self.setWindowTitle("Excel Report Formatting")
+        self.resize(350, 200)
+        
+        self.layout = QVBoxLayout(self)
+        
+        # Form
+        form = QFormLayout()
+        
+        # Header Color
+        self.header_color = self.db.get_setting("excel_header_bg", "#D7E4BC")
+        self.btn_header = QPushButton(self.header_color)
+        self.btn_header.setStyleSheet(f"background-color: {self.header_color};")
+        self.btn_header.clicked.connect(lambda: self.pick_color("header"))
+        
+        # Total Row Color
+        self.total_color = self.db.get_setting("excel_total_bg", "#f0f0f0")
+        self.btn_total = QPushButton(self.total_color)
+        self.btn_total.setStyleSheet(f"background-color: {self.total_color};")
+        self.btn_total.clicked.connect(lambda: self.pick_color("total"))
+        
+        form.addRow("Header Background:", self.btn_header)
+        form.addRow("Total Row Background:", self.btn_total)
+        
+        grp = QGroupBox("Color Settings")
+        grp.setLayout(form)
+        self.layout.addWidget(grp)
+        
+        # Reset Button
+        self.reset_btn = QPushButton("Reset to Defaults")
+        self.reset_btn.clicked.connect(self.reset_defaults)
+        self.layout.addWidget(self.reset_btn)
+        
+        self.layout.addStretch()
+        
+        # Buttons
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.save_settings)
+        btns.rejected.connect(self.reject)
+        self.layout.addWidget(btns)
+        
+    def pick_color(self, target):
+        current = self.header_color if target == "header" else self.total_color
+        color = QColorDialog.getColor(QColor(current), self, "Select Color")
+        
+        if color.isValid():
+            hex_color = color.name().upper()
+            if target == "header":
+                self.header_color = hex_color
+                self.btn_header.setText(hex_color)
+                self.btn_header.setStyleSheet(f"background-color: {hex_color};")
+            else:
+                self.total_color = hex_color
+                self.btn_total.setText(hex_color)
+                self.btn_total.setStyleSheet(f"background-color: {hex_color};")
+                
+    def reset_defaults(self):
+        self.header_color = "#D7E4BC"
+        self.btn_header.setText(self.header_color)
+        self.btn_header.setStyleSheet(f"background-color: {self.header_color};")
+        
+        self.total_color = "#F0F0F0"
+        self.btn_total.setText(self.total_color)
+        self.btn_total.setStyleSheet(f"background-color: {self.total_color};")
+        
+    def save_settings(self):
+        self.db.set_setting("excel_header_bg", self.header_color)
+        self.db.set_setting("excel_total_bg", self.total_color)
+        self.accept()
+
 
