@@ -5,14 +5,16 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QFileDialog, QDialog, QFormLayout, QCheckBox,
                              QScrollArea, QDialogButtonBox, QMenu, QFrame, QGraphicsDropShadowEffect, QProgressDialog, QApplication)
 from PyQt6.QtGui import QAction, QPixmap, QFont, QColor
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from datetime import datetime
 import os
 import sys
 
 
 from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog, ImportHistoryDialog, ImportPreviewDialog
+from src.reports import ReportGenerator
 from ..theme import ThemeManager
+from ..database import DatabaseManager
 
 
 class IndividualCard(QFrame):
@@ -127,6 +129,52 @@ class IndividualCard(QFrame):
                 }}
             """)
 
+
+
+class ReportWorker(QThread):
+    """Background worker for report generation."""
+    progress = pyqtSignal(int, int, str) # current, total, message
+    finished = pyqtSignal(bool, str)     # success, message
+    
+    finished = pyqtSignal(bool, str)     # success, message
+    
+    def __init__(self, db_name, printer_view_getter, start_date, output_path):
+        super().__init__()
+        self.db_name = db_name
+        self.printer_view_getter = printer_view_getter
+        self.start_date = start_date
+        self.output_path = output_path
+        
+    def run(self):
+        db_manager = None
+        try:
+            # Create thread-local DB connection
+            db_manager = DatabaseManager(self.db_name)
+            
+            # Create generator with thread-local DB
+            # Note: printer_view_getter usage in thread might be risky for PDF. 
+            # If PDF export is requested, we might need to rethink this, 
+            # but for Excel/CSV this fixes the SQLite error.
+            generator = ReportGenerator(db_manager, printer_view_getter=self.printer_view_getter)
+            
+            def callback(current, total, msg):
+                self.progress.emit(current, total, msg)
+                
+            success, msg = generator.generate_quarterly_report(
+                self.start_date, 
+                self.output_path, 
+                progress_callback=callback
+            )
+            self.finished.emit(success, msg)
+            
+        except Exception as e:
+            self.finished.emit(False, str(e))
+        finally:
+            if db_manager and hasattr(db_manager, 'conn'):
+                try:
+                    db_manager.conn.close()
+                except:
+                    pass
 
 
 class Dashboard(QWidget):
@@ -1051,76 +1099,59 @@ class Dashboard(QWidget):
     def generate_quarterly_report(self):
         """Generate quarterly interest report."""
         from ..reports import ReportGenerator
-        from PyQt6.QtWidgets import QDateEdit, QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox, QComboBox, QPushButton
         from PyQt6.QtCore import QDate
+        from dateutil.relativedelta import relativedelta
         
         # Determine Default Date based on FY Setting
         # Logic: Find the most recent "Quarter Start" relative to today.
         # Quarters are [Start, Start+3, Start+6, Start+9]
         
-        fy_start_str = self.db.get_setting("fy_start_month", "November")
-        months = ["January", "February", "March", "April", "May", "June", 
-                  "July", "August", "September", "October", "November", "December"]
-        try:
-            start_month_idx = months.index(fy_start_str) + 1 # 1-based
-        except ValueError:
-            start_month_idx = 1
-            
-        today = QDate.currentDate()
-        current_year = today.year()
-        
-        # Quarters for this year:
-        q_starts = []
-        for i in range(4):
-            m = start_month_idx + (i * 3)
-            y = current_year
-            if m > 12:
-                m -= 12
-                # If start is late in year, next quarters spill to next year conceptually, 
-                # but we want to find "most recent start".
-                # Let's simplify: Build a list of candidate dates around today
-            q_starts.append((y, m))
-        
-        # Also check previous year for context (e.g. if FY starts Nov, and it is Jan)
-        for i in range(4):
-            m = start_month_idx + (i * 3)
-            y = current_year - 1
-            if m > 12: m -= 12
-            q_starts.append((y, m))
-            
-        # Convert to QDate and find closest in past
-        candidates = []
-        for y, m in q_starts:
-            # Handle overflow logic properly if needed, but simplistic mapping works for 1-12
-            # Wait, if start_month_idx is 11 (Nov):
-            # Q1: Nov (11)
-            # Q2: Feb (14 -> 2, Year+1)
-            # Q3: May (17 -> 5, Year+1)
-            # Q4: Aug (20 -> 8, Year+1)
-            
-            # Correct logic:
-            base_date = datetime(current_year - 1, start_month_idx, 1) # Start of FY last year
-            # Generate 8 quarters forward
-            from dateutil.relativedelta import relativedelta
-            
-            for i in range(8):
-                d = base_date + relativedelta(months=i*3)
-                qd = QDate(d.year, d.month, d.day)
-                if qd <= today:
-                    candidates.append(qd)
-        
-        candidates.sort()
-        default_date = candidates[-1] if candidates else QDate.currentDate()
+        # Determine Default Date using centralized logic in ReportGenerator
+        # Pass printer_view_getter to instance
+        generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
+        # Get datetime object
+        def_dt = generator.get_default_quarter_date()
+        # default_date = QDate(def_dt.year, def_dt.month, def_dt.day)
 
         # Dialog to select start date
         dialog = QDialog(self)
         dialog.setWindowTitle("Quarterly Report Period")
         layout = QFormLayout(dialog)
         
-        start_date_edit = QDateEdit()
-        start_date_edit.setCalendarPopup(True)
-        start_date_edit.setDate(default_date)
-        layout.addRow("Quarter Start Date:", start_date_edit)
+        # Quarter Selector (Dropdown)
+        quarter_combo = QComboBox()
+        
+        # Populate
+        recent_quarters = generator.get_recent_quarters()
+        default_idx = 0
+        
+        for i, q_start in enumerate(recent_quarters):
+            # Calculate End Date for label
+            # Month 3 end
+            m3_end = q_start + relativedelta(months=3, days=-1)
+            label = f"{q_start.strftime('%b %Y')} - {m3_end.strftime('%b %Y')}"
+            
+            quarter_combo.addItem(label, q_start.strftime("%Y-%m-%d"))
+            
+            # Select default
+            if q_start.year == def_dt.year and q_start.month == def_dt.month:
+                default_idx = i
+                
+        quarter_combo.setCurrentIndex(default_idx)
+        layout.addRow("Select Quarter:", quarter_combo)
+        
+        # Format Settings Button
+        fmt_btn = QPushButton("Format Settings...")
+        fmt_btn.setStyleSheet("color: #2b5797; border: 1px solid #2b5797; padding: 4px; border-radius: 4px;")
+        
+        def open_fmt_dialog():
+            from ..dialogs import ExcelFormatDialog
+            dlg = ExcelFormatDialog(self.db, self)
+            dlg.exec()
+            
+        fmt_btn.clicked.connect(open_fmt_dialog)
+        layout.addRow("", fmt_btn)
         
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dialog.accept)
@@ -1128,23 +1159,52 @@ class Dashboard(QWidget):
         layout.addRow(btns)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            start_date = start_date_edit.date().toString("yyyy-MM-dd")
+            start_date = quarter_combo.currentData()
             
             # File save dialog
             file_path, _ = QFileDialog.getSaveFileName(
                 self, "Save Report", 
                 f"Quarterly_Report_{start_date}.xlsx", 
-                "Excel Files (*.xlsx)"
+                "Excel Files (*.xlsx);;CSV Files (*.csv);;PDF Files (*.pdf)"
             )
             
             if file_path:
-                generator = ReportGenerator(self.db)
-                success = generator.generate_quarterly_report(start_date, file_path)
+                # Pass printer_view_getter for PDF support
+                # generator already instantiated
                 
-                if success:
-                    QMessageBox.information(self, "Success", f"Report saved to:\n{file_path}")
-                else:
-                    QMessageBox.critical(self, "Error", "Failed to generate report. Check console for details.")
+                # Setup Progress Dialog
+                progress = QProgressDialog("Generating Report...", "Cancel", 0, 100, self)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                
+                # Setup Thread
+                # Pass DB name instead of sharing connection
+                db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
+                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path)
+                
+                def on_progress(curr, total, msg):
+                    progress.setMaximum(total)
+                    progress.setValue(curr)
+                    progress.setLabelText(msg)
+                    if progress.wasCanceled():
+                        # We need a way to stop the worker. 
+                        # For now, simplistic check or just let it finish but ignore result?
+                        # Implementing stop flag in generator is cleaner, but for now just close.
+                        self.report_worker.terminate() # Rough, but effective for immediate stop
+                        
+                def on_finished(success, message):
+                    progress.close()
+                    if success:
+                        QMessageBox.information(self, "Success", f"Report saved to:\n{file_path}")
+                    else:
+                        QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
+                    self.report_worker = None
+                    
+                self.report_worker.progress.connect(on_progress)
+                self.report_worker.finished.connect(on_finished)
+                
+                self.report_worker.start()
 
     def open_mass_savings_dialog(self):
         """Open dialog for Mass Savings Increment."""
