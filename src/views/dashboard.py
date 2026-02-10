@@ -11,7 +11,7 @@ import os
 import sys
 
 
-from ..dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog
+from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog, ImportHistoryDialog, ImportPreviewDialog
 from ..theme import ThemeManager
 
 
@@ -1343,6 +1343,13 @@ class Dashboard(QWidget):
         
         dialog.exec()
 
+    def show_import_history(self):
+        """Show the Import History and Undo dialog."""
+        dlg = ImportHistoryDialog(self.db, self)
+        dlg.exec()
+        # Refresh UI after potential undo
+        self.load_individuals()
+
     def import_individuals(self):
         """Import individuals from another database with selection and progress."""
         try:
@@ -1352,13 +1359,20 @@ class Dashboard(QWidget):
                 file_path = data["file_path"]
                 options = {
                     "import_loans": data["import_loans"],
-                    "import_savings": data["import_savings"]
+                    "import_savings": data["import_savings"],
+                    "date_range": data["date_range"]
                 }
                 
                 if not file_path or not os.path.exists(file_path):
                     QMessageBox.critical(self, "Error", "File does not exist.")
                     return
                 
+                # 0. Validate Schema
+                is_valid, error_msg = self.db.validate_source_schema(file_path)
+                if not is_valid:
+                     QMessageBox.critical(self, "Invalid Database", f"The selected file cannot be imported:\n{error_msg}")
+                     return
+
                 # 1. Get Preview
                 preview_list = self.db.get_import_preview(file_path)
                 if not preview_list:
@@ -1426,16 +1440,19 @@ class Dashboard(QWidget):
                     if not selected_ids:
                         return
 
-                    # Check for Conflicts
+                    # Generate Preview & Resolve Conflicts
                     decision_map = None
-                    conflicts = self.db.check_import_conflicts(file_path, selected_ids)
+                    preview = self.db.generate_import_preview(file_path, selected_ids, options)
                     
-                    if conflicts:
-                        dlg = DuplicateResolutionDialog(conflicts, self)
-                        if dlg.exec() == QDialog.DialogCode.Accepted:
-                            decision_map = dlg.get_decisions()
+                    if preview:
+                        preview_dlg = ImportPreviewDialog(preview, self)
+                        if preview_dlg.exec() == QDialog.DialogCode.Accepted:
+                            decision_map = preview_dlg.get_decisions()
                         else:
-                            return # Abort import
+                            return # Cancel
+                    else:
+                        QMessageBox.warning(self, "Error", "Failed to generate import preview.")
+                        return
                     
                     # 3. Perform Import IN THREAD
                     

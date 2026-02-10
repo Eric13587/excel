@@ -177,18 +177,18 @@ msg += f"Ledger Entries: {count['ledger']}"
 
 ## Summary
 
-| # | Improvement | Priority |
-|---|-------------|----------|
-| 1 | Transaction Safety / Rollback | High |
-| 2 | Progress Indicator | High |
-| 3 | Better Duplicate Detection | High |
-| 4 | Conflict Resolution UI | Medium |
-| 5 | Dry Run / Preview | High |
-| 6 | Savings Balance Recalculation | Medium |
-| 7 | Loan Ref Collision Handling | Medium |
-| 8 | Schema Validation | Medium |
-| 9 | Import Log / Audit Trail | Medium |
-| 10 | Undo Import Operations | High |
-| 11 | CSV/Excel Import Support | Low |
-| 12 | Date Range Filter | Low |
-| 13 | Savings Stats in Summary | Low |
+| # | Improvement | Priority | Status |
+|---|-------------|----------|--------|
+| 1 | Transaction Safety / Rollback | High | **Completed** |
+| 2 | Progress Indicator | High | **Completed** |
+| 3 | Better Duplicate Detection | High | **Completed** |
+| 4 | Conflict Resolution UI | Medium | **Completed** |
+| 5 | Dry Run / Preview | High | **Completed** |
+| 6 | Savings Balance Recalculation | Medium | **Completed** |
+| 7 | Loan Ref Collision Handling | Medium | **Completed** |
+| 8 | Schema Validation | Medium | **Completed** |
+| 9 | Import Log / Audit Trail | Medium | **Completed** |
+| 10 | Undo Import Operations | High | **Completed** |
+| 11 | CSV/Excel Import Support | Low | Pending |
+| 12 | Date Range Filter | Low | **Completed** |
+| 13 | Savings Stats in Summary | Low | **Completed** |

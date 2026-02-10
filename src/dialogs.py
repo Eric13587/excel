@@ -1,3 +1,4 @@
+import json
 from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton, 
                              QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, 
                              QFileDialog, QGroupBox, QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox,
@@ -162,6 +163,30 @@ class ImportDialog(QDialog):
         opts_layout.addWidget(self.chk_individuals)
         opts_layout.addWidget(self.chk_loans)
         opts_layout.addWidget(self.chk_savings)
+        
+        # Date Filter
+        self.chk_date_filter = QCheckBox("Filter Transactions by Date")
+        self.chk_date_filter.stateChanged.connect(self.toggle_date_inputs)
+        
+        date_layout = QHBoxLayout()
+        self.start_date = QDateEdit()
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDate(QDate.currentDate().addMonths(-1))
+        self.start_date.setEnabled(False)
+        
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDate(QDate.currentDate())
+        self.end_date.setEnabled(False)
+        
+        date_layout.addWidget(QLabel("Start:"))
+        date_layout.addWidget(self.start_date)
+        date_layout.addWidget(QLabel("End:"))
+        date_layout.addWidget(self.end_date)
+        
+        opts_layout.addWidget(self.chk_date_filter)
+        opts_layout.addLayout(date_layout)
+        
         opts_group.setLayout(opts_layout)
         self.layout.addWidget(opts_group)
         
@@ -189,6 +214,11 @@ class ImportDialog(QDialog):
         
         self.selected_file_path = None
 
+    def toggle_date_inputs(self, state):
+        enabled = (state == 2) # Checked
+        self.start_date.setEnabled(enabled)
+        self.end_date.setEnabled(enabled)
+
     def select_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, 
@@ -203,10 +233,17 @@ class ImportDialog(QDialog):
             self.import_btn.setEnabled(True)
 
     def get_data(self):
+        date_range = None
+        if self.chk_date_filter.isChecked():
+            start = self.start_date.date().toString("yyyy-MM-dd")
+            end = self.end_date.date().toString("yyyy-MM-dd")
+            date_range = (start, end)
+            
         return {
             "file_path": self.selected_file_path,
             "import_loans": self.chk_loans.isChecked(),
-            "import_savings": self.chk_savings.isChecked()
+            "import_savings": self.chk_savings.isChecked(),
+            "date_range": date_range
         }
 
 
@@ -385,4 +422,214 @@ class DuplicateResolutionDialog(QDialog):
             action = combo.currentData()
             decisions[src_id] = action
         return decisions
+
+
+class ImportHistoryDialog(QDialog):
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Import History")
+        self.resize(800, 500)
+        self.layout = QVBoxLayout(self)
+        
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["ID", "Date", "Source File", "Items", "Details"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.layout.addWidget(self.table)
+        
+        # Keys to display
+        self.keys = ['id', 'timestamp', 'source_file', 'item_count', 'details']
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.undo_btn = QPushButton("Undo Selected Import")
+        self.undo_btn.clicked.connect(self.undo_import)
+        self.undo_btn.setStyleSheet("background-color: #d9534f; color: white; padding: 5px;")
+        
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.undo_btn)
+        btn_layout.addWidget(close_btn)
+        self.layout.addLayout(btn_layout)
+        
+        self.load_history()
+        
+    def load_history(self):
+        self.table.setRowCount(0)
+        history = self.db.get_import_history()
+        self.table.setRowCount(len(history))
+        for i, row in enumerate(history):
+            for j, key in enumerate(self.keys):
+                raw_val = row.get(key, "")
+                display_val = str(raw_val)
+                tooltip = display_val
+
+                if key == 'details':
+                    try:
+                        # Try to parse JSON
+                        data = json.loads(raw_val)
+                        if isinstance(data, dict):
+                            # Format as "Ind: 5 | Loans: 2 ..."
+                            parts = []
+                            if data.get('individuals', 0) > 0: parts.append(f"Ind: {data['individuals']}")
+                            if data.get('loans', 0) > 0: parts.append(f"Loans: {data['loans']}")
+                            if data.get('savings', 0) > 0: parts.append(f"Sav: {data['savings']}")
+                            if data.get('ledger', 0) > 0: parts.append(f"Ledger: {data['ledger']}")
+                            
+                            display_val = " | ".join(parts) if parts else "No items imported"
+                            tooltip = json.dumps(data, indent=2)
+                    except (json.JSONDecodeError, TypeError):
+                        # Fallback for old string format or invalid json
+                        pass
+
+                item = QTableWidgetItem(display_val)
+                item.setToolTip(str(tooltip))
+                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable) 
+                self.table.setItem(i, j, item)
+                
+    def undo_import(self):
+        selected_rows = self.table.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select an import to undo.")
+            return
+            
+        row = selected_rows[0].row()
+        import_id = int(self.table.item(row, 0).text())
+        date = self.table.item(row, 1).text()
+        source = self.table.item(row, 2).text()
+        
+        reply = QMessageBox.question(
+            self, "Confirm Undo",
+            f"Are you sure you want to UNDO the import from {date}?\n\n"
+            f"Source: {source}\n\n"
+            "This will delete all individuals, loans, and transactions created by this import.\n"
+            "Merged data will be partially reverted (loans/savings deleted).",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            if self.db.undo_import(import_id):
+                QMessageBox.information(self, "Success", "Import undone successfully.")
+                self.load_history()
+            else:
+                QMessageBox.critical(self, "Error", "Failed to undo import. Check logs for details.")
+
+
+class ImportPreviewDialog(QDialog):
+    def __init__(self, preview_data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Preview")
+        self.resize(500, 400)
+        self.preview = preview_data
+        self.decision_map = {}
+        
+        self.layout = QVBoxLayout(self)
+        
+        # Summary Group
+        grp = QGroupBox("Import Summary")
+        form = QFormLayout()
+        
+        s = self.preview['summary']
+        self.individuals_new_count = s['individuals_new']
+        self.individuals_merged_count = s['individuals_merged']
+        
+        self.lbl_new = QLabel(str(self.individuals_new_count))
+        self.lbl_merged = QLabel(str(self.individuals_merged_count))
+        self.lbl_conflicts = QLabel(str(s['conflicts']))
+        if s['conflicts'] > 0:
+            self.lbl_conflicts.setStyleSheet("color: red; font-weight: bold;")
+            
+        form.addRow("New Individuals:", self.lbl_new)
+        form.addRow("Merged Individuals:", self.lbl_merged)
+        form.addRow("Potential Conflicts:", self.lbl_conflicts)
+        form.addRow(QLabel("---"))
+        form.addRow("Loans to Import:", QLabel(str(s['loans'])))
+        
+        # Loan Renames
+        if s.get('loans_renamed', 0) > 0:
+            lbl_renames = QLabel(str(s['loans_renamed']))
+            lbl_renames.setStyleSheet("color: orange; font-weight: bold;")
+            form.addRow("Loans to Rename:", lbl_renames)
+            
+        form.addRow("Ledger Entries:", QLabel(str(s['ledger'])))
+        form.addRow("Savings Entries:", QLabel(str(s['savings'])))
+        
+        grp.setLayout(form)
+        self.layout.addWidget(grp)
+        
+        # Conflict Resolution Area
+        self.conflict_layout = QVBoxLayout()
+        if s['conflicts'] > 0:
+            self.res_btn = QPushButton(f"Resolve {s['conflicts']} Conflicts")
+            self.res_btn.clicked.connect(self.resolve_conflicts)
+            self.res_btn.setStyleSheet("background-color: #f0ad4e; color: white; font-weight: bold;")
+            self.conflict_layout.addWidget(self.res_btn)
+            
+            self.conflict_lbl = QLabel("Conflicts must be resolved before importing.")
+            self.conflict_lbl.setStyleSheet("color: #666; font-style: italic;")
+            self.conflict_lbl.setWordWrap(True)
+            self.conflict_layout.addWidget(self.conflict_lbl)
+        else:
+            self.conflict_layout.addWidget(QLabel("No conflicts detected. Ready to import."))
+            
+        self.layout.addLayout(self.conflict_layout)
+        
+        self.layout.addStretch()
+        
+        # Buttons
+        btns = QHBoxLayout()
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        self.import_btn = QPushButton("Start Import")
+        self.import_btn.clicked.connect(self.accept)
+        # Disable import if conflicts exist and not resolved
+        if s['conflicts'] > 0:
+            self.import_btn.setEnabled(False)
+            
+        btns.addStretch()
+        btns.addWidget(self.cancel_btn)
+        btns.addWidget(self.import_btn)
+        self.layout.addLayout(btns)
+        
+    def resolve_conflicts(self):
+        dlg = DuplicateResolutionDialog(self.preview['conflicts'], self)
+        if dlg.exec():
+            self.decision_map = dlg.get_decisions()
+            
+            # Calculate impact of decisions
+            new_add = 0
+            merged_add = 0
+            skipped = 0
+            
+            for action in self.decision_map.values():
+                if action == 'new': 
+                    new_add += 1
+                elif action == 'skip': 
+                    skipped += 1
+                else: 
+                    merged_add += 1
+            
+            # Update labels
+            total_resolved = len(self.decision_map)
+            self.lbl_conflicts.setText("Resolved")
+            self.lbl_conflicts.setStyleSheet("color: green; font-weight: bold;")
+            
+            self.lbl_new.setText(f"{self.individuals_new_count} + {new_add} (from conflicts)")
+            self.lbl_merged.setText(f"{self.individuals_merged_count} + {merged_add} (from conflicts)")
+            
+            self.conflict_lbl.setText(f"Decisions made: {new_add} New, {merged_add} Merged, {skipped} Skipped.")
+            
+            self.res_btn.setEnabled(False)
+            self.res_btn.setText("Conflicts Resolved")
+            self.import_btn.setEnabled(True)
+            
+    def get_decisions(self):
+        return self.decision_map
 
