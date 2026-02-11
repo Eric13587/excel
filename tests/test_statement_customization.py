@@ -69,5 +69,36 @@ class TestStatementCustomization(unittest.TestCase):
         # Check Period Display
         self.assertIn("01/01/2026", pres.period_display)
 
+    def test_show_loans_toggle(self):
+        """Test that show_loans=False excludes loans from HTML."""
+        config = StatementConfig(show_loans=False)
+        data = self.db.get_statement_data(self.ind_id, "2026-01-01", "2026-01-31")
+        pres = self.sg._prepare_presentation(data, "2026-01-01", "2026-01-31", config)
+        
+        # Loans should not be prepared
+        self.assertEqual(len(pres.loan_sections), 0)
+        
+        html = self.sg._generate_pdf_html(pres, config)
+        self.assertNotIn("Loan:", html)
+        # No loans column div should be rendered
+        self.assertNotIn('<div class="loans-column">', html)
+        self.assertNotIn("LOANS</div>", html)
+        # Savings should be standalone and centered
+        self.assertIn("standalone", html)
+        self.assertIn("centered", html)
+        # Only savings balance in summary, no loan totals
+        self.assertIn("Savings Balance", html)
+        self.assertNotIn("Net Outstanding", html)
+
+    def test_show_loans_enabled(self):
+        """Test that show_loans=True includes loans in HTML."""
+        config = StatementConfig(show_loans=True)
+        data = self.db.get_statement_data(self.ind_id, "2026-01-01", "2026-01-31")
+        pres = self.sg._prepare_presentation(data, "2026-01-01", "2026-01-31", config)
+        
+        html = self.sg._generate_pdf_html(pres, config)
+        self.assertIn("LOANS", html)
+        self.assertNotIn("Loans section excluded", html)
+
 if __name__ == "__main__":
     unittest.main()

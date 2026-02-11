@@ -16,7 +16,6 @@ except ImportError:
     _PANDAS_AVAILABLE = False
 
 from src.config import DEFAULT_INTEREST_RATE
-from src.config import DEFAULT_INTEREST_RATE
 from src.data_structures import (
     StatementData, StatementPresentation, StatementLoanSection, 
     StatementRow, StatementSavingsRow, StatementConfig
@@ -131,7 +130,7 @@ class StatementGenerator:
         total_balance = 0.0
         total_gross_balance = 0.0
         
-        if not df.empty:
+        if config.show_loans and not df.empty:
             df['loan_id'] = df['loan_id'].fillna('-')
             loan_groups = df.groupby('loan_id')
             
@@ -265,6 +264,9 @@ class StatementGenerator:
         if config is None:
             config = StatementConfig()
 
+        savings_only = not config.show_loans and config.show_savings
+        loans_only = config.show_loans and not config.show_savings
+
         # Generate HTML with landscape layout
         html = """<!DOCTYPE html>
 <html><head>
@@ -281,14 +283,17 @@ class StatementGenerator:
     .client-info .right { text-align: right; }
     .client-info p { margin: 2px 0; }
     .main-container { display: flex; gap: 20px; }
+    .main-container.centered { justify-content: center; }
     .loans-column { flex: 1; }
     .savings-column { flex: 0.6; }
+    .savings-column.standalone { flex: none; width: 70%; }
     .section-title { background: #2b5797; color: white; padding: 6px 10px; font-size: 11px; font-weight: bold; margin-bottom: 0; }
     .savings-title { background: #28a745; }
     table { width: 100%; border-collapse: collapse; font-size: 8px; margin-bottom: 10px; }
     th { background: #e0e0e0; padding: 4px; text-align: left; border: 1px solid #ccc; font-size: 7px; }
     td { padding: 3px 4px; border: 1px solid #ddd; }
     .loan-box { margin-bottom: 12px; }
+    .summary-row { margin-top: 15px; padding: 10px; background: #f9f9f9; border-radius: 5px; }
     .footer { margin-top: 15px; text-align: center; font-size: 8px; color: #999; }
 </style>
 </head><body>"""
@@ -312,56 +317,53 @@ class StatementGenerator:
         <p><strong>Statement Date:</strong> {datetime.now().strftime(config.date_format)}</p>
         <p><strong>Account Status:</strong> <span style="color:{presentation.status_color};font-weight:bold;">{presentation.status_str}</span></p>
     </div>
-</div>
-<div class="main-container">
-    <div class="loans-column">
+</div>"""
+
+        # Main container — centered when savings-only
+        container_class = "main-container centered" if savings_only else "main-container"
+        html += f'<div class="{container_class}">'
+
+        # === LOANS COLUMN ===
+        if config.show_loans:
+            html += """<div class="loans-column">
         <div class="section-title">LOANS</div>"""
-        
-        # Build Column Headers
-        # Defined columns map to attributes
-        # "Date" -> row.date
-        # "Type" -> row.event_type
-        # "Debit" -> row.debit
-        # "Interest" -> row.interest
-        # "Credit" -> row.credit
-        # "Balance" -> row.balance
-        # "Gross" -> row.gross_balance (conditionally formatted)
-        # "Notes" -> row.notes
-        
-        def render_header():
-             return "".join([f"<th>{col}</th>" for col in config.columns])
 
-        def render_row(row):
-            def get_val(col):
-                if col == "Date": return row.date
-                if col == "Type": return row.event_type
-                if col == "Debit": return f"{row.debit:,.0f}"
-                if col == "Interest": return f"{row.interest:,.0f}"
-                if col == "Credit": return f"{row.credit:,.0f}"
-                if col == "Balance": return f"{row.balance:,.0f}"
-                if col == "Gross": return f"{row.gross_balance:,.0f}" if row.show_gross else ""
-                if col == "Notes": return row.notes
-                return ""
+            def render_header():
+                 return "".join([f"<th>{col}</th>" for col in config.columns])
+
+            def render_row(row):
+                def get_val(col):
+                    if col == "Date": return row.date
+                    if col == "Type": return row.event_type
+                    if col == "Debit": return f"{row.debit:,.0f}"
+                    if col == "Interest": return f"{row.interest:,.0f}"
+                    if col == "Credit": return f"{row.credit:,.0f}"
+                    if col == "Balance": return f"{row.balance:,.0f}"
+                    if col == "Gross": return f"{row.gross_balance:,.0f}" if row.show_gross else ""
+                    if col == "Notes": return row.notes
+                    return ""
+                
+                return "<tr>" + "".join([f"<td>{get_val(c)}</td>" for c in config.columns]) + "</tr>"
+
+            if presentation.loan_sections:
+                for section in presentation.loan_sections:
+                    html += f"""<div class="loan-box">
+                    <table><thead><tr><th colspan="{len(config.columns)}" style="background:#2b5797;color:white;">Loan: {section.loan_ref}</th></tr>
+                    <tr>{render_header()}</tr></thead><tbody>"""
+                    
+                    for row in section.rows:
+                        html += render_row(row)
+                    
+                    html += "</tbody></table></div>"
+            else:
+                html += "<p style='padding:10px;color:#666;'>No loan transactions in this period</p>"
             
-            return "<tr>" + "".join([f"<td>{get_val(c)}</td>" for c in config.columns]) + "</tr>"
-
-        if presentation.loan_sections:
-            for section in presentation.loan_sections:
-                html += f"""<div class="loan-box">
-                <table><thead><tr><th colspan="{len(config.columns)}" style="background:#2b5797;color:white;">Loan: {section.loan_ref}</th></tr>
-                <tr>{render_header()}</tr></thead><tbody>"""
-                
-                for row in section.rows:
-                    html += render_row(row)
-                
-                html += "</tbody></table></div>"
-        else:
-            html += "<p style='padding:10px;color:#666;'>No loan transactions in this period</p>"
+            html += """</div>"""
         
-        html += """</div>"""
-        
+        # === SAVINGS COLUMN ===
         if config.show_savings:
-            html += """<div class="savings-column">
+            col_class = "savings-column standalone" if savings_only else "savings-column"
+            html += f"""<div class="{col_class}">
         <div class="section-title savings-title">SAVINGS / SHARES</div>"""
             if presentation.savings_rows:
                 html += """<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Balance</th><th>Notes</th></tr></thead><tbody>"""
@@ -375,17 +377,25 @@ class StatementGenerator:
                 html += "<p style='padding:10px;color:#666;'>No savings transactions in this period</p>"
             html += "</div>"
         
-        html += f"""</div>
-<div class="summary-row">
-    <div class="summary-item summary-loans">
+        html += "</div>"  # close main-container
+
+        # === SUMMARY ROW — only show relevant sections ===
+        html += '<div class="summary-row">'
+        
+        if config.show_loans:
+            html += f"""<div class="summary-item summary-loans">
         <div>Total Net Outstanding: {presentation.total_net_outstanding:,.0f}</div>
         <div style="font-size:10px;color:#666;">(Principal + Accrued Interest)</div>
         <div style="margin-top:5px;">Total Gross Outstanding: {presentation.total_gross_outstanding:,.0f}</div>
         <div style="font-size:10px;color:#666;">(Principal + Total Expected Interest)</div>
-    </div>
-    {'<div class="summary-item summary-savings">Savings Balance: {:,.0f}</div>'.format(presentation.savings_balance) if config.show_savings else ''}
-</div>
-<div class="footer">{config.custom_footer} | Statement generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} | Period: {presentation.period_display}</div>
+    </div>"""
+        
+        if config.show_savings:
+            html += f'<div class="summary-item summary-savings">Savings Balance: {presentation.savings_balance:,.0f}</div>'
+        
+        html += "</div>"  # close summary-row
+
+        html += f"""<div class="footer">{config.custom_footer} | Statement generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} | Period: {presentation.period_display}</div>
 </body></html>"""
         
         return html
@@ -482,9 +492,6 @@ class StatementGenerator:
             web_view.page().printToPdf(filepath, page_layout)
             loop.exec()
             
-            web_view.page().printToPdf(filepath, page_layout)
-            loop.exec()
-            
         except Exception as e:
             if config and not config.allow_html_fallback:
                  print(f"PDF generation failed: {e}. Fallback disabled.")
@@ -538,7 +545,7 @@ class StatementGenerator:
         
         # Prepare presentation
         try:
-             presentation = self._prepare_presentation(data, from_date, to_date)
+             presentation = self._prepare_presentation(data, from_date, to_date, config)
         except Exception as e:
             print(f"Presentation preparation failed: {e}")
             return False
@@ -596,7 +603,7 @@ class StatementGenerator:
 
                 row_idx = 3
                 
-                if presentation.loan_sections:
+                if config.show_loans and presentation.loan_sections:
                     for section in presentation.loan_sections:
                         # Merge title across dynamic columns
                         worksheet.merge_range(row_idx, 0, row_idx, len(config.columns)-1, f"Loan Reference: {section.loan_ref}", sub_header_fmt)
@@ -635,8 +642,6 @@ class StatementGenerator:
                         worksheet.write(row_idx, 3, row.balance, currency_fmt)
                         worksheet.write(row_idx, 4, row.notes, cell_fmt)
                         row_idx += 1
-            
-            return True
             
             return True
             

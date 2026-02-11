@@ -12,15 +12,21 @@ import re
 class IndividualDialog(QDialog):
     """Dialog for adding/editing individual details with input validation."""
     
-    def __init__(self, parent=None, name="", phone="", email=""):
+    def __init__(self, parent=None, name="", phone="", email="", mode="add"):
         super().__init__(parent)
-        self.setWindowTitle("Individual Details")
-        self.setMinimumWidth(350)
+        is_edit = mode == "edit"
+        self.setWindowTitle("Edit Individual" if is_edit else "Add Individual")
+        self.setMinimumWidth(380)
         self.layout = QFormLayout(self)
+        
+        # Shared validation style
+        self._error_style = "border: 1px solid #dc3545; border-radius: 3px; padding: 4px;"
+        self._normal_style = "border: 1px solid #ccc; border-radius: 3px; padding: 4px;"
         
         # Name input with validation
         self.name_input = QLineEdit(name)
         self.name_input.setPlaceholderText("Enter full name")
+        self.name_input.setStyleSheet(self._normal_style)
         self.name_error = QLabel()
         self.name_error.setStyleSheet("color: #dc3545; font-size: 11px;")
         self.name_error.setWordWrap(True)
@@ -35,6 +41,7 @@ class IndividualDialog(QDialog):
         # Phone input with validation
         self.phone_input = QLineEdit(phone)
         self.phone_input.setPlaceholderText("e.g., +254 712 345678")
+        self.phone_input.setStyleSheet(self._normal_style)
         self.phone_error = QLabel()
         self.phone_error.setStyleSheet("color: #dc3545; font-size: 11px;")
         self.phone_error.setWordWrap(True)
@@ -49,6 +56,7 @@ class IndividualDialog(QDialog):
         # Email input with validation
         self.email_input = QLineEdit(email)
         self.email_input.setPlaceholderText("e.g., name@example.com")
+        self.email_input.setStyleSheet(self._normal_style)
         self.email_error = QLabel()
         self.email_error.setStyleSheet("color: #dc3545; font-size: 11px;")
         self.email_error.setWordWrap(True)
@@ -59,55 +67,66 @@ class IndividualDialog(QDialog):
         email_layout.addWidget(self.email_input)
         email_layout.addWidget(self.email_error)
         self.layout.addRow("Email:", email_layout)
-        
+
         # Real-time validation on text change
         self.name_input.textChanged.connect(self.validate_name)
         self.phone_input.textChanged.connect(self.validate_phone)
         self.email_input.textChanged.connect(self.validate_email)
         
-        self.save_btn = QPushButton("Save")
-        self.save_btn.clicked.connect(self.validate_and_accept)
-        self.layout.addRow(self.save_btn)
+        # Enter key submits from any field
+        self.name_input.returnPressed.connect(self.validate_and_accept)
+        self.phone_input.returnPressed.connect(self.validate_and_accept)
+        self.email_input.returnPressed.connect(self.validate_and_accept)
+        
+        # Save + Cancel buttons via QDialogButtonBox
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self.validate_and_accept)
+        self.button_box.rejected.connect(self.reject)
+        self.layout.addRow(self.button_box)
+    
+    def _set_field_error(self, field, error_label, message):
+        """Show error state on a field."""
+        error_label.setText(message)
+        error_label.show()
+        field.setStyleSheet(self._error_style)
+    
+    def _clear_field_error(self, field, error_label):
+        """Clear error state on a field."""
+        error_label.hide()
+        field.setStyleSheet(self._normal_style)
     
     def validate_name(self):
         """Validate name field: required, max 100 characters."""
         name = self.name_input.text().strip()
         if not name:
-            self.name_error.setText("Name is required")
-            self.name_error.show()
-            self.name_input.setStyleSheet("border: 1px solid #dc3545;")
+            self._set_field_error(self.name_input, self.name_error, "Name is required")
             return False
         if len(name) > 100:
-            self.name_error.setText("Name too long (max 100 characters)")
-            self.name_error.show()
-            self.name_input.setStyleSheet("border: 1px solid #dc3545;")
+            self._set_field_error(self.name_input, self.name_error, "Name too long (max 100 characters)")
             return False
-        self.name_error.hide()
-        self.name_input.setStyleSheet("")
+        self._clear_field_error(self.name_input, self.name_error)
         return True
     
     def validate_phone(self):
         """Validate phone field: optional, but if provided must be valid format."""
         phone = self.phone_input.text().strip()
         if phone and not re.match(r'^[\d\s\-\+\(\)]{7,20}$', phone):
-            self.phone_error.setText("Invalid phone format (use digits, spaces, +, -, parentheses)")
-            self.phone_error.show()
-            self.phone_input.setStyleSheet("border: 1px solid #dc3545;")
+            self._set_field_error(self.phone_input, self.phone_error, 
+                                 "Invalid phone format (use digits, spaces, +, -, parentheses)")
             return False
-        self.phone_error.hide()
-        self.phone_input.setStyleSheet("")
+        self._clear_field_error(self.phone_input, self.phone_error)
         return True
     
     def validate_email(self):
         """Validate email field: optional, but if provided must be valid format."""
         email = self.email_input.text().strip()
         if email and not re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
-            self.email_error.setText("Invalid email format (e.g., name@example.com)")
-            self.email_error.show()
-            self.email_input.setStyleSheet("border: 1px solid #dc3545;")
+            self._set_field_error(self.email_input, self.email_error, 
+                                 "Invalid email format (e.g., name@example.com)")
             return False
-        self.email_error.hide()
-        self.email_input.setStyleSheet("")
+        self._clear_field_error(self.email_input, self.email_error)
         return True
     
     def validate_and_accept(self):
@@ -120,7 +139,11 @@ class IndividualDialog(QDialog):
             self.accept()
 
     def get_data(self):
-        return self.name_input.text().strip(), self.phone_input.text().strip(), self.email_input.text().strip()
+        # Normalize name: strip + collapse internal whitespace
+        name = " ".join(self.name_input.text().strip().split())
+        phone = self.phone_input.text().strip()
+        email = self.email_input.text().strip()
+        return name, phone, email
 
 
 class ImportDialog(QDialog):
@@ -251,7 +274,7 @@ class ImportDialog(QDialog):
 class StatementConfigDialog(QDialog):
     """Dialog for configuring statement generation options."""
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_start_date=None):
         super().__init__(parent)
         self.setWindowTitle("Generate Statements")
         self.setMinimumWidth(400)
@@ -263,7 +286,16 @@ class StatementConfigDialog(QDialog):
         
         self.from_date = QDateEdit()
         self.from_date.setCalendarPopup(True)
-        self.from_date.setDate(QDate.currentDate().addMonths(-1)) # Default 1 month back
+        
+        # Smart default: use earliest record date if provided, else 1 month back
+        if default_start_date:
+            qd = QDate.fromString(default_start_date, "yyyy-MM-dd")
+            if qd.isValid():
+                self.from_date.setDate(qd)
+            else:
+                self.from_date.setDate(QDate.currentDate().addMonths(-1))
+        else:
+            self.from_date.setDate(QDate.currentDate().addMonths(-1))
         
         self.to_date = QDateEdit()
         self.to_date.setCalendarPopup(True)
@@ -274,27 +306,22 @@ class StatementConfigDialog(QDialog):
         date_group.setLayout(date_layout)
         self.layout.addWidget(date_group)
         
-        # 2. Options Section
+        # 2. Content Options (section-level toggles)
         opts_group = QGroupBox("Content Options")
         opts_layout = QVBoxLayout()
+        
+        self.chk_loans = QCheckBox("Include Loans Section")
+        self.chk_loans.setChecked(True)
         
         self.chk_savings = QCheckBox("Include Savings Section")
         self.chk_savings.setChecked(True)
         
-        self.chk_gross = QCheckBox("Show Gross Balance Column")
-        self.chk_gross.setChecked(True)
-        self.chk_gross.setToolTip("Show the running gross balance (Principal + Interest) if available")
-        
-        self.chk_notes = QCheckBox("Show Notes Column")
-        self.chk_notes.setChecked(True)
-        
+        opts_layout.addWidget(self.chk_loans)
         opts_layout.addWidget(self.chk_savings)
-        opts_layout.addWidget(self.chk_gross)
-        opts_layout.addWidget(self.chk_notes)
         opts_group.setLayout(opts_layout)
         self.layout.addWidget(opts_group)
         
-        # 3. Column Selection (Advanced)
+        # 3. Visible Columns (column-level toggles for loans table)
         col_group = QGroupBox("Visible Columns")
         col_layout = QVBoxLayout()
         self.col_list = QListWidget()
@@ -309,10 +336,6 @@ class StatementConfigDialog(QDialog):
         col_layout.addWidget(self.col_list)
         col_group.setLayout(col_layout)
         
-        # Sync logic
-        self.chk_gross.stateChanged.connect(lambda s: self.set_col_state("Gross", s))
-        self.chk_notes.stateChanged.connect(lambda s: self.set_col_state("Notes", s))
-        
         self.layout.addWidget(col_group)
         
         # Buttons
@@ -320,29 +343,28 @@ class StatementConfigDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         self.layout.addWidget(btns)
-        
-    def set_col_state(self, col_name, state):
-        for i in range(self.col_list.count()):
-            item = self.col_list.item(i)
-            if item.text() == col_name:
-                item.setCheckState(Qt.CheckState.Checked if state else Qt.CheckState.Unchecked)
                 
     def get_config(self):
         """Return (from_date, to_date, StatementConfig)."""
         f_date = self.from_date.date()
         t_date = self.to_date.date()
         
-        # Get columns
+        # Get columns from list
         cols = []
         for i in range(self.col_list.count()):
             item = self.col_list.item(i)
             if item.checkState() == Qt.CheckState.Checked:
                 cols.append(item.text())
         
+        # Derive show_gross_balance / show_notes from column list
+        show_gross = "Gross" in cols
+        show_notes = "Notes" in cols
+        
         config = StatementConfig(
+            show_loans=self.chk_loans.isChecked(),
             show_savings=self.chk_savings.isChecked(),
-            show_gross_balance=self.chk_gross.isChecked(),
-            show_notes=self.chk_notes.isChecked(),
+            show_gross_balance=show_gross,
+            show_notes=show_notes,
             columns=cols
         )
         

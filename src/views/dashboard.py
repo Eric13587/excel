@@ -555,7 +555,7 @@ class Dashboard(QWidget):
             card.apply_theme()
 
 
-    def refresh_list(self):
+    def refresh_list(self, select_id=None):
         # Clear existing items
         self.card_widgets = []
         self.selected_card = None
@@ -578,6 +578,13 @@ class Dashboard(QWidget):
         
         # Sync to UIStateManager
         self._ui_state.set_cards(self.card_widgets)
+        
+        # Auto-select if requested
+        if select_id is not None:
+            for card in self.card_widgets:
+                if card.ind_id == select_id:
+                    self.select_individual(card)
+                    break
 
     def filter_list(self, text):
         """Filter cards by text using UIStateManager."""
@@ -726,8 +733,15 @@ class Dashboard(QWidget):
         
         def set_mode_and_configure(mode):
             self.print_mode = mode
-            # Open Config Dialog
-            conf_dialog = StatementConfigDialog(dialog)
+            
+            # Compute earliest date across selected individuals
+            selected_ids = [cb.property("ind_id") for cb in checkboxes if cb.isChecked()]
+            earliest_date = None
+            if selected_ids:
+                earliest_date = self.db.get_earliest_record_date_for_ids(selected_ids)
+            
+            # Open Config Dialog with smart default start date
+            conf_dialog = StatementConfigDialog(dialog, default_start_date=earliest_date)
             if conf_dialog.exec() == QDialog.DialogCode.Accepted:
                 # Capture data
                 f_date, t_date, config = conf_dialog.get_config()
