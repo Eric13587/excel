@@ -1,6 +1,5 @@
 """Database management module for LoanMaster."""
 import sqlite3
-import sqlite3
 import pandas as pd
 import json
 from datetime import datetime
@@ -255,12 +254,18 @@ class DatabaseManager:
         self.conn.commit()
 
     # Individual operations
-    def add_individual(self, name, phone, email):
+    def add_individual(self, name, phone, email, default_deduction=0):
         cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO individuals (name, phone, email, created_at) VALUES (?, ?, ?, ?)",
-                       (name, phone, email, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        cursor.execute("INSERT INTO individuals (name, phone, email, default_deduction, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (name, phone, email, default_deduction, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         self.conn.commit()
         return cursor.lastrowid
+
+    def individual_name_exists(self, name):
+        """Check if an individual with the given name already exists (case-insensitive)."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM individuals WHERE LOWER(name) = LOWER(?)", (name,))
+        return cursor.fetchone()[0] > 0
 
     def get_individuals(self):
         cursor = self.conn.cursor()
@@ -320,6 +325,38 @@ class DatabaseManager:
             savings_balance=savings_balance,
             active_loans=active_loans
         )
+
+    def get_earliest_record_date(self, individual_id):
+        """Get the earliest transaction date for an individual across ledger and savings."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT MIN(date) FROM (
+                SELECT MIN(date) AS date FROM ledger WHERE individual_id = ?
+                UNION ALL
+                SELECT MIN(date) AS date FROM savings WHERE individual_id = ?
+            )
+        """, (individual_id, individual_id))
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+
+    def get_earliest_record_date_for_ids(self, individual_ids):
+        """Get the earliest transaction date across multiple individuals.
+        
+        Uses a single query with IN clause for efficiency.
+        """
+        if not individual_ids:
+            return None
+        placeholders = ','.join('?' * len(individual_ids))
+        cursor = self.conn.cursor()
+        cursor.execute(f"""
+            SELECT MIN(date) FROM (
+                SELECT MIN(date) AS date FROM ledger WHERE individual_id IN ({placeholders})
+                UNION ALL
+                SELECT MIN(date) AS date FROM savings WHERE individual_id IN ({placeholders})
+            )
+        """, list(individual_ids) + list(individual_ids))
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
 
     # Ledger operations
     def get_ledger(self, individual_id, start_date=None, end_date=None):
@@ -464,9 +501,9 @@ class DatabaseManager:
         cursor.execute("""
             INSERT INTO loans (
                 individual_id, ref, principal, total_amount, balance, installment, 
-                monthly_interest, start_date, next_due_date, unearned_interest, interest_balance
+                monthly_interest, start_date, next_due_date, unearned_interest, interest_balance, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Active')
         """, (individual_id, ref, principal, total, balance, installment, monthly_interest, start_date, next_due_date, unearned_interest))
         self.conn.commit()
 

@@ -37,10 +37,10 @@ class TestMassPartialFailure(unittest.TestCase):
         # We need to patch `catch_up_loan` on the service instance
         original_catch_up = self.engine.loan_service.catch_up_loan
         
-        def side_effect(ind_id, loan_ref, batch_id=None):
+        def side_effect(ind_id, loan_ref, batch_id=None, target_date=None):
             if ind_id == self.u2:
                 raise ValueError("Simulated Failure for U2")
-            return original_catch_up(ind_id, loan_ref, batch_id)
+            return original_catch_up(ind_id, loan_ref, batch_id, target_date=target_date)
             
         with patch.object(self.engine.loan_service, 'catch_up_loan', side_effect=side_effect):
             result = self.engine.mass_catch_up_loans(items)
@@ -72,10 +72,10 @@ class TestMassPartialFailure(unittest.TestCase):
         
         original_catch_up = self.engine.savings_service.catch_up_savings
         
-        def side_effect(ind_id, amount=None, batch_id=None):
+        def side_effect(ind_id, amount=None, batch_id=None, target_date=None):
             if ind_id == self.u2:
                 raise ValueError("Simulated Savings Failure")
-            return original_catch_up(ind_id, amount, batch_id)
+            return original_catch_up(ind_id, amount, batch_id, target_date=target_date)
             
         with patch.object(self.engine.savings_service, 'catch_up_savings', side_effect=side_effect):
             result = self.engine.mass_catch_up_savings(items)

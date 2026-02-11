@@ -64,9 +64,8 @@ class LoanActionController:
         if dialog.exec():
             name, phone, email = dialog.get_data()
             if name:
-                # Check for duplicates
-                existing = self.db.get_individuals()
-                if any(ind[1].lower() == name.lower() for ind in existing):
+                # Efficient SQL duplicate check
+                if self.db.individual_name_exists(name):
                     confirm = QMessageBox.question(
                         self.parent, "Duplicate Name",
                         f"The name '{name}' already exists. Add anyway?",
@@ -75,9 +74,14 @@ class LoanActionController:
                     if confirm == QMessageBox.StandardButton.No:
                         return False
 
-                self.db.add_individual(name, phone, email)
+                new_id = self.db.add_individual(name, phone, email)
                 if self.on_refresh:
-                    self.on_refresh()
+                    self.on_refresh(select_id=new_id)
+                
+                QMessageBox.information(
+                    self.parent, "Success",
+                    f"'{name}' has been added successfully."
+                )
                 return True
         return False
     
@@ -96,14 +100,17 @@ class LoanActionController:
         ind_id = self.ui_state.get_selected_id()
         card = self.ui_state.selected_card
         
-        dialog = dialog_class(self.parent, card.name, card.phone, 
-                             getattr(card, 'email', ''))
+        dialog = dialog_class(
+            self.parent, card.name, card.phone, 
+            getattr(card, 'email', ''),
+            mode="edit"
+        )
         if dialog.exec():
             name, phone, email = dialog.get_data()
             if name:
                 self.db.update_individual(ind_id, name, phone, email)
                 if self.on_refresh:
-                    self.on_refresh()
+                    self.on_refresh(select_id=ind_id)
                 return True
         return False
     

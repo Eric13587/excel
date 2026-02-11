@@ -52,6 +52,7 @@ class StatementPresentation:
 
 @dataclass
 class StatementConfig:
+    show_loans: bool = True
     show_savings: bool = True
     show_gross_balance: bool = True
     show_notes: bool = True
