@@ -6,10 +6,10 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, 
                              QPushButton, QLineEdit, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QScrollArea, QGroupBox,
-                             QMessageBox, QFileDialog, QInputDialog, QMenu, QDialog,
+                             QMessageBox, QFileDialog, QMenu, QDialog,
                              QFormLayout, QDateEdit, QCheckBox, QSpinBox, QDialogButtonBox,
-                             QHeaderView, QAbstractItemView, QSplitter, QProgressDialog, QApplication)
-from PyQt6.QtGui import QAction, QColor, QShortcut, QKeySequence, QTextDocument
+                             QHeaderView, QSplitter, QProgressDialog, QApplication)
+from PyQt6.QtGui import QAction, QColor, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QDate, QTimer
 
 

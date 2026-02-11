@@ -359,9 +359,6 @@ class LoanEngine:
         return self.loan_service.restructure_loan(
             individual_id, loan_ref, new_duration, new_interest_rate
         )
-        
-        self.recalculate_default_deduction(individual_id)
-        return True
 
 
     def recalculate_loan_history(self, individual_id, loan_ref):

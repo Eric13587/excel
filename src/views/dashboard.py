@@ -4,8 +4,8 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QTableWidgetItem, QLineEdit, QMessageBox,
                              QFileDialog, QDialog, QFormLayout, QCheckBox,
                              QScrollArea, QDialogButtonBox, QMenu, QFrame, QGraphicsDropShadowEffect, QProgressDialog, QApplication)
-from PyQt6.QtGui import QAction, QPixmap, QFont, QColor
-from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
+from PyQt6.QtGui import QAction, QPixmap, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from datetime import datetime
 import os
 import sys
