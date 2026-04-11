@@ -61,6 +61,7 @@ class StatementConfig:
     date_format: str = "%B %d, %Y"
     # Default columns for PDF/Excel
     columns: List[str] = field(default_factory=lambda: ["Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"])
+    savings_columns: List[str] = field(default_factory=lambda: ["Date", "Type", "Amount", "Balance", "Notes"])
     company_logo_path: Optional[str] = None
     company_name: Optional[str] = None
     allow_html_fallback: bool = True

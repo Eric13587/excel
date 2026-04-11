@@ -2,7 +2,7 @@ import json
 from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton, 
                              QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, 
                              QFileDialog, QGroupBox, QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox,
-                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView, QColorDialog)
+                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView, QColorDialog, QFrame)
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 from .data_structures import StatementConfig
@@ -299,7 +299,11 @@ class StatementConfigDialog(QDialog):
         
         self.to_date = QDateEdit()
         self.to_date.setCalendarPopup(True)
-        self.to_date.setDate(QDate.currentDate())
+        # Default to END of PREVIOUS month
+        curr = QDate.currentDate()
+        first_of_curr = QDate(curr.year(), curr.month(), 1)
+        prev_month_end = first_of_curr.addDays(-1)
+        self.to_date.setDate(prev_month_end)
         
         date_layout.addRow("From:", self.from_date)
         date_layout.addRow("To:", self.to_date)
@@ -321,20 +325,47 @@ class StatementConfigDialog(QDialog):
         opts_group.setLayout(opts_layout)
         self.layout.addWidget(opts_group)
         
-        # 3. Visible Columns (column-level toggles for loans table)
+        # 3. Visible Columns (column-level toggles for loans and savings tables)
         col_group = QGroupBox("Visible Columns")
-        col_layout = QVBoxLayout()
-        self.col_list = QListWidget()
-        self.col_list.setFixedHeight(120)
+        col_layout = QHBoxLayout()
         
+        # Loans List
+        loan_col_layout = QVBoxLayout()
+        loan_col_layout.addWidget(QLabel("<b>Loans</b>"))
+        self.loan_col_list = QListWidget()
+        self.loan_col_list.setFixedHeight(120)
         all_cols = ["Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"]
         for col in all_cols:
             item = QListWidgetItem(col)
             item.setCheckState(Qt.CheckState.Checked)
-            self.col_list.addItem(item)
-            
-        col_layout.addWidget(self.col_list)
+            self.loan_col_list.addItem(item)
+        loan_col_layout.addWidget(self.loan_col_list)
+        
+        # Divider
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.VLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        
+        # Savings List
+        sav_col_layout = QVBoxLayout()
+        sav_col_layout.addWidget(QLabel("<b>Savings / Shares</b>"))
+        self.sav_col_list = QListWidget()
+        self.sav_col_list.setFixedHeight(120)
+        sav_cols = ["Date", "Type", "Amount", "Balance", "Notes"]
+        for col in sav_cols:
+            item = QListWidgetItem(col)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.sav_col_list.addItem(item)
+        sav_col_layout.addWidget(self.sav_col_list)
+        
+        col_layout.addLayout(loan_col_layout)
+        col_layout.addWidget(divider)
+        col_layout.addLayout(sav_col_layout)
         col_group.setLayout(col_layout)
+        
+        # Logic to enable/disable column lists based on section toggles
+        self.chk_loans.stateChanged.connect(lambda state: self.loan_col_list.setEnabled(state == 2))
+        self.chk_savings.stateChanged.connect(lambda state: self.sav_col_list.setEnabled(state == 2))
         
         self.layout.addWidget(col_group)
         
@@ -349,23 +380,34 @@ class StatementConfigDialog(QDialog):
         f_date = self.from_date.date()
         t_date = self.to_date.date()
         
+        # Expand bounds to encompass full months
+        f_date = QDate(f_date.year(), f_date.month(), 1)
+        t_date = QDate(t_date.year(), t_date.month(), t_date.daysInMonth())
+        
         # Get columns from list
         cols = []
-        for i in range(self.col_list.count()):
-            item = self.col_list.item(i)
+        for i in range(self.loan_col_list.count()):
+            item = self.loan_col_list.item(i)
             if item.checkState() == Qt.CheckState.Checked:
                 cols.append(item.text())
+                
+        sav_cols = []
+        for i in range(self.sav_col_list.count()):
+            item = self.sav_col_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                sav_cols.append(item.text())
         
         # Derive show_gross_balance / show_notes from column list
         show_gross = "Gross" in cols
-        show_notes = "Notes" in cols
+        show_notes = "Notes" in cols or "Notes" in sav_cols
         
         config = StatementConfig(
             show_loans=self.chk_loans.isChecked(),
             show_savings=self.chk_savings.isChecked(),
             show_gross_balance=show_gross,
             show_notes=show_notes,
-            columns=cols
+            columns=cols,
+            savings_columns=sav_cols
         )
         
         return f_date, t_date, config

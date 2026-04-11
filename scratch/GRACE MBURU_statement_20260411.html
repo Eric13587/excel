@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html><head>
+<style>
+    @page { size: landscape; margin: 15mm; }
+    body { font-family: Arial, sans-serif; margin: 0; padding: 10px; font-size: 9px; }
+    .header { text-align: center; border-bottom: 3px solid #2b5797; padding-bottom: 10px; margin-bottom: 15px; display: flex; align_items: center; justify-content: center; position: relative;}
+    .header h1 { color: #2b5797; margin: 0; font-size: 22px; }
+    .header h2 { color: #333; margin: 5px 0 0 0; font-size: 16px; font-weight: normal; }
+    .header .period { color: #666; font-size: 11px; margin-top: 5px; }
+    .logo { position: absolute; left: 0; top: 0; height: 50px; }
+    .client-info { background: #f5f5f5; padding: 8px; margin-bottom: 15px; border-radius: 5px; display: flex; justify-content: space-between; }
+    .client-info .left { }
+    .client-info .right { text-align: right; }
+    .client-info p { margin: 2px 0; }
+    .main-container { display: flex; gap: 20px; }
+    .main-container.centered { justify-content: center; }
+    .loans-column { flex: 1; }
+    .savings-column { flex: 0.6; }
+    .savings-column.standalone { flex: none; width: 70%; }
+    .section-title { background: #2b5797; color: white; padding: 6px 10px; font-size: 11px; font-weight: bold; margin-bottom: 0; }
+    .savings-title { background: #28a745; }
+    table { width: 100%; border-collapse: collapse; font-size: 8px; margin-bottom: 10px; }
+    th { background: #e0e0e0; padding: 4px; text-align: left; border: 1px solid #ccc; font-size: 7px; }
+    td { padding: 3px 4px; border: 1px solid #ddd; }
+    .loan-box { margin-bottom: 12px; }
+    .summary-row { margin-top: 15px; padding: 10px; background: #f9f9f9; border-radius: 5px; }
+    .footer { margin-top: 15px; text-align: center; font-size: 8px; color: #999; }
+</style>
+</head><body><div class="header">
+    
+    <div>
+        <h1>ACCOUNT STATEMENT</h1>
+        <h2>GRACE MBURU</h2>
+        <div class="period">For the period: August 01, 2025 to September 15, 2025</div>
+    </div>
+</div>
+<div class="client-info">
+    <div class="left">
+        <p><strong>Client Name:</strong> GRACE MBURU</p>
+        <p><strong>Contact:</strong> </p>
+    </div>
+    <div class="right">
+        <p><strong>Statement Date:</strong> April 11, 2026</p>
+        <p><strong>Account Status:</strong> <span style="color:#28a745;font-weight:bold;">Active</span></p>
+    </div>
+</div><div class="main-container"><div class="loans-column">
+        <div class="section-title">LOANS</div><p style='padding:10px;color:#666;'>No loan transactions in this period</p></div><div class="savings-column">
+        <div class="section-title savings-title">SAVINGS / SHARES</div><table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Balance</th><th>Notes</th></tr></thead><tbody><tr><td>2025-08-28</td><td>Deposit</td><td style='color:black'>2,500</td><td>182,361</td><td>Monthly Contribution</td></tr></tbody></table></div></div><div class="summary-row"><div class="summary-item summary-loans">
+        <div>Total Net Outstanding: 0</div>
+        <div style="font-size:10px;color:#666;">(Principal + Accrued Interest)</div>
+        <div style="margin-top:5px;">Total Gross Outstanding: 0</div>
+        <div style="font-size:10px;color:#666;">(Principal + Total Expected Interest)</div>
+    </div><div class="summary-item summary-savings">Savings Balance: 182,361</div></div><div class="footer"> | Statement generated on 2026-04-11 at 10:51 | Period: August 01, 2025 to September 15, 2025</div>
+</body></html>

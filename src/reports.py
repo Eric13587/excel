@@ -51,21 +51,33 @@ class ReportGenerator:
 
     def get_recent_quarters(self, ref_date=None):
         """
-        Get a list of recent and upcoming quarter start dates based on FY settings.
-        Returns a list of QDate objects (for UI compatibility) or datetime objects? 
-        Let's return datetime objects, UI can convert.
+        Get all quarter start dates from the earliest transaction date up to the current quarter based on FY settings.
+        Returns a list of datetime objects.
         """
         if ref_date is None:
             ref_date = datetime.now()
             
         fy_start_idx = self.get_fy_start_month_index()
         
-        # Look back 1 year and forward 1 year
+        cursor = self.db.conn.cursor()
+        cursor.execute("SELECT MIN(date) FROM (SELECT date FROM ledger UNION ALL SELECT date FROM savings)")
+        row = cursor.fetchone()
+        
+        start_year = ref_date.year
+        if row and row[0]:
+            try:
+                # Expecting YYYY-MM-DD
+                earliest_date = datetime.strptime(row[0][:10], "%Y-%m-%d")
+                start_year = earliest_date.year
+            except ValueError:
+                pass
+                
+        # Look back to start_year - 1 (in case FY started in previous year) and forward to current year + 1
         current_year = ref_date.year
         candidates = []
         
-        # Check last year, current year, next year
-        for year in [current_year - 1, current_year, current_year + 1]:
+        # We need from start_year-1 up to current_year+1
+        for year in range(start_year - 1, current_year + 2):
             # FY Quarters: start, start+3, start+6, start+9
             for i in range(4):
                 m = fy_start_idx + (i * 3)
@@ -81,12 +93,10 @@ class ReportGenerator:
                 except ValueError:
                     continue
                     
-        # Filter to reasonable range (e.g. +/- 15 months from now)
+        # Filter to remove stuff way in the future (optional, we shouldn't show 5 years ahead)
         # deduplicate and sort
         candidates = sorted(list(set(candidates)))
         
-        # Return strict range if needed, or just return all generated?
-        # Let's return all generated, UI can filter.
         return candidates
 
     def get_default_quarter_date(self):
@@ -341,7 +351,147 @@ class ReportGenerator:
             traceback.print_exc()
             return False, error_msg
 
-    def _export_to_excel(self, df, output_path):
+    def _calculate_savings_summary(self, ind_id, q_dates, report_start_date_str):
+        """Calculate B/F, contributions, and cashout for an individual's savings."""
+        m1_start, m2_start, m3_start, _, m3_next = q_dates
+        savings_df = self.db.get_savings_transactions(ind_id)
+        if savings_df.empty:
+            return None
+
+        # Calculate B/F up to report_start_date_str
+        bf_txs = savings_df[savings_df['date'] < report_start_date_str]
+        bf_deposits = bf_txs[bf_txs['transaction_type'].isin(['Deposit', 'Interest'])]['amount'].sum() if not bf_txs.empty else 0.0
+        bf_withdrawals = bf_txs[bf_txs['transaction_type'] == 'Withdrawal']['amount'].sum() if not bf_txs.empty else 0.0
+        bf = bf_deposits - bf_withdrawals
+
+        m1_start_str = m1_start.strftime("%Y-%m-%d")
+        m2_start_str = m2_start.strftime("%Y-%m-%d")
+        m3_start_str = m3_start.strftime("%Y-%m-%d")
+        m3_next_str = m3_next.strftime("%Y-%m-%d")
+
+        def sum_period(start_dt, end_dt, tx_types):
+            mask = (savings_df['date'] >= start_dt) & \
+                   (savings_df['date'] < end_dt) & \
+                   (savings_df['transaction_type'].isin(tx_types))
+            filtered = savings_df[mask]
+            return filtered['amount'].sum() if not filtered.empty else 0.0
+
+        m1 = sum_period(m1_start_str, m2_start_str, ['Deposit', 'Interest'])
+        m2 = sum_period(m2_start_str, m3_start_str, ['Deposit', 'Interest'])
+        m3 = sum_period(m3_start_str, m3_next_str, ['Deposit', 'Interest'])
+        
+        cashout = sum_period(m1_start_str, m3_next_str, ['Withdrawal'])
+
+        if bf == 0 and m1 == 0 and m2 == 0 and m3 == 0 and cashout == 0:
+            return None
+
+        return {
+            "bf": bf,
+            "m1": m1,
+            "m2": m2,
+            "m3": m3,
+            "cashout": cashout
+        }
+
+    def generate_quarterly_savings_report(self, start_date_str, output_path, progress_callback=None):
+        """
+        Generate a quarterly shares/savings report starting from the given date.
+        """
+        try:
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+            
+            # Validation
+            is_valid, err_msg = self._validate_start_date(start_date)
+            if not is_valid:
+                return False, err_msg
+            
+            # 1. Prepare Dates
+            q_dates = self._get_quarter_dates(start_date)
+            m1_start, m2_start, m3_start, _, m3_next = q_dates
+            
+            # Format headers
+            bf_date_obj = m1_start + relativedelta(days=-1)
+            day = bf_date_obj.day
+            suffix = "TH" if 11 <= day <= 13 else {1:"ST",2:"ND",3:"RD"}.get(day%10, "TH")
+            bf_date_label = f"B/F {day}{suffix} {bf_date_obj.strftime('%b %Y')}".upper()
+            
+            m1_name = m1_start.strftime("%b-%y")
+            m2_name = m2_start.strftime("%b-%y")
+            m3_name = m3_start.strftime("%b-%y")
+            
+            # 2. Collect Data
+            individuals = self.db.get_individuals()
+            total_individuals = len(individuals)
+            report_data = []
+            
+            for i, ind in enumerate(individuals):
+                ind_id, name = ind[0], ind[1]
+                
+                if progress_callback:
+                    progress_callback(i + 1, total_individuals, f"Processing {name}...")
+                
+                res = self._calculate_savings_summary(ind_id, q_dates, start_date_str)
+                if not res:
+                    continue
+
+                bf = math.ceil(res['bf'])
+                m1 = math.ceil(res['m1'])
+                m2 = math.ceil(res['m2'])
+                m3 = math.ceil(res['m3'])
+                cashout = math.ceil(res['cashout'])
+                
+                sub_total = m1 + m2 + m3
+                grand_total = bf + sub_total - cashout
+                
+                report_data.append({
+                    "Name": name,
+                    bf_date_label: bf,
+                    m1_name: m1,
+                    m2_name: m2,
+                    m3_name: m3,
+                    "Sub Total": sub_total,
+                    "Cash Out": cashout,
+                    "Grand Total": grand_total
+                })
+            
+            # 3. Build DataFrame
+            df = pd.DataFrame(report_data)
+            
+            if df.empty:
+                df = pd.DataFrame(columns=["Name", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"])
+            else:
+                # Calculate Totals
+                sums = df.select_dtypes(include=['number']).sum()
+                total_row = {col: sums[col] if col in sums else '' for col in df.columns}
+                total_row['Name'] = 'TOTAL'
+                df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+            # 4. Export
+            success = False
+            msg = ""
+            warnings = set()
+            title = "Quarterly Savings Report"
+            
+            if output_path.endswith('.csv'):
+                success, msg = self._export_to_csv(df, output_path)
+            elif output_path.endswith('.pdf'):
+                success, msg = self._export_to_pdf(df, output_path, m1_start, m3_next, title=title)
+            else:
+                success, msg = self._export_to_excel(df, output_path, sheet_name=title)
+                
+            if success and warnings:
+                msg += "\n\nWarnings:\n" + "\n".join(sorted(list(warnings)))
+                
+            return success, msg
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"Error generating savings report: {error_msg}")
+            import traceback
+            traceback.print_exc()
+            return False, error_msg
+
+    def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report'):
         """Export DataFrame to Excel with formatting."""
         try:
             # Get colors from settings
@@ -349,9 +499,9 @@ class ReportGenerator:
             total_bg = self.db.get_setting("excel_total_bg", "#F0F0F0")
             
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Quarterly Report')
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
                 workbook = writer.book
-                worksheet = writer.sheets['Quarterly Report']
+                worksheet = writer.sheets[sheet_name]
                 
                 # Formats
                 header_fmt = workbook.add_format({'bold': True, 'border': 1, 'bg_color': header_bg})
@@ -386,7 +536,7 @@ class ReportGenerator:
         except Exception as e:
             return False, f"CSV Export Failed: {e}"
 
-    def _export_to_pdf(self, df, output_path, start_date, end_date):
+    def _export_to_pdf(self, df, output_path, start_date, end_date, title="Quarterly Interest Report"):
         """Export DataFrame to PDF via HTML and QWebEngineView."""
         if not self.printer_view_getter:
             return False, "PDF printing not available (UI dependency missing)."
@@ -423,7 +573,7 @@ class ReportGenerator:
                 </style>
             </head>
             <body>
-                <h1>Quarterly Interest Report</h1>
+                <h1>{title}</h1>
                 <div class="period">Period: {period_str}</div>
                 {html_table}
                 <div style="margin-top:20px; font-size: 9px; color: #999;">Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>

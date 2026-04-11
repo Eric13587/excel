@@ -314,7 +314,7 @@ class DatabaseManager:
         # But UI savings table shows just current balance? 
         # Verify get_savings_transactions implementation first? 
         # Let's just fetch full ledger as planned for Gross Balance.
-        savings_df = self.get_savings_transactions(individual_id, start_date, end_date)
+        savings_df = self.get_savings_transactions(individual_id)
         savings_balance = self.get_savings_balance(individual_id)
         active_loans = self.get_active_loans(individual_id)
         

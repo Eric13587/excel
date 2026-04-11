@@ -138,12 +138,13 @@ class ReportWorker(QThread):
     
     finished = pyqtSignal(bool, str)     # success, message
     
-    def __init__(self, db_name, printer_view_getter, start_date, output_path):
+    def __init__(self, db_name, printer_view_getter, start_date, output_path, report_type='loan'):
         super().__init__()
         self.db_name = db_name
         self.printer_view_getter = printer_view_getter
         self.start_date = start_date
         self.output_path = output_path
+        self.report_type = report_type
         
     def run(self):
         db_manager = None
@@ -160,11 +161,18 @@ class ReportWorker(QThread):
             def callback(current, total, msg):
                 self.progress.emit(current, total, msg)
                 
-            success, msg = generator.generate_quarterly_report(
-                self.start_date, 
-                self.output_path, 
-                progress_callback=callback
-            )
+            if self.report_type == 'savings':
+                success, msg = generator.generate_quarterly_savings_report(
+                    self.start_date, 
+                    self.output_path, 
+                    progress_callback=callback
+                )
+            else:
+                success, msg = generator.generate_quarterly_report(
+                    self.start_date, 
+                    self.output_path, 
+                    progress_callback=callback
+                )
             self.finished.emit(success, msg)
             
         except Exception as e:
@@ -374,9 +382,19 @@ class Dashboard(QWidget):
         self.print_selected_btn.clicked.connect(self.batch_print_selected)
         self.print_selected_btn.setStyleSheet("background-color: #3b82f6; color: white; padding: 8px 15px; border-radius: 5px;")
         
-        self.report_btn = QPushButton("Quarterly Report")
-        self.report_btn.clicked.connect(self.generate_quarterly_report)
-        self.report_btn.setStyleSheet("background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;")
+        self.reports_btn = QPushButton("Quarterly Reports")
+        self.reports_btn.setStyleSheet("background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;")
+        reports_menu = QMenu(self)
+        
+        loan_report_action = QAction("Loan Report", self)
+        loan_report_action.triggered.connect(self.generate_quarterly_report)
+        reports_menu.addAction(loan_report_action)
+        
+        savings_report_action = QAction("Savings / Shares Report", self)
+        savings_report_action.triggered.connect(self.generate_quarterly_savings_report)
+        reports_menu.addAction(savings_report_action)
+        
+        self.reports_btn.setMenu(reports_menu)
         
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.open_settings)
@@ -406,7 +424,7 @@ class Dashboard(QWidget):
         self.mass_ops_btn.setMenu(mass_menu)
         
         utility_layout.addWidget(self.print_selected_btn)
-        utility_layout.addWidget(self.report_btn)
+        utility_layout.addWidget(self.reports_btn)
         utility_layout.addStretch()
         utility_layout.addWidget(self.settings_btn)
         utility_layout.addWidget(self.mass_ops_btn)
@@ -546,7 +564,7 @@ class Dashboard(QWidget):
         # These are simple, maybe we keep them or theme them. Let's theme them slightly.
         # print_selected_btn uses 'accent' usually
         self.print_selected_btn.setStyleSheet(f"background-color: {t.get_color('accent')}; color: white; padding: 8px 15px; border-radius: 5px;")
-        self.report_btn.setStyleSheet(f"background-color: {t.get_color('success')}; color: white; padding: 8px 15px; border-radius: 5px;")
+        self.reports_btn.setStyleSheet(f"background-color: {t.get_color('success')}; color: white; padding: 8px 15px; border-radius: 5px;")
         self.settings_btn.setStyleSheet(f"background-color: {t.get_color('text_secondary')}; color: white; padding: 8px 15px; border-radius: 5px;")
         self.mass_ops_btn.setStyleSheet(f"background-color: #8B5CF6; color: white; padding: 8px 15px; border-radius: 5px;") # Purple
 
@@ -1111,26 +1129,19 @@ class Dashboard(QWidget):
              QMessageBox.warning(self, "Undo", "Failed to undo.")
 
     def generate_quarterly_report(self):
-        """Generate quarterly interest report."""
+        """Generate quarterly loan interest report."""
         from ..reports import ReportGenerator
         from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox, QComboBox, QPushButton
         from PyQt6.QtCore import QDate
         from dateutil.relativedelta import relativedelta
         
         # Determine Default Date based on FY Setting
-        # Logic: Find the most recent "Quarter Start" relative to today.
-        # Quarters are [Start, Start+3, Start+6, Start+9]
-        
-        # Determine Default Date using centralized logic in ReportGenerator
-        # Pass printer_view_getter to instance
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
-        # Get datetime object
         def_dt = generator.get_default_quarter_date()
-        # default_date = QDate(def_dt.year, def_dt.month, def_dt.day)
 
         # Dialog to select start date
         dialog = QDialog(self)
-        dialog.setWindowTitle("Quarterly Report Period")
+        dialog.setWindowTitle("Quarterly Loan Report Period")
         layout = QFormLayout(dialog)
         
         # Quarter Selector (Dropdown)
@@ -1193,19 +1204,99 @@ class Dashboard(QWidget):
                 progress.setValue(0)
                 
                 # Setup Thread
-                # Pass DB name instead of sharing connection
                 db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
-                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path)
+                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path, report_type='loan')
                 
                 def on_progress(curr, total, msg):
                     progress.setMaximum(total)
                     progress.setValue(curr)
                     progress.setLabelText(msg)
                     if progress.wasCanceled():
-                        # We need a way to stop the worker. 
-                        # For now, simplistic check or just let it finish but ignore result?
-                        # Implementing stop flag in generator is cleaner, but for now just close.
-                        self.report_worker.terminate() # Rough, but effective for immediate stop
+                        if getattr(self, 'report_worker', None):
+                            self.report_worker.terminate()
+                        
+                def on_finished(success, message):
+                    progress.close()
+                    if success:
+                        QMessageBox.information(self, "Success", f"Report saved to:\n{file_path}")
+                    else:
+                        QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
+                    self.report_worker = None
+                    
+                self.report_worker.progress.connect(on_progress)
+                self.report_worker.finished.connect(on_finished)
+                
+                self.report_worker.start()
+
+    def generate_quarterly_savings_report(self):
+        """Generate quarterly savings report."""
+        from ..reports import ReportGenerator
+        from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox, QComboBox, QPushButton
+        from PyQt6.QtCore import QDate
+        from dateutil.relativedelta import relativedelta
+        
+        generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
+        def_dt = generator.get_default_quarter_date()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Quarterly Savings Report Period")
+        layout = QFormLayout(dialog)
+        
+        quarter_combo = QComboBox()
+        recent_quarters = generator.get_recent_quarters()
+        default_idx = 0
+        
+        for i, q_start in enumerate(recent_quarters):
+            m3_end = q_start + relativedelta(months=3, days=-1)
+            label = f"{q_start.strftime('%b %Y')} - {m3_end.strftime('%b %Y')}"
+            quarter_combo.addItem(label, q_start.strftime("%Y-%m-%d"))
+            if q_start.year == def_dt.year and q_start.month == def_dt.month:
+                default_idx = i
+                
+        quarter_combo.setCurrentIndex(default_idx)
+        layout.addRow("Select Quarter:", quarter_combo)
+        
+        fmt_btn = QPushButton("Format Settings...")
+        fmt_btn.setStyleSheet("color: #F59E0B; border: 1px solid #F59E0B; padding: 4px; border-radius: 4px;")
+        
+        def open_fmt_dialog():
+            from ..dialogs import ExcelFormatDialog
+            dlg = ExcelFormatDialog(self.db, self)
+            dlg.exec()
+            
+        fmt_btn.clicked.connect(open_fmt_dialog)
+        layout.addRow("", fmt_btn)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dialog.accept)
+        btns.rejected.connect(dialog.reject)
+        layout.addRow(btns)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            start_date = quarter_combo.currentData()
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Savings Report", 
+                f"Quarterly_Savings_Report_{start_date}.xlsx", 
+                "Excel Files (*.xlsx);;CSV Files (*.csv);;PDF Files (*.pdf)"
+            )
+            
+            if file_path:
+                progress = QProgressDialog("Generating Savings Report...", "Cancel", 0, 100, self)
+                progress.setWindowModality(Qt.WindowModality.WindowModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                
+                db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
+                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path, report_type='savings')
+                
+                def on_progress(curr, total, msg):
+                    progress.setMaximum(total)
+                    progress.setValue(curr)
+                    progress.setLabelText(msg)
+                    if progress.wasCanceled():
+                        if getattr(self, 'report_worker', None):
+                            self.report_worker.terminate()
                         
                 def on_finished(success, message):
                     progress.close()
