@@ -142,3 +142,4 @@ Thumbs.db
 *.db
 *.db-journal
 .gemini/
+test_*
