@@ -423,9 +423,14 @@ class Dashboard(QWidget):
         
         self.mass_ops_btn.setMenu(mass_menu)
         
+        self.treasury_btn = QPushButton("Treasury & GL")
+        self.treasury_btn.clicked.connect(self.open_treasury)
+        self.treasury_btn.setStyleSheet("background-color: #2563EB; color: white; padding: 8px 15px; border-radius: 5px;")
+        
         utility_layout.addWidget(self.print_selected_btn)
         utility_layout.addWidget(self.reports_btn)
         utility_layout.addStretch()
+        utility_layout.addWidget(self.treasury_btn)
         utility_layout.addWidget(self.settings_btn)
         utility_layout.addWidget(self.mass_ops_btn)
         
@@ -1712,6 +1717,13 @@ class Dashboard(QWidget):
             msg += f"\n... and {len(errors) - 10} more."
             
         QMessageBox.warning(self, "Partial Failures", msg)
+
+    def open_treasury(self):
+        """Open the Treasury and General Ledger dialog."""
+        from .treasury import TreasuryDialog
+        dialog = TreasuryDialog(self.db, self.theme_manager, self)
+        dialog.exec()
+
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
