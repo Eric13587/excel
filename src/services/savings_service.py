@@ -55,7 +55,14 @@ class SavingsService:
             default = self.db.get_setting("default_savings_increment", "2500")
             return float(default)
         
-        # Return the last deposit amount as suggestion
+        # Truly return the most common deposit amount (mode)
+        try:
+            mode_series = deposits['amount'].mode()
+            if not mode_series.empty:
+                return float(mode_series.iloc[0])
+        except Exception:
+            pass
+            
         return float(deposits.iloc[-1]['amount'])
     
     def add_deposit(self, individual_id, amount, date_str, notes="", batch_id=None):

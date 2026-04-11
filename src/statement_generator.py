@@ -139,6 +139,8 @@ class StatementGenerator:
                 
                 rows = []
                 current_gross = 0.0
+                snapshot_balance = 0.0
+                snapshot_gross = 0.0
                 
                 # Full Replay Simulation
                 for _, row in group.iterrows():
@@ -147,6 +149,9 @@ class StatementGenerator:
                     deducted = float(row['deducted'])
                     date_str = str(row['date'])
                     
+                    if date_str > to_date:
+                        break
+                    
                     # Simulation Logic (Matches LedgerView)
                     if event == "Loan Issued" or event == "Loan Top-Up":
                         # Gross increases by Principal + 15% Interest (Standard Rule)
@@ -154,14 +159,14 @@ class StatementGenerator:
                         current_gross += added * 1.15
                     elif event == "Repayment" or event == "Loan Buyoff":
                         current_gross -= deducted
+                        
+                    snapshot_gross = current_gross
+                    snapshot_balance = float(row['balance'])
                     
                     # Date Filtering for Report Display
                     # If date is before range, we just simulate and continue.
                     if date_str < from_date:
                         continue
-                    # If date is AFTER range, we stop. The current_gross is now the closing balance for this period.
-                    if date_str > to_date:
-                        break
                         
                     # Prepare Row Data
                     interest = math.ceil(float(row.get('interest_amount', 0)))
@@ -192,31 +197,26 @@ class StatementGenerator:
                         rows=rows
                     ))
                     
-                    # Use the last visible row for balance snapshot, or the simulation state
-                    # Ideally last row of the period (which matches `rows[-1]` or `balance` loop var if we broke)
-                    # We need the balance at `to_date`. 
-                    # If we broke, `balance` variable holds the balance of the last processed row (before break? no, last processed was > to_date?)
-                    # Wait, if we 'break' on `date > to_date`, we haven't processed that future row.
-                    # So `balance` holds value of the last *valid* row (<= to_date).
-                    # `current_gross` is also correct.
-                    
-                    # EXCEPT: if 'rows' is empty (all dates < from_date), but loop finished (all dates < to_date).
-                    # Then loan_sections is NOT appended (if rows check).
-                    # But we might still want to count the totals?
-                    # The current logic appends to loan_sections ONLY if rows exists.
-                    # This means quiet loans don't appear in report sections. 
-                    # But should they appear in Totals?
-                    # Existing logic: `if rows: ... total_balance += ...`
-                    # So existing logic excludes invisible loans from totals. We'll stick to that for consistency.
-                    
-                    total_balance += float(rows[-1].balance)
-                    total_gross_balance += float(rows[-1].gross_balance)
+                # Accurately reflect standard totals using the exact endpoint snapshot,
+                # even if this specific loan had NO transactions inside the statement period 
+                # (so long as the loan was still active/owed a balance on the boundary date).
+                if snapshot_balance > 0:
+                    total_balance += snapshot_balance
+                    total_gross_balance += snapshot_gross
 
         savings_rows = []
-        if config.show_savings and not savings_df.empty:
-            # Savings are usually simpler, just run through them
-            # We want to display them sorted by date.
+        actual_savings_balance = 0.0
+        
+        if not savings_df.empty:
+            # Sort full history by date chronologically
             savings_df = savings_df.sort_values(by='date')
+            
+            # Find the strict snapshot balance up to our specific to_date
+            s_up_to_end = savings_df[savings_df['date'] <= to_date]
+            if not s_up_to_end.empty:
+                actual_savings_balance = float(s_up_to_end.iloc[-1]['balance'])
+                
+        if config.show_savings and not savings_df.empty:
             
             for _, row in savings_df.iterrows():
                 # Filter
@@ -252,7 +252,7 @@ class StatementGenerator:
             savings_rows=savings_rows,
             total_net_outstanding=total_balance,
             total_gross_outstanding=total_gross_balance,
-            savings_balance=data.savings_balance
+            savings_balance=actual_savings_balance
         )
     
     def _generate_pdf_html(self, presentation: StatementPresentation, config: StatementConfig = None):
@@ -365,13 +365,33 @@ class StatementGenerator:
             col_class = "savings-column standalone" if savings_only else "savings-column"
             html += f"""<div class="{col_class}">
         <div class="section-title savings-title">SAVINGS / SHARES</div>"""
+            
+            def render_sav_header():
+                return "".join([f"<th>{col}</th>" for col in config.savings_columns])
+                
+            def render_sav_row(row):
+                def get_val(c):
+                    if c == "Date": return row.date
+                    if c == "Type": return row.type
+                    if c == "Amount": return f"{row.amount:,.0f}"
+                    if c == "Balance": return f"{row.balance:,.0f}"
+                    if c == "Notes": return row.notes
+                    return ""
+                color = "#dc3545" if row.is_withdrawal else "black"
+                row_html = "<tr>"
+                for c in config.savings_columns:
+                    val = get_val(c)
+                    if c == "Amount":
+                        row_html += f"<td style='color:{color}'>{val}</td>"
+                    else:
+                        row_html += f"<td>{val}</td>"
+                row_html += "</tr>"
+                return row_html
+
             if presentation.savings_rows:
-                html += """<table><thead><tr><th>Date</th><th>Type</th><th>Amount</th><th>Balance</th><th>Notes</th></tr></thead><tbody>"""
-                
+                html += f"<table><thead><tr>{render_sav_header()}</tr></thead><tbody>"
                 for row in presentation.savings_rows:
-                    color = "#dc3545" if row.is_withdrawal else "black"
-                    html += f"<tr><td>{row.date}</td><td>{row.type}</td><td style='color:{color}'>{row.amount:,.0f}</td><td>{row.balance:,.0f}</td><td>{row.notes}</td></tr>"
-                
+                    html += render_sav_row(row)
                 html += "</tbody></table>"
             else:
                 html += "<p style='padding:10px;color:#666;'>No savings transactions in this period</p>"
@@ -627,20 +647,34 @@ class StatementGenerator:
                 
                 # Savings section
                 if config.show_savings and presentation.savings_rows:
-                    worksheet.merge_range(row_idx, 0, row_idx, 4, "SAVINGS / SHARES", savings_header_fmt)
+                    num_cols = len(config.savings_columns)
+                    merge_end_col = max(num_cols - 1, 0)
+                    if merge_end_col == 0:
+                        worksheet.write(row_idx, 0, "SAVINGS / SHARES", savings_header_fmt)
+                    else:
+                        worksheet.merge_range(row_idx, 0, row_idx, merge_end_col, "SAVINGS / SHARES", savings_header_fmt)
                     row_idx += 1
                     
-                    s_headers = ['Date', 'Type', 'Amount', 'Balance', 'Notes']
+                    s_headers = config.savings_columns
                     for col, header in enumerate(s_headers):
                         worksheet.write(row_idx, col, header, col_header_fmt)
                     row_idx += 1
                     
+                    def get_sav_val(r, col_name):
+                        if col_name == "Date": return r.date
+                        if col_name == "Type": return r.type
+                        if col_name == "Amount": return r.amount
+                        if col_name == "Balance": return r.balance
+                        if col_name == "Notes": return r.notes
+                        return ""
+                        
                     for row in presentation.savings_rows:
-                        worksheet.write(row_idx, 0, row.date, cell_fmt)
-                        worksheet.write(row_idx, 1, row.type, cell_fmt)
-                        worksheet.write(row_idx, 2, row.amount, currency_fmt)
-                        worksheet.write(row_idx, 3, row.balance, currency_fmt)
-                        worksheet.write(row_idx, 4, row.notes, cell_fmt)
+                        for col, header in enumerate(config.savings_columns):
+                            val = get_sav_val(row, header)
+                            if header in ["Amount", "Balance"] and isinstance(val, (int, float)):
+                                worksheet.write(row_idx, col, val, currency_fmt)
+                            else:
+                                worksheet.write(row_idx, col, val, cell_fmt)
                         row_idx += 1
             
             return True

@@ -330,6 +330,8 @@ class LoanService:
                         if count > 0:
                             processed_count += 1
                             total_deductions += count
+                    except LoanInactiveError:
+                        pass  # Silently skip inactive/paid loans during mass deduction
                     except Exception as e:
                         errors.append((l_ref, str(e)))
 
