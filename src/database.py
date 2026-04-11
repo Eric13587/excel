@@ -249,6 +249,19 @@ class DatabaseManager:
                 value TEXT
             )
         """)
+        
+        # General Ledger / Treasury Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS general_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT,
+                category TEXT,
+                type TEXT,
+                amount REAL,
+                notes TEXT,
+                batch_id TEXT
+            )
+        """)
 
             
         self.conn.commit()
@@ -1565,3 +1578,51 @@ class DatabaseManager:
         finally:
             if conn:
                 conn.close()
+
+    # ==========================================
+    # Treasury / General Ledger Methods
+    # ==========================================
+    
+    def add_gl_entry(self, date_str, category, type_str, amount, notes, batch_id=None):
+        """Add a General Ledger entry (Bank, Expenses, Equity, etc)."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO general_ledger (date, category, type, amount, notes, batch_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (date_str, category, type_str, amount, notes, batch_id))
+        self.conn.commit()
+        return cursor.lastrowid
+        
+    def get_gl_entries(self, start_date=None, end_date=None):
+        """Fetch general ledger entries, optionally filtered by date range."""
+        query = "SELECT * FROM general_ledger"
+        params = []
+        conditions = []
+        
+        if start_date:
+            conditions.append("date >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("date <= ?")
+            params.append(end_date)
+            
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+            
+        query += " ORDER BY date DESC, id DESC"
+        
+        cursor = self.conn.cursor()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        columns = [column[0] for column in cursor.description]
+        results = []
+        for row in rows:
+            results.append(dict(zip(columns, row)))
+        return results
+        
+    def delete_gl_entry(self, entry_id):
+        """Delete a specific general ledger entry."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM general_ledger WHERE id=?", (entry_id,))
+        self.conn.commit()

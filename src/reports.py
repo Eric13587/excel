@@ -663,3 +663,204 @@ class ReportGenerator:
                 
         except Exception as e:
             return False, f"Report Generation Failed: {e}"
+
+    
+    def generate_financial_statements(self, output_path, target_date_str=None):
+        """Generates the Income Statement & Balance Sheet as PDF."""
+        try:
+            if not target_date_str:
+                target_date_str = datetime.now().strftime("%Y-%m-%d")
+                
+            cursor = self.db.conn.cursor()
+            
+            # --- INCOME STATEMENT DATA ---
+            # 1. Interest Revenue (Loans up to target date)
+            # Find all interest portions from Repayments, or "Interest Earned" if standard.
+            # In LoanMaster, 'Interest Earned' adds to balance, but we just realized it as income when Repaid. 
+            # Or we can count 'Interest Earned'. Actually 'Interest Earned' events are the true accrued revenue.
+            cursor.execute("SELECT SUM(interest_amount) FROM ledger WHERE date <= ? AND event_type IN ('Interest Earned')", (target_date_str,))
+            interest_revenue = cursor.fetchone()[0] or 0.0
+            
+            # 2. Other Income (GL)
+            cursor.execute("SELECT SUM(amount) FROM general_ledger WHERE type='Income' AND date <= ?", (target_date_str,))
+            gl_income = cursor.fetchone()[0] or 0.0
+            
+            total_revenue = interest_revenue + gl_income
+            
+            # 3. Expenses (GL)
+            cursor.execute("SELECT category, SUM(amount) as amt FROM general_ledger WHERE type='Expense' AND date <= ? GROUP BY category", (target_date_str,))
+            expense_rows = cursor.fetchall()
+            total_expenses = sum([val for _, val in expense_rows])
+            
+            net_surplus = total_revenue - total_expenses
+            
+            # --- BALANCE SHEET DATA ---
+            # Assets
+            # 1. Total Outstanding Principal (We can calculate by Ledger exactly up to date)
+            cursor.execute("SELECT SUM(principal_portion), SUM(interest_portion) FROM ledger WHERE date <= ? AND event_type='Repayment'", (target_date_str,))
+            rep_p, rep_i = cursor.fetchone()
+            rep_p, rep_i = rep_p or 0, rep_i or 0
+            
+            cursor.execute("SELECT SUM(added) FROM ledger WHERE date <= ? AND (event_type LIKE 'Loan Issued%' OR event_type='Loan Top-Up')", (target_date_str,))
+            loans_issued = cursor.fetchone()[0] or 0.0
+            
+            outstanding_loan_principal = loans_issued - rep_p
+            
+            # 2. Bank Cash
+            # Sav Dep
+            cursor.execute("SELECT SUM(amount) FROM savings WHERE transaction_type='Deposit' AND date <= ?", (target_date_str,))
+            sav_dep = cursor.fetchone()[0] or 0.0
+            # Sav WD
+            cursor.execute("SELECT SUM(amount) FROM savings WHERE transaction_type='Withdrawal' AND date <= ?", (target_date_str,))
+            sav_wd = cursor.fetchone()[0] or 0.0
+            # GL Asset In (Capital/Deposit)
+            cursor.execute("SELECT SUM(amount) FROM general_ledger WHERE type='Asset' AND date <= ?", (target_date_str,))
+            gl_asset = cursor.fetchone()[0] or 0.0
+            # GL Liab (Borrowings increase cash)
+            cursor.execute("SELECT SUM(amount) FROM general_ledger WHERE type='Liability/Equity' AND date <= ?", (target_date_str,))
+            gl_liab = cursor.fetchone()[0] or 0.0
+            
+            bank_cash = (rep_p + rep_i) + sav_dep - sav_wd - loans_issued + gl_income - total_expenses + gl_asset + gl_liab
+            
+            total_assets = outstanding_loan_principal + bank_cash
+            
+            # Liabilities
+            # 1. Member Savings 
+            total_savings = sav_dep - sav_wd
+            
+            # 2. External Borrowing/Liabilities
+            # GL Liability
+            total_liabilities = total_savings + gl_liab
+            
+            # Equity
+            # 1. Capital (GL Asset -> initial capital?) Actually initial capital should be Liability/Equity if strict, but let's assume it's in gl_liab or gl_asset.
+            # 2. Retained Surplus
+            total_equity = gl_asset + net_surplus
+            # Note: Strict accounting: gl_asset is "Bank Deposit" (debit cash, credit what?). If they recorded initial capital as "Asset" type, it's Equity implicitly.
+            
+            total_liabilities_and_equity = total_liabilities + total_equity
+            
+            # Render HTML
+            html = f"""
+            <!DOCTYPE html>
+            <html>
+                <head>
+                    <style>
+                        body {{ font-family: 'Helvetica', Arial, sans-serif; padding: 30px; font-size: 14px; color: #333; }}
+                        h1 {{ text-align: center; color: #1e3a8a; font-size: 24px; text-transform: uppercase; margin-bottom: 5px; }}
+                        h2 {{ text-align: center; color: #64748b; font-size: 14px; font-weight: normal; margin-top: 0; }}
+                        h3 {{ color: #0f172a; border-bottom: 2px solid #cbd5e1; padding-bottom: 5px; font-size: 18px; margin-top: 30px; }}
+                        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
+                        td {{ padding: 8px 5px; border-bottom: 1px dotted #e2e8f0; }}
+                        .label {{ width: 70%; }}
+                        .amount {{ width: 30%; text-align: right; font-family: 'Courier New', Courier, monospace; }}
+                        .total-row td {{ font-weight: bold; border-top: 2px solid #333; border-bottom: 2px double #333; background: #f8fafc; font-size: 15px; }}
+                        .section-title {{ font-weight: bold; padding-top: 15px; color: #475569; }}
+                    </style>
+                </head>
+                <body>
+                    <h1>Instutitional Financial Statements</h1>
+                    <h2>Report up to: {target_date_str}</h2>
+                    
+                    <h3>I. INCOME STATEMENT (P&L)</h3>
+                    <table>
+                        <tr><td class="section-title" colspan="2">Revenues</td></tr>
+                        <tr><td class="label">Interest Income (Loans)</td><td class="amount">{interest_revenue:,.2f}</td></tr>
+                        <tr><td class="label">Other SACCO Income</td><td class="amount">{gl_income:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">Total Revenue</td><td class="amount">{total_revenue:,.2f}</td></tr>
+                        
+                        <tr><td class="section-title" colspan="2">Operating Expenses</td></tr>
+            """
+            
+            for cat, amt in expense_rows:
+                html += f'<tr><td class="label">{cat}</td><td class="amount">{amt:,.2f}</td></tr>'
+                
+            if not expense_rows:
+                html += '<tr><td class="label">No recorded expenses</td><td class="amount">0.00</td></tr>'
+                
+            html += f"""
+                        <tr class="total-row"><td class="label">Total Expenses</td><td class="amount">{total_expenses:,.2f}</td></tr>
+                        <tr style="height: 20px;"><td colspan="2"></td></tr>
+                        <tr class="total-row" style="color: {'#166534' if net_surplus >= 0 else '#991b1b'};"><td class="label">NET SURPLUS (PROFIT)</td><td class="amount">{net_surplus:,.2f}</td></tr>
+                    </table>
+                    
+                    <div style="page-break-before: always;"></div>
+                    
+                    <h3>II. BALANCE SHEET</h3>
+                    <table>
+                        <tr><td class="section-title" colspan="2">ASSETS</td></tr>
+                        <tr><td class="label">Cash and Bank Balances</td><td class="amount">{bank_cash:,.2f}</td></tr>
+                        <tr><td class="label">Loan Portfolio (Principal Outstanding)</td><td class="amount">{outstanding_loan_principal:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">TOTAL ASSETS</td><td class="amount">{total_assets:,.2f}</td></tr>
+                        
+                        <tr><td class="section-title" colspan="2">LIABILITIES</td></tr>
+                        <tr><td class="label">Member Savings & Shares Hold</td><td class="amount">{total_savings:,.2f}</td></tr>
+                        <tr><td class="label">External Borrowing / Other Payables</td><td class="amount">{gl_liab:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">Total Liabilities</td><td class="amount">{total_liabilities:,.2f}</td></tr>
+                        
+                        <tr><td class="section-title" colspan="2">EQUITY</td></tr>
+                        <tr><td class="label">Institutional Capital / Deposits</td><td class="amount">{gl_asset:,.2f}</td></tr>
+                        <tr><td class="label">Retained Surplus (Profit)</td><td class="amount">{net_surplus:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">Total Equity</td><td class="amount">{total_equity:,.2f}</td></tr>
+                        
+                        <tr style="height: 20px;"><td colspan="2"></td></tr>
+                        <tr class="total-row"><td class="label">TOTAL LIABILITIES & EQUITY</td><td class="amount">{total_liabilities_and_equity:,.2f}</td></tr>
+                    </table>
+                    
+                    <div style="margin-top: 40px; font-size: 11px; text-align: center; color: #64748b;">Generated securely by LoanMaster Treasury Engine on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
+                </body>
+            </html>
+            """
+            
+            # Print PDF
+            from PyQt6.QtCore import QMarginsF, QEventLoop, QTimer
+            from PyQt6.QtGui import QPageLayout, QPageSize
+            
+            if not self.printer_view_getter:
+                return False, "PDF printer view unavailable."
+                
+            web_view = self.printer_view_getter()
+            if not web_view:
+                 return False, "Printer View not initialized."
+                 
+            web_view.setHtml(html)
+            
+            loop = QEventLoop()
+            
+            try: web_view.loadFinished.disconnect()
+            except: pass
+            web_view.loadFinished.connect(loop.quit)
+            
+            QTimer.singleShot(2000, loop.quit)
+            loop.exec()
+            
+            pdf_print_success = [False]
+            pdf_print_message = [""]
+            
+            def print_finished(path, success):
+                pdf_print_success[0] = success
+                if not success:
+                    pdf_print_message[0] = "Failed to write PDF file (maybe permission issue)."
+                loop.quit()
+                
+            try: web_view.page().pdfPrintingFinished.disconnect()
+            except: pass
+            
+            page_layout = QPageLayout(
+                QPageSize(QPageSize.PageSizeId.A4),
+                QPageLayout.Orientation.Portrait,
+                QMarginsF(15, 15, 15, 15)
+            )
+            
+            web_view.page().pdfPrintingFinished.connect(print_finished)
+            web_view.page().printToPdf(output_path, page_layout)
+            
+            loop.exec()
+            
+            if pdf_print_success[0]:
+                return True, "Institutional Statement Generated Successfully."
+            else:
+                return False, pdf_print_message[0]
+                
+        except Exception as e:
+            return False, f"Balance Sheet Generation Failed: {e}"
