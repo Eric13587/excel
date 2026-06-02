@@ -286,6 +286,12 @@ class LedgerView(QWidget):
     def load_individual(self, ind_id, name):
         self.current_individual_id = ind_id
         self.title_label.setText(f"<b>Ledger for {name}</b>")
+        
+        # Auto-populate monthly savings amount for this individual
+        suggested = self.engine.get_suggested_savings_increment(ind_id)
+        if suggested and suggested > 0:
+            self.savings_increment_input.setText(str(int(suggested)))
+        
         self.refresh_ledger()
 
 
