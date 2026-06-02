@@ -150,9 +150,13 @@ class SavingsService:
              # Rules say "catch up from last entry". If no entry, no catch up.
             return 0
         
-        # Get the last transaction details
+        # Get the last DEPOSIT date (withdrawals don't shift deposit schedule)
         # transactions df is sorted by ID ascending (chronological usually)
-        last_tx = transactions.iloc[-1] # Last row is latest
+        deposits = transactions[transactions['transaction_type'] == 'Deposit']
+        if not deposits.empty:
+            last_tx = deposits.iloc[-1]
+        else:
+            last_tx = transactions.iloc[-1]  # Fallback if no deposits exist
         last_date_str = str(last_tx['date']).split()[0]
         try:
             last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
