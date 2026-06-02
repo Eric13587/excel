@@ -847,6 +847,31 @@ class LedgerView(QWidget):
             new_amount = safe_float(pay_text)
             
             if event_type == "Repayment" and col == 5:
+                 # Guard: Disallow zero/negative repayments
+                 if new_amount <= 0:
+                     msg = QMessageBox(self)
+                     msg.setIcon(QMessageBox.Icon.Information)
+                     msg.setWindowTitle("Zero Deduction Not Allowed")
+                     msg.setTextFormat(Qt.TextFormat.RichText)
+                     msg.setText(
+                         "Setting a repayment to zero is not supported.<br><br>"
+                         "If no deduction happened in a particular month, the correct "
+                         "approach is to edit the <b>date</b> of this entry to the month "
+                         "when the deduction actually occurred next.<br><br>"
+                         "To do this:<br>"
+                         "&nbsp;&nbsp;1. Double-click the <b>Date</b> cell of this entry<br>"
+                         "&nbsp;&nbsp;2. Change it to the next month where a deduction took place<br>"
+                         "&nbsp;&nbsp;3. Press Enter — subsequent dates will auto-cascade<br><br>"
+                         "This preserves the correct loan balance and interest calculations."
+                     )
+                     msg.exec()
+                     # Revert the cell to its previous value
+                     tx = self.engine.get_transaction(trans_id)
+                     if tx:
+                         table.setItem(row, 5, QTableWidgetItem(f"{float(tx['deducted']):,.0f}"))
+                     table.blockSignals(False)
+                     return
+                 
                  # Special logic for Payment Amount
                  self.engine.update_repayment_amount(self.current_individual_id, trans_id, new_amount, notes)
                  
