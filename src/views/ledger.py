@@ -1614,14 +1614,15 @@ class LedgerView(QWidget):
             if amount <= 0:
                 raise ValueError
             
-            # Get last savings entry date and add 1 month
+            # Get last DEPOSIT date and add 1 month (withdrawals don't shift deposit schedule)
             savings_df = self.db.get_savings_transactions(self.current_individual_id)
-            if savings_df.empty:
-                # No entries, use current date
+            deposits_df = savings_df[savings_df['transaction_type'] == 'Deposit'] if not savings_df.empty else savings_df
+            if deposits_df.empty:
+                # No deposit entries, use current date
                 date = datetime.now().strftime("%Y-%m-%d")
             else:
                 from dateutil.relativedelta import relativedelta
-                last_date_str = savings_df.iloc[-1]['date']
+                last_date_str = deposits_df.iloc[-1]['date']
                 last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
                 next_date = last_date + relativedelta(months=1)
                 date = next_date.strftime("%Y-%m-%d")
@@ -1664,11 +1665,15 @@ class LedgerView(QWidget):
         layout.addRow(rb_months)
         layout.addRow(rb_range)
         
-        # Determine default start date (next month after last entry)
+        # Determine default start date (next month after last DEPOSIT, not withdrawal)
         savings_df = self.db.get_savings_transactions(self.current_individual_id)
         default_start = QDate.currentDate()
         if not savings_df.empty:
-            last_date_str = savings_df.iloc[-1]['date']
+            deposits_df = savings_df[savings_df['transaction_type'] == 'Deposit']
+            if not deposits_df.empty:
+                last_date_str = deposits_df.iloc[-1]['date']
+            else:
+                last_date_str = savings_df.iloc[-1]['date']
             last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
             from dateutil.relativedelta import relativedelta
             next_date = last_date + relativedelta(months=1)
@@ -1949,7 +1954,12 @@ class LedgerView(QWidget):
         
         from dateutil.relativedelta import relativedelta
         
-        last_date_str = savings_df.iloc[-1]['date']
+        # Use last DEPOSIT date, not last transaction (withdrawals don't shift deposit schedule)
+        deposits_df = savings_df[savings_df['transaction_type'] == 'Deposit']
+        if not deposits_df.empty:
+            last_date_str = deposits_df.iloc[-1]['date']
+        else:
+            last_date_str = savings_df.iloc[-1]['date']
         last_date = datetime.strptime(last_date_str, "%Y-%m-%d")
         
         # Ask for Target Date
