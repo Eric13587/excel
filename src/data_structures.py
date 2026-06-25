@@ -10,6 +10,7 @@ class StatementData:
     savings_df: pd.DataFrame
     savings_balance: float
     active_loans: List[Dict[str, Any]]
+    loan_suspensions: List[Dict[str, Any]] = field(default_factory=list)
 
 @dataclass
 class StatementRow:
@@ -22,6 +23,10 @@ class StatementRow:
     gross_balance: float
     show_gross: bool
     notes: str
+    # Annotation rows are non-transaction informational rows (e.g. a suspension
+    # span) rendered as a single greyed-out band spanning all columns.
+    is_annotation: bool = False
+    annotation_text: str = ""
 
 @dataclass
 class StatementLoanSection:

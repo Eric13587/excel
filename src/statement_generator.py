@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import math
+import calendar
 from datetime import datetime
 
 # Optional dependencies
@@ -86,6 +87,99 @@ class StatementGenerator:
         cleaned = re.sub(r'\s*\(Auto\)', '', str(note))
         cleaned = re.sub(r'\s*\(Catch-up\)', '', cleaned)
         return cleaned.strip()
+
+    @staticmethod
+    def _months_between(start_str, end_str, end_inclusive):
+        """List the (year, month) tuples spanned by two dates.
+
+        Args:
+            start_str: Start date "YYYY-MM-DD".
+            end_str: End date "YYYY-MM-DD".
+            end_inclusive: Include the end month when True.
+
+        Returns:
+            Ordered list of (year, month) tuples.
+        """
+        s = datetime.strptime(str(start_str)[:10], "%Y-%m-%d")
+        e = datetime.strptime(str(end_str)[:10], "%Y-%m-%d")
+        months = []
+        y, m = s.year, s.month
+        ey, em = e.year, e.month
+        while (y < ey) or (y == ey and (m <= em if end_inclusive else m < em)):
+            months.append((y, m))
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+        return months
+
+    @staticmethod
+    def _format_months(months):
+        """Render [(2026, 3), (2026, 4)] as 'Mar, Apr 2026', grouping by year."""
+        by_year = {}
+        order = []
+        for (y, m) in months:
+            if y not in by_year:
+                by_year[y] = []
+                order.append(y)
+            by_year[y].append(calendar.month_abbr[m])
+        return "; ".join(f"{', '.join(by_year[y])} {y}" for y in order)
+
+    def _build_suspension_annotations(self, loan_ref, suspensions, from_date, to_date, date_format):
+        """Build greyed-out annotation rows for suspension spans on one loan.
+
+        Only spans overlapping [from_date, to_date] produce a row. Each row is
+        placed (for chronological sorting) at its start date, clamped to the
+        statement window.
+        """
+        annotations = []
+        for s in suspensions:
+            if s.get('loan_ref') != loan_ref:
+                continue
+
+            start = str(s.get('start_date') or '')[:10]
+            if not start:
+                continue
+
+            resumed = str(s.get('resumed_date') or '')[:10] or None
+            until = str(s.get('suspend_until') or '')[:10] or None
+            # Effective end of the span: actual resume date if resumed, else the
+            # intended resume date, else open-ended (still suspended).
+            end = resumed or until
+
+            # Overlap test against the statement window.
+            if start > to_date:
+                continue
+            if end is not None and end < from_date:
+                continue
+
+            if resumed:
+                # Resume month receives a deduction, so exclude it.
+                months = self._months_between(start, resumed, end_inclusive=False)
+                if not months:  # suspended and resumed within the same month
+                    months = self._months_between(start, start, end_inclusive=True)
+                month_text = self._format_months(months)
+                text = f"Loan suspended — no deductions for {month_text}"
+            elif until:
+                # suspend_until is the intended *resume* date, so exclude its month.
+                months = self._months_between(start, until, end_inclusive=False)
+                if not months:
+                    months = self._months_between(start, start, end_inclusive=True)
+                month_text = self._format_months(months)
+                until_disp = datetime.strptime(until, "%Y-%m-%d").strftime(date_format)
+                text = f"Loan suspended — no deductions for {month_text} (resumes {until_disp})"
+            else:
+                start_disp = datetime.strptime(start, "%Y-%m-%d").strftime(date_format)
+                text = f"Loan suspended on {start_disp} — deductions paused indefinitely"
+
+            placement = max(start, from_date)
+            annotations.append(StatementRow(
+                date=placement,
+                event_type="Loan Suspended",
+                debit=0, interest=0, credit=0, balance=0, gross_balance=0,
+                show_gross=False, notes="",
+                is_annotation=True, annotation_text=text
+            ))
+        return annotations
 
     def _validate_inputs(self, ind_id, from_date, to_date):
         """Validate input parameters.
@@ -167,7 +261,8 @@ class StatementGenerator:
         loan_sections = []
         total_balance = 0.0
         total_gross_balance = 0.0
-        
+        suspensions = data.loan_suspensions or []
+
         if config.show_loans and not df.empty:
             df['loan_id'] = df['loan_id'].fillna('-')
             loan_groups = df.groupby('loan_id')
@@ -229,6 +324,14 @@ class StatementGenerator:
                         notes=notes
                     ))
                 
+                # Merge suspension annotation rows into the loan's timeline,
+                # placed chronologically (stable sort keeps same-date order).
+                annotation_rows = self._build_suspension_annotations(
+                    loan_ref, suspensions, from_date, to_date, config.date_format
+                )
+                if annotation_rows:
+                    rows = sorted(rows + annotation_rows, key=lambda r: str(r.date))
+
                 if rows:
                     loan_sections.append(StatementLoanSection(
                         loan_ref=loan_ref,
@@ -393,8 +496,15 @@ class StatementGenerator:
                     <tr>{render_header()}</tr></thead><tbody>"""
                     
                     for row in section.rows:
-                        html += render_row(row)
-                    
+                        if getattr(row, 'is_annotation', False):
+                            html += (
+                                f'<tr><td colspan="{len(config.columns)}" '
+                                f'style="background:#f0f0f0;color:#888;font-style:italic;padding:4px 6px;">'
+                                f'{row.annotation_text}</td></tr>'
+                            )
+                        else:
+                            html += render_row(row)
+
                     html += "</tbody></table></div>"
             else:
                 html += "<p style='padding:10px;color:#666;'>No loan transactions in this period</p>"
@@ -649,6 +759,10 @@ class StatementGenerator:
                 cell_fmt = workbook.add_format({'border': 1})
                 currency_fmt = workbook.add_format({'border': 1, 'num_format': '#,##0'})
                 period_fmt = workbook.add_format({'italic': True, 'font_size': 10, 'align': 'center'})
+                annotation_fmt = workbook.add_format({
+                    'border': 1, 'italic': True, 'font_color': '#888888',
+                    'bg_color': '#F0F0F0'
+                })
                 
                 # Document header
                 worksheet.merge_range('A1:H1', f"{config.custom_title} - {presentation.customer_name}", header_fmt)
@@ -683,7 +797,17 @@ class StatementGenerator:
                             worksheet.write(row_idx, col, header, col_header_fmt)
                         row_idx += 1
                         
+                        last_col = len(config.columns) - 1
                         for row in section.rows:
+                            if getattr(row, 'is_annotation', False):
+                                # Greyed-out suspension band spanning all columns.
+                                if last_col > 0:
+                                    worksheet.merge_range(row_idx, 0, row_idx, last_col,
+                                                          row.annotation_text, annotation_fmt)
+                                else:
+                                    worksheet.write(row_idx, 0, row.annotation_text, annotation_fmt)
+                                row_idx += 1
+                                continue
                             for col, header in enumerate(config.columns):
                                 val = get_row_val(row, header)
                                 if isinstance(val, (int, float)) and val != "":

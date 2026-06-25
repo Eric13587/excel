@@ -142,8 +142,9 @@ class LoanService:
             limit_date_str_for_check = target_date.strftime("%Y-%m-%d") if target_date and not isinstance(target_date, str) else (target_date or datetime.now().strftime("%Y-%m-%d"))
             
             if suspend_until and loan['next_due_date'] > suspend_until:
-                # Suspension period has passed — auto-resume
-                self.db.resume_loan(loan['id'])
+                # Suspension period has passed — auto-resume.
+                # Record the resume at the intended boundary, not "now".
+                self.db.resume_loan(loan['id'], resumed_date=suspend_until)
             else:
                 # Still suspended — advance next_due_date through suspension period
                 # to extend the loan term, but create no transactions
@@ -164,7 +165,7 @@ class LoanService:
                 
                 # If suspension period has now passed, auto-resume and re-fetch
                 if suspend_until and due_date.strftime("%Y-%m-%d") > suspend_until:
-                    self.db.resume_loan(loan['id'])
+                    self.db.resume_loan(loan['id'], resumed_date=suspend_until)
                     # Re-fetch loan with updated next_due_date and proceed
                     loan = self.db.get_loan_by_ref(individual_id, loan_ref)
                     if not loan or loan['status'] != 'Active':

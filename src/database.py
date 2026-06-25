@@ -200,6 +200,44 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        # Loan suspension history (audit trail of suspension spans).
+        # The is_suspended/suspend_until columns above hold only the *current*
+        # state; this table preserves every suspension span so statements can
+        # render "no deductions for months x, y, z" even after a loan resumes.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS loan_suspensions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                loan_id INTEGER,
+                individual_id INTEGER,
+                loan_ref TEXT,
+                start_date TEXT,      -- date the suspension took effect
+                suspend_until TEXT,   -- intended resume date (NULL = indefinite)
+                resumed_date TEXT,    -- actual resume date (NULL = still active)
+                status TEXT DEFAULT 'active',  -- 'active' | 'resumed'
+                created_at TEXT,
+                FOREIGN KEY(loan_id) REFERENCES loans(id),
+                FOREIGN KEY(individual_id) REFERENCES individuals(id)
+            )
+        """)
+
+        # Back-fill: loans currently suspended under the old flag-only model have
+        # no audit span. Create a best-effort open span (start ≈ next_due_date,
+        # the point deductions paused) so their statements annotate too. The
+        # NOT EXISTS guard makes this idempotent — it only fires once per loan.
+        cursor.execute("""
+            INSERT INTO loan_suspensions
+                (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
+            SELECT l.id, l.individual_id, l.ref,
+                   COALESCE(NULLIF(l.next_due_date, ''), date('now')),
+                   l.suspend_until, NULL, 'active', datetime('now')
+            FROM loans l
+            WHERE l.is_suspended = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM loan_suspensions s
+                  WHERE s.loan_id = l.id AND s.resumed_date IS NULL
+              )
+        """)
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS savings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -348,13 +386,15 @@ class DatabaseManager:
         savings_df = self.get_savings_transactions(individual_id)
         savings_balance = self.get_savings_balance(individual_id)
         active_loans = self.get_active_loans(individual_id)
-        
+        loan_suspensions = self.get_loan_suspensions(individual_id)
+
         return StatementData(
             individual=individual,
             ledger_df=ledger_df,
             savings_df=savings_df,
             savings_balance=savings_balance,
-            active_loans=active_loans
+            active_loans=active_loans,
+            loan_suspensions=loan_suspensions
         )
 
     def get_earliest_record_date(self, individual_id):
@@ -647,22 +687,89 @@ class DatabaseManager:
 
     # ========== LOAN SUSPENSION OPERATIONS ==========
 
-    def suspend_loan(self, loan_id, until_date=None):
-        """Suspend deductions for a loan.
-        
+    def suspend_loan(self, loan_id, until_date=None, start_date=None):
+        """Suspend deductions for a loan and record the suspension span.
+
         Args:
             loan_id: The loan's primary key ID.
             until_date: Optional YYYY-MM-DD date string. If None, suspended indefinitely.
+            start_date: Optional YYYY-MM-DD date the suspension takes effect.
+                Defaults to today.
         """
         cursor = self.conn.cursor()
         cursor.execute("UPDATE loans SET is_suspended=1, suspend_until=? WHERE id=?", (until_date, loan_id))
+
+        if start_date is None:
+            start_date = datetime.now().strftime("%Y-%m-%d")
+
+        # Resolve loan_ref / individual_id for the audit record.
+        cursor.execute("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
+        row = cursor.fetchone()
+        loan_ref = row[0] if row else None
+        individual_id = row[1] if row else None
+
+        # If an open span already exists (re-suspending an already-suspended loan,
+        # or extending it), update it in place rather than creating a duplicate.
+        cursor.execute(
+            "SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL AND status='active' ORDER BY id DESC LIMIT 1",
+            (loan_id,),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                "UPDATE loan_suspensions SET suspend_until=?, start_date=? WHERE id=?",
+                (until_date, start_date, existing[0]),
+            )
+        else:
+            cursor.execute(
+                """INSERT INTO loan_suspensions
+                       (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, NULL, 'active', ?)""",
+                (loan_id, individual_id, loan_ref, start_date, until_date,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
         self.conn.commit()
 
-    def resume_loan(self, loan_id):
-        """Resume deductions for a suspended loan."""
+    def resume_loan(self, loan_id, resumed_date=None):
+        """Resume deductions for a suspended loan and close its suspension span.
+
+        Args:
+            loan_id: The loan's primary key ID.
+            resumed_date: Optional YYYY-MM-DD date deductions effectively resume.
+                Defaults to today. Auto-resume during catch-up passes the
+                intended ``suspend_until`` boundary so the recorded span reflects
+                the real skipped period rather than when the job happened to run.
+        """
         cursor = self.conn.cursor()
         cursor.execute("UPDATE loans SET is_suspended=0, suspend_until=NULL WHERE id=?", (loan_id,))
+
+        if resumed_date is None:
+            resumed_date = datetime.now().strftime("%Y-%m-%d")
+
+        # Close the most recent open suspension span for this loan.
+        cursor.execute(
+            "UPDATE loan_suspensions SET resumed_date=?, status='resumed' "
+            "WHERE id = (SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL "
+            "ORDER BY id DESC LIMIT 1)",
+            (resumed_date, loan_id),
+        )
         self.conn.commit()
+
+    def get_loan_suspensions(self, individual_id):
+        """Return all recorded suspension spans for an individual.
+
+        Returns:
+            List of dicts with keys: id, loan_id, individual_id, loan_ref,
+            start_date, suspend_until, resumed_date, status.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id, loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status "
+            "FROM loan_suspensions WHERE individual_id=? ORDER BY start_date, id",
+            (individual_id,),
+        )
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, r)) for r in cursor.fetchall()]
 
     # ========== RETIREMENT OPERATIONS ==========
 
