@@ -22,6 +22,19 @@ def gl():
     return GLService(db), db
 
 
+def _legacy_gl(db, date, category, gtype, amount, notes=""):
+    """Insert a row into the frozen legacy single-entry table (test bridge).
+
+    The production add_gl_entry method has been retired; migration tests still
+    need to simulate pre-existing legacy data, so they write the table directly.
+    """
+    db.conn.execute(
+        "INSERT INTO general_ledger (date, category, type, amount, notes) VALUES (?, ?, ?, ?, ?)",
+        (date, category, gtype, amount, notes),
+    )
+    db.conn.commit()
+
+
 # --------------------------------------------------------------------------- #
 # Chart of accounts
 # --------------------------------------------------------------------------- #
@@ -173,10 +186,10 @@ def test_backfill_balances_and_is_idempotent(gl):
 # --------------------------------------------------------------------------- #
 def test_migrate_legacy_gl_balances_and_idempotent(gl):
     svc, db = gl
-    db.add_gl_entry("2026-01-01", "Initial Bank Capital", "Asset", 50000, "seed capital")
-    db.add_gl_entry("2026-01-10", "Office Rent", "Expense", 12000, "jan rent")
-    db.add_gl_entry("2026-01-15", "Fines & Fees (Income)", "Income", 3000, "late fees")
-    db.add_gl_entry("2026-01-20", "External Loan Received", "Liability/Equity", 20000, "bank loan")
+    _legacy_gl(db, "2026-01-01", "Initial Bank Capital", "Asset", 50000, "seed capital")
+    _legacy_gl(db, "2026-01-10", "Office Rent", "Expense", 12000, "jan rent")
+    _legacy_gl(db, "2026-01-15", "Fines & Fees (Income)", "Income", 3000, "late fees")
+    _legacy_gl(db, "2026-01-20", "External Loan Received", "Liability/Equity", 20000, "bank loan")
 
     n1 = svc.migrate_legacy_gl()
     assert n1 == 4
@@ -194,7 +207,7 @@ def test_migrate_legacy_gl_balances_and_idempotent(gl):
 def test_backfill_and_migration_together_balance(gl):
     svc, db = gl
     _seed_subledgers(db)
-    db.add_gl_entry("2026-01-10", "Office Rent", "Expense", 12000, "rent")
+    _legacy_gl(db, "2026-01-10", "Office Rent", "Expense", 12000, "rent")
     svc.backfill_from_subledgers()
     svc.migrate_legacy_gl()
     rows, balanced = svc.get_trial_balance()
@@ -241,8 +254,8 @@ def test_balance_sheet_balances_after_backfill(gl):
 def test_balance_sheet_with_capital_and_expense_balances(gl):
     svc, db = gl
     _seed_subledgers(db)
-    db.add_gl_entry("2026-01-01", "Initial Bank Capital", "Asset", 50000, "capital")
-    db.add_gl_entry("2026-01-10", "Office Rent", "Expense", 12000, "rent")
+    _legacy_gl(db, "2026-01-01", "Initial Bank Capital", "Asset", 50000, "capital")
+    _legacy_gl(db, "2026-01-10", "Office Rent", "Expense", 12000, "rent")
     svc.sync()  # rebuild projection + migrate legacy in one call
 
     bs = svc.get_balance_sheet()
@@ -276,7 +289,7 @@ def test_rebuild_reflects_ledger_deletion(gl):
 def test_rebuild_preserves_manual_and_migration_entries(gl):
     svc, db = gl
     _seed_subledgers(db)
-    db.add_gl_entry("2026-01-10", "Office Rent", "Expense", 12000, "rent")
+    _legacy_gl(db, "2026-01-10", "Office Rent", "Expense", 12000, "rent")
     svc.backfill_from_subledgers()
     svc.migrate_legacy_gl()
 

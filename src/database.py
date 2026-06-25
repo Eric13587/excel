@@ -306,7 +306,10 @@ class DatabaseManager:
             )
         """)
         
-        # General Ledger / Treasury Table
+        # Legacy single-entry treasury table — FROZEN. No longer written to;
+        # retained so GLService.migrate_legacy_gl can convert any historical
+        # rows into balanced double-entry journals. New treasury activity is
+        # posted via journal_entries/journal_lines.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS general_ledger (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1803,49 +1806,10 @@ class DatabaseManager:
                 conn.close()
 
     # ==========================================
-    # Treasury / General Ledger Methods
+    # Treasury / General Ledger
     # ==========================================
-    
-    def add_gl_entry(self, date_str, category, type_str, amount, notes, batch_id=None):
-        """Add a General Ledger entry (Bank, Expenses, Equity, etc)."""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT INTO general_ledger (date, category, type, amount, notes, batch_id)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (date_str, category, type_str, amount, notes, batch_id))
-        self.conn.commit()
-        return cursor.lastrowid
-        
-    def get_gl_entries(self, start_date=None, end_date=None):
-        """Fetch general ledger entries, optionally filtered by date range."""
-        query = "SELECT * FROM general_ledger"
-        params = []
-        conditions = []
-        
-        if start_date:
-            conditions.append("date >= ?")
-            params.append(start_date)
-        if end_date:
-            conditions.append("date <= ?")
-            params.append(end_date)
-            
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-            
-        query += " ORDER BY date DESC, id DESC"
-        
-        cursor = self.conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-        
-        columns = [column[0] for column in cursor.description]
-        results = []
-        for row in rows:
-            results.append(dict(zip(columns, row)))
-        return results
-        
-    def delete_gl_entry(self, entry_id):
-        """Delete a specific general ledger entry."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM general_ledger WHERE id=?", (entry_id,))
-        self.conn.commit()
+    # The single-entry general_ledger API (add/get/delete) has been retired in
+    # favour of the double-entry ledger (see GLService). The general_ledger
+    # table is kept read-only as a historical source that GLService.migrate_
+    # legacy_gl converts into balanced journals; new treasury activity is posted
+    # as journal entries through the Treasury dialog.
