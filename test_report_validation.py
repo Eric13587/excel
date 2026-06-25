@@ -11,9 +11,12 @@ def test_fy_logic():
     print("\n--- Testing FY Logic ---")
     mock_db = MagicMock()
     mock_db.get_setting.return_value = "November" # FY starts Nov
-    
+    # get_recent_quarters reads the earliest record date straight off a cursor;
+    # give it a real date string so strptime has something to parse.
+    mock_db.conn.cursor.return_value.fetchone.return_value = ("2024-01-01",)
+
     gen = ReportGenerator(mock_db)
-    
+
     # 1. Test get_fy_start_month_index
     idx = gen.get_fy_start_month_index()
     print(f"FY Start Month Index (Nov): {idx}")
@@ -239,7 +242,10 @@ def test_progress_callback():
     ]
     # Mock ledger (empty is fine, we just want to check the loop)
     mock_db.get_ledger.return_value = pd.DataFrame()
-    
+    # The retired-member exclusion path calls get_individual; keep members
+    # non-retired so that branch stays inert for this test.
+    mock_db.get_individual.return_value = {'is_retired': 0, 'retired_date': ''}
+
     # Track callbacks
     callbacks = []
     def on_progress(curr, total, msg):
@@ -247,11 +253,13 @@ def test_progress_callback():
         
     gen = ReportGenerator(mock_db)
     
-    # Run helper (mock validation to pass)
-    with patch.object(gen, '_validate_start_date', return_value=(True, "")):
-        with patch.object(gen, '_get_fy_start_date', return_value=datetime(2025, 1, 1)):
-             # We need a valid start date string
-             gen.generate_quarterly_report("2025-01-01", "dummy.xlsx", progress_callback=on_progress)
+    # Run helper (mock validation to pass). Patch export too so the test only
+    # exercises the callback loop and doesn't write a real file to the repo.
+    with patch.object(gen, '_export_to_excel', return_value=(True, "Exported")):
+        with patch.object(gen, '_validate_start_date', return_value=(True, "")):
+            with patch.object(gen, '_get_fy_start_date', return_value=datetime(2025, 1, 1)):
+                # We need a valid start date string
+                gen.generate_quarterly_report("2025-01-01", "dummy.xlsx", progress_callback=on_progress)
              
     # Verify callbacks
     print(f"Callbacks received: {len(callbacks)}")
@@ -267,7 +275,9 @@ def test_legacy_warnings():
     print("\n--- Testing Legacy Data Warnings ---")
     mock_db = MagicMock()
     mock_db.get_individuals.return_value = [(1, "Alice")]
-    
+    # Non-retired member so the retired-exclusion branch stays inert.
+    mock_db.get_individual.return_value = {'is_retired': 0, 'retired_date': ''}
+
     # Mock ledger WITHOUT principal_balance
     import pandas as pd
     data = {
