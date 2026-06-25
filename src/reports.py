@@ -689,75 +689,40 @@ class ReportGenerator:
             if not target_date_str:
                 target_date_str = datetime.now().strftime("%Y-%m-%d")
                 
-            cursor = self.db.conn.cursor()
-            
-            # --- INCOME STATEMENT DATA ---
-            # 1. Interest Revenue (Loans up to target date)
-            # Find all interest portions from Repayments, or "Interest Earned" if standard.
-            # In LoanMaster, 'Interest Earned' adds to balance, but we just realized it as income when Repaid. 
-            # Or we can count 'Interest Earned'. Actually 'Interest Earned' events are the true accrued revenue.
-            cursor.execute("SELECT SUM(interest_amount) FROM ledger WHERE date <= ? AND event_type IN ('Interest Earned')", (target_date_str,))
-            interest_revenue = cursor.fetchone()[0] or 0.0
-            
-            # 2. Other Income (GL)
-            cursor.execute("SELECT SUM(amount) FROM general_ledger WHERE type='Income' AND date <= ?", (target_date_str,))
-            gl_income = cursor.fetchone()[0] or 0.0
-            
-            total_revenue = interest_revenue + gl_income
-            
-            # 3. Expenses (GL)
-            cursor.execute("SELECT category, SUM(amount) as amt FROM general_ledger WHERE type='Expense' AND date <= ? GROUP BY category", (target_date_str,))
-            expense_rows = cursor.fetchall()
-            total_expenses = sum([val for _, val in expense_rows])
-            
-            net_surplus = total_revenue - total_expenses
-            
-            # --- BALANCE SHEET DATA ---
-            # Assets
-            # 1. Total Outstanding Principal (We can calculate by Ledger exactly up to date)
-            cursor.execute("SELECT SUM(principal_portion), SUM(interest_portion) FROM ledger WHERE date <= ? AND event_type='Repayment'", (target_date_str,))
-            rep_p, rep_i = cursor.fetchone()
-            rep_p, rep_i = rep_p or 0, rep_i or 0
-            
-            cursor.execute("SELECT SUM(added) FROM ledger WHERE date <= ? AND (event_type LIKE 'Loan Issued%' OR event_type='Loan Top-Up')", (target_date_str,))
-            loans_issued = cursor.fetchone()[0] or 0.0
-            
-            outstanding_loan_principal = loans_issued - rep_p
-            
-            # 2. Bank Cash
-            # Sav Dep
-            cursor.execute("SELECT SUM(amount) FROM savings WHERE transaction_type='Deposit' AND date <= ?", (target_date_str,))
-            sav_dep = cursor.fetchone()[0] or 0.0
-            # Sav WD
-            cursor.execute("SELECT SUM(amount) FROM savings WHERE transaction_type='Withdrawal' AND date <= ?", (target_date_str,))
-            sav_wd = cursor.fetchone()[0] or 0.0
-            # GL Asset In (Capital/Deposit)
-            cursor.execute("SELECT SUM(amount) FROM general_ledger WHERE type='Asset' AND date <= ?", (target_date_str,))
-            gl_asset = cursor.fetchone()[0] or 0.0
-            # GL Liab (Borrowings increase cash)
-            cursor.execute("SELECT SUM(amount) FROM general_ledger WHERE type='Liability/Equity' AND date <= ?", (target_date_str,))
-            gl_liab = cursor.fetchone()[0] or 0.0
-            
-            bank_cash = (rep_p + rep_i) + sav_dep - sav_wd - loans_issued + gl_income - total_expenses + gl_asset + gl_liab
-            
-            total_assets = outstanding_loan_principal + bank_cash
-            
-            # Liabilities
-            # 1. Member Savings 
-            total_savings = sav_dep - sav_wd
-            
-            # 2. External Borrowing/Liabilities
-            # GL Liability
-            total_liabilities = total_savings + gl_liab
-            
-            # Equity
-            # 1. Capital (GL Asset -> initial capital?) Actually initial capital should be Liability/Equity if strict, but let's assume it's in gl_liab or gl_asset.
-            # 2. Retained Surplus
-            total_equity = gl_asset + net_surplus
-            # Note: Strict accounting: gl_asset is "Bank Deposit" (debit cash, credit what?). If they recorded initial capital as "Asset" type, it's Equity implicitly.
-            
-            total_liabilities_and_equity = total_liabilities + total_equity
-            
+            # Derive the statements from the double-entry general ledger so the
+            # books balance by construction. This replaces the previous
+            # hand-assembled cash/equity equations (which were not guaranteed to
+            # tie out). sync() brings the GL current with ledger/savings first.
+            from src.services.gl_service import GLService
+            gl = GLService(self.db)
+            gl.sync()
+
+            inc = gl.get_income_statement(None, target_date_str)
+            bs = gl.get_balance_sheet(target_date_str)
+            net_surplus = inc['net_surplus']
+
+            def _rows(lines, empty_label):
+                if not lines:
+                    return f'<tr><td class="label">{empty_label}</td><td class="amount">0.00</td></tr>'
+                return "".join(
+                    f'<tr><td class="label">{l["name"]}</td>'
+                    f'<td class="amount">{l["amount"]:,.2f}</td></tr>'
+                    for l in lines
+                )
+
+            if bs['is_balanced']:
+                balance_banner = (
+                    '<div style="margin-top:10px;padding:8px;border-radius:5px;text-align:center;'
+                    'background:#dcfce7;color:#166534;font-weight:bold;">'
+                    'Balance check: Assets = Liabilities + Equity ✓</div>'
+                )
+            else:
+                balance_banner = (
+                    '<div style="margin-top:10px;padding:8px;border-radius:5px;text-align:center;'
+                    'background:#fee2e2;color:#991b1b;font-weight:bold;">'
+                    'Balance check FAILED — books do not tie; investigate before relying on this.</div>'
+                )
+
             # Render HTML
             html = f"""
             <!DOCTYPE html>
@@ -777,54 +742,43 @@ class ReportGenerator:
                     </style>
                 </head>
                 <body>
-                    <h1>Instutitional Financial Statements</h1>
+                    <h1>Institutional Financial Statements</h1>
                     <h2>Report up to: {target_date_str}</h2>
-                    
-                    <h3>I. INCOME STATEMENT (P&L)</h3>
+
+                    <h3>I. INCOME STATEMENT (P&amp;L)</h3>
                     <table>
                         <tr><td class="section-title" colspan="2">Revenues</td></tr>
-                        <tr><td class="label">Interest Income (Loans)</td><td class="amount">{interest_revenue:,.2f}</td></tr>
-                        <tr><td class="label">Other SACCO Income</td><td class="amount">{gl_income:,.2f}</td></tr>
-                        <tr class="total-row"><td class="label">Total Revenue</td><td class="amount">{total_revenue:,.2f}</td></tr>
-                        
+                        {_rows(inc['revenue'], 'No recorded income')}
+                        <tr class="total-row"><td class="label">Total Revenue</td><td class="amount">{inc['total_revenue']:,.2f}</td></tr>
+
                         <tr><td class="section-title" colspan="2">Operating Expenses</td></tr>
-            """
-            
-            for cat, amt in expense_rows:
-                html += f'<tr><td class="label">{cat}</td><td class="amount">{amt:,.2f}</td></tr>'
-                
-            if not expense_rows:
-                html += '<tr><td class="label">No recorded expenses</td><td class="amount">0.00</td></tr>'
-                
-            html += f"""
-                        <tr class="total-row"><td class="label">Total Expenses</td><td class="amount">{total_expenses:,.2f}</td></tr>
+                        {_rows(inc['expenses'], 'No recorded expenses')}
+                        <tr class="total-row"><td class="label">Total Expenses</td><td class="amount">{inc['total_expenses']:,.2f}</td></tr>
                         <tr style="height: 20px;"><td colspan="2"></td></tr>
                         <tr class="total-row" style="color: {'#166534' if net_surplus >= 0 else '#991b1b'};"><td class="label">NET SURPLUS (PROFIT)</td><td class="amount">{net_surplus:,.2f}</td></tr>
                     </table>
-                    
+
                     <div style="page-break-before: always;"></div>
-                    
-                    <h3>II. BALANCE SHEET</h3>
+
+                    <h3>II. BALANCE SHEET (as of {target_date_str})</h3>
                     <table>
                         <tr><td class="section-title" colspan="2">ASSETS</td></tr>
-                        <tr><td class="label">Cash and Bank Balances</td><td class="amount">{bank_cash:,.2f}</td></tr>
-                        <tr><td class="label">Loan Portfolio (Principal Outstanding)</td><td class="amount">{outstanding_loan_principal:,.2f}</td></tr>
-                        <tr class="total-row"><td class="label">TOTAL ASSETS</td><td class="amount">{total_assets:,.2f}</td></tr>
-                        
+                        {_rows(bs['assets'], 'No assets')}
+                        <tr class="total-row"><td class="label">TOTAL ASSETS</td><td class="amount">{bs['total_assets']:,.2f}</td></tr>
+
                         <tr><td class="section-title" colspan="2">LIABILITIES</td></tr>
-                        <tr><td class="label">Member Savings & Shares Hold</td><td class="amount">{total_savings:,.2f}</td></tr>
-                        <tr><td class="label">External Borrowing / Other Payables</td><td class="amount">{gl_liab:,.2f}</td></tr>
-                        <tr class="total-row"><td class="label">Total Liabilities</td><td class="amount">{total_liabilities:,.2f}</td></tr>
-                        
+                        {_rows(bs['liabilities'], 'No liabilities')}
+                        <tr class="total-row"><td class="label">Total Liabilities</td><td class="amount">{bs['total_liabilities']:,.2f}</td></tr>
+
                         <tr><td class="section-title" colspan="2">EQUITY</td></tr>
-                        <tr><td class="label">Institutional Capital / Deposits</td><td class="amount">{gl_asset:,.2f}</td></tr>
-                        <tr><td class="label">Retained Surplus (Profit)</td><td class="amount">{net_surplus:,.2f}</td></tr>
-                        <tr class="total-row"><td class="label">Total Equity</td><td class="amount">{total_equity:,.2f}</td></tr>
-                        
+                        {_rows(bs['equity'], 'No equity')}
+                        <tr class="total-row"><td class="label">Total Equity</td><td class="amount">{bs['total_equity']:,.2f}</td></tr>
+
                         <tr style="height: 20px;"><td colspan="2"></td></tr>
-                        <tr class="total-row"><td class="label">TOTAL LIABILITIES & EQUITY</td><td class="amount">{total_liabilities_and_equity:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">TOTAL LIABILITIES &amp; EQUITY</td><td class="amount">{bs['total_liabilities_and_equity']:,.2f}</td></tr>
                     </table>
-                    
+                    {balance_banner}
+
                     <div style="margin-top: 40px; font-size: 11px; text-align: center; color: #64748b;">Generated securely by LoanMaster Treasury Engine on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
                 </body>
             </html>
