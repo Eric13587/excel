@@ -274,6 +274,15 @@ class ReportGenerator:
                 if progress_callback:
                     progress_callback(i + 1, total_individuals, f"Processing {name}...")
                 
+                # Skip retired individuals who retired BEFORE this report period
+                # and have no outstanding loans. If they retired during this period,
+                # include them — their transactions naturally stop at retirement.
+                ind_details = self.db.get_individual(ind_id)
+                if ind_details and ind_details.get('is_retired', 0):
+                    retired_date = ind_details.get('retired_date', '')
+                    if retired_date and retired_date < start_date_str and not self.db.has_outstanding_loans(ind_id):
+                        continue  # Retired before this period with no debt — exclude
+                
                 ledger_df = self.db.get_ledger(ind_id)
                 if ledger_df.empty:
                     continue
@@ -429,6 +438,15 @@ class ReportGenerator:
                 
                 if progress_callback:
                     progress_callback(i + 1, total_individuals, f"Processing {name}...")
+                
+                # Skip retired individuals who retired BEFORE this report period.
+                # If they retired during this quarter, include them — the retirement
+                # withdrawal will appear as a meaningful final entry.
+                ind_details = self.db.get_individual(ind_id)
+                if ind_details and ind_details.get('is_retired', 0):
+                    retired_date = ind_details.get('retired_date', '')
+                    if retired_date and retired_date < start_date_str:
+                        continue  # Retired before this period — exclude from savings report
                 
                 res = self._calculate_savings_summary(ind_id, q_dates, start_date_str)
                 if not res:

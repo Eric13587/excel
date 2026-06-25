@@ -5,6 +5,7 @@ the Dashboard view for better separation of concerns.
 """
 import os
 import re
+import sys
 import math
 from datetime import datetime
 
@@ -39,7 +40,44 @@ class StatementGenerator:
         """
         self.db = db_manager
         self._get_printer_view = printer_view_getter
+        self._logo_path = self._resolve_logo_path()
     
+    @staticmethod
+    def _resolve_logo_path():
+        """Resolve absolute path to the SACCO logo for embedding in statements."""
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        
+        logo_path = os.path.join(base_path, "resources", "nairobi_water_sacco_logo.png")
+        if os.path.exists(logo_path):
+            return logo_path
+        return None
+
+    @staticmethod
+    def _get_base64_data_url(path):
+        """Load image file and return its base64 data URL for inline HTML embedding."""
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            import base64
+            ext = os.path.splitext(path)[1].lower()
+            mime_type = "image/png"
+            if ext in ['.jpg', '.jpeg']:
+                mime_type = "image/jpeg"
+            elif ext == '.gif':
+                mime_type = "image/gif"
+            elif ext == '.svg':
+                mime_type = "image/svg+xml"
+                
+            with open(path, "rb") as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                return f"data:{mime_type};base64,{encoded_string}"
+        except Exception as e:
+            print(f"Failed to encode image {path} as base64: {e}")
+            return ""
+
     @staticmethod
     def clean_notes(note):
         """Clean notes by removing auto-generated markers."""
@@ -294,11 +332,14 @@ class StatementGenerator:
     td { padding: 3px 4px; border: 1px solid #ddd; }
     .loan-box { margin-bottom: 12px; }
     .summary-row { margin-top: 15px; padding: 10px; background: #f9f9f9; border-radius: 5px; }
-    .footer { margin-top: 15px; text-align: center; font-size: 8px; color: #999; }
+    .footer { margin-top: 15px; display: flex; align-items: center; justify-content: space-between; font-size: 8px; color: #999; border-top: 1px solid #e0e0e0; padding-top: 8px; }
+    .footer-text { text-align: left; }
+    .footer-logo { height: 48px; opacity: 0.95; }
 </style>
 </head><body>"""
         
-        logo_html = f'<img src="{config.company_logo_path}" class="logo">' if config.company_logo_path else ''
+        company_logo_url = self._get_base64_data_url(config.company_logo_path) if config.company_logo_path else ""
+        logo_html = f'<img src="{company_logo_url}" class="logo">' if company_logo_url else ''
         
         html += f"""<div class="header">
     {logo_html}
@@ -415,7 +456,15 @@ class StatementGenerator:
         
         html += "</div>"  # close summary-row
 
-        html += f"""<div class="footer">{config.custom_footer} | Statement generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} | Period: {presentation.period_display}</div>
+        footer_logo_html = ''
+        footer_logo_url = self._get_base64_data_url(self._logo_path) if self._logo_path else ""
+        if footer_logo_url:
+            footer_logo_html = f'<img src="{footer_logo_url}" class="footer-logo">'
+        
+        html += f"""<div class="footer">
+    <div class="footer-text">{config.custom_footer} | Statement generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} | Period: {presentation.period_display}</div>
+    {footer_logo_html}
+</div>
 </body></html>"""
         
         return html

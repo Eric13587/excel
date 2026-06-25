@@ -20,12 +20,13 @@ from ..database import DatabaseManager
 class IndividualCard(QFrame):
     """A custom widget to display individual details in the list."""
     
-    def __init__(self, ind_id, name, phone, email, parent_dashboard):
+    def __init__(self, ind_id, name, phone, email, parent_dashboard, is_retired=False):
         super().__init__()
         self.ind_id = ind_id
         self.name = name
         self.phone = phone
         self.email = email
+        self.is_retired = is_retired
         self.dashboard = parent_dashboard
         self._is_selected = False
         
@@ -75,6 +76,15 @@ class IndividualCard(QFrame):
         layout.addLayout(info_layout)
         
         layout.addStretch()
+        
+        # Retirement badge
+        self.retired_badge = QLabel("RETIRED")
+        self.retired_badge.setStyleSheet(
+            "background-color: #DC2626; color: white; font-size: 10px; "
+            "font-weight: bold; padding: 2px 8px; border-radius: 4px;"
+        )
+        self.retired_badge.setVisible(self.is_retired)
+        layout.addWidget(self.retired_badge)
 
     def apply_theme(self):
         t = self.dashboard.theme_manager
@@ -367,8 +377,14 @@ class Dashboard(QWidget):
         self.delete_btn.clicked.connect(self.delete_individual)
         self.delete_btn.setEnabled(False)
         
+        self.retire_btn = QPushButton("Retire")
+        self.retire_btn.clicked.connect(self.retire_individual_btn)
+        self.retire_btn.setEnabled(False)
+        self.retire_btn.setStyleSheet("background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;")
+        
         actions_layout.addWidget(self.open_btn)
         actions_layout.addWidget(self.edit_btn)
+        actions_layout.addWidget(self.retire_btn)
         actions_layout.addStretch()
         actions_layout.addWidget(self.delete_btn)
         
@@ -594,8 +610,10 @@ class Dashboard(QWidget):
         individuals.sort(key=lambda x: x[1].lower())
         
         for idx, ind in enumerate(individuals, 1):
-             # ind: [id, name, phone, email]
-             card = IndividualCard(ind[0], ind[1], ind[2], ind[3], self)
+             # ind: [id, name, phone, email, default_deduction, created_at, import_id, is_retired, retired_date]
+             ind_details = self.db.get_individual(ind[0])
+             is_retired = bool(ind_details.get('is_retired', 0)) if ind_details else False
+             card = IndividualCard(ind[0], ind[1], ind[2], ind[3], self, is_retired=is_retired)
              self.scroll_content_layout.addWidget(card)
              self.card_widgets.append(card)
         
@@ -628,6 +646,15 @@ class Dashboard(QWidget):
         self.open_btn.setEnabled(enabled)
         self.edit_btn.setEnabled(enabled)
         self.delete_btn.setEnabled(enabled)
+        self.retire_btn.setEnabled(enabled)
+        
+        # Update retire button text based on selected card's state
+        if self.selected_card and self.selected_card.is_retired:
+            self.retire_btn.setText("Reinstate")
+            self.retire_btn.setStyleSheet("background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;")
+        else:
+            self.retire_btn.setText("Retire")
+            self.retire_btn.setStyleSheet("background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;")
 
     def add_individual(self):
         self.loan_controller.add_individual(IndividualDialog)
@@ -649,6 +676,56 @@ class Dashboard(QWidget):
 
     def delete_individual(self):
         self.loan_controller.delete_individual()
+    
+    def retire_individual_btn(self):
+        """Retire or reinstate the selected individual."""
+        if not self.selected_card:
+            return
+        
+        ind_id = self.selected_card.ind_id
+        name = self.selected_card.name
+        is_retired = self.selected_card.is_retired
+        
+        if is_retired:
+            # Reinstate
+            confirm = QMessageBox.question(
+                self, "Reinstate Individual",
+                f"Are you sure you want to reinstate '{name}'?\n\n"
+                f"They will appear in all reports again.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                self.engine.reinstate_individual(ind_id)
+                self.refresh_list(select_id=ind_id)
+                QMessageBox.information(self, "Reinstated", f"'{name}' has been reinstated.")
+        else:
+            # Retire
+            savings_bal = self.db.get_savings_balance(ind_id)
+            has_loans = self.db.has_outstanding_loans(ind_id)
+            
+            msg = f"Are you sure you want to retire '{name}'?\n\n"
+            if savings_bal > 0:
+                msg += f"\u2022 Savings balance of {savings_bal:,.0f} will be auto-withdrawn\n"
+            if has_loans:
+                msg += f"\u2022 Outstanding loans will remain active until cleared\n"
+                msg += f"\u2022 They will still appear in Loan Reports\n"
+            msg += f"\n\u2022 They will be excluded from Savings/Shares Reports\n"
+            msg += f"\u2022 They will be excluded from Mass Savings operations"
+            
+            confirm = QMessageBox.question(
+                self, "Retire Individual", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                result = self.engine.retire_individual(ind_id)
+                withdrawn = result.get('savings_withdrawn', 0)
+                
+                msg = f"'{name}' has been retired."
+                if withdrawn > 0:
+                    msg += f"\nSavings withdrawal of {withdrawn:,.0f} was created."
+                
+                self.refresh_list(select_id=ind_id)
+                QMessageBox.information(self, "Retired", msg)
     
     def batch_print_all(self):
         """Print all statements to a selected folder."""
@@ -966,14 +1043,28 @@ class Dashboard(QWidget):
             cb.setProperty("loan_ref", loan['ref'])
             cb.setProperty("ind_id", loan['individual_id'])
             
-            # Check if actually overdue?
-            # catch_up_loan works if next_due <= current_date.
-            # Visual cue if up to date?
-            is_overdue = loan['next_due_date'] <= datetime.now().strftime("%Y-%m-%d")
-            if not is_overdue:
-                cb.setText(label_text + " (Up to Date)")
-                cb.setEnabled(False) # Can't catch up if up to date
+            # Check if suspended
+            is_suspended = loan.get('is_suspended', 0)
+            suspend_until = loan.get('suspend_until', '')
+            
+            # Check if individual is retired
+            ind_details = self.db.get_individual(loan['individual_id'])
+            is_retired = bool(ind_details.get('is_retired', 0)) if ind_details else False
+            
+            if is_suspended:
+                suffix = f" (\u23f8 SUSPENDED until {suspend_until})" if suspend_until else " (\u23f8 SUSPENDED)"
+                cb.setText(label_text + suffix)
+                cb.setEnabled(False)
                 cb.setChecked(False)
+            elif is_retired:
+                cb.setText(label_text + " (Retired)")
+            else:
+                # Check if actually overdue?
+                is_overdue = loan['next_due_date'] <= datetime.now().strftime("%Y-%m-%d")
+                if not is_overdue:
+                    cb.setText(label_text + " (Up to Date)")
+                    cb.setEnabled(False)
+                    cb.setChecked(False)
             
             checkboxes.append(cb)
             scroll_layout.addWidget(cb)
@@ -1359,6 +1450,11 @@ class Dashboard(QWidget):
         engine = self.engine
         
         for ind in individuals:
+            # Skip retired individuals from mass savings
+            ind_details = self.db.get_individual(ind[0])
+            if ind_details and ind_details.get('is_retired', 0):
+                continue
+            
             label_text = f"{ind[1]}"
             cb = QCheckBox(label_text)
             cb.setChecked(False) 

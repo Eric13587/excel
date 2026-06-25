@@ -97,6 +97,26 @@ class SavingsService:
         self.db.add_savings_transaction(individual_id, date_str, "Withdrawal", amount, notes, batch_id=batch_id)
         return True
 
+    def withdraw_all(self, individual_id, date_str, notes="Retirement withdrawal"):
+        """Withdraw the full savings balance for an individual.
+        
+        Used during retirement to clear out savings.
+        
+        Args:
+            individual_id: ID of the individual.
+            date_str: Date in YYYY-MM-DD format.
+            notes: Transaction notes.
+            
+        Returns:
+            The withdrawn amount (0 if no balance).
+        """
+        balance = self.get_savings_balance(individual_id)
+        if balance <= 0:
+            return 0.0
+        
+        self.db.add_savings_transaction(individual_id, date_str, "Withdrawal", balance, notes)
+        return balance
+
     def recalculate_user_savings(self, individual_id):
         """Recalculate running balances for a user's savings account."""
         transactions = self.db.get_savings_transactions(individual_id)

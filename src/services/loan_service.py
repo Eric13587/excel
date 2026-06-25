@@ -12,7 +12,7 @@ import json
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-from src.exceptions import LoanNotFoundError, LoanInactiveError
+from src.exceptions import LoanNotFoundError, LoanInactiveError, LoanSuspendedError
 from src.config import DEFAULT_INTEREST_RATE
 
 
@@ -135,7 +135,42 @@ class LoanService:
             raise LoanNotFoundError(loan_ref, individual_id)
         if loan['status'] != 'Active':
             raise LoanInactiveError(loan_ref, loan['status'])
+        
+        # --- Suspension Guard ---
+        if loan.get('is_suspended', 0):
+            suspend_until = loan.get('suspend_until')
+            limit_date_str_for_check = target_date.strftime("%Y-%m-%d") if target_date and not isinstance(target_date, str) else (target_date or datetime.now().strftime("%Y-%m-%d"))
             
+            if suspend_until and loan['next_due_date'] > suspend_until:
+                # Suspension period has passed — auto-resume
+                self.db.resume_loan(loan['id'])
+            else:
+                # Still suspended — advance next_due_date through suspension period
+                # to extend the loan term, but create no transactions
+                due_date = datetime.strptime(loan['next_due_date'], "%Y-%m-%d")
+                resume_date = datetime.strptime(suspend_until, "%Y-%m-%d") if suspend_until else datetime.strptime(limit_date_str_for_check, "%Y-%m-%d")
+                
+                months_skipped = 0
+                while due_date <= resume_date and due_date.strftime("%Y-%m-%d") <= limit_date_str_for_check:
+                    due_date = due_date + relativedelta(months=1)
+                    months_skipped += 1
+                
+                if months_skipped > 0:
+                    # Advance next_due_date on the loan record (extending term)
+                    cursor = self.db.conn.cursor()
+                    cursor.execute("UPDATE loans SET next_due_date=? WHERE id=?", 
+                                   (due_date.strftime("%Y-%m-%d"), loan['id']))
+                    self.db.conn.commit()
+                
+                # If suspension period has now passed, auto-resume and re-fetch
+                if suspend_until and due_date.strftime("%Y-%m-%d") > suspend_until:
+                    self.db.resume_loan(loan['id'])
+                    # Re-fetch loan with updated next_due_date and proceed
+                    loan = self.db.get_loan_by_ref(individual_id, loan_ref)
+                    if not loan or loan['status'] != 'Active':
+                        return 0
+                else:
+                    return 0  # Still suspended, nothing to do
         
         count = 0
         if target_date:
@@ -332,6 +367,8 @@ class LoanService:
                             total_deductions += count
                     except LoanInactiveError:
                         pass  # Silently skip inactive/paid loans during mass deduction
+                    except LoanSuspendedError:
+                        pass  # Silently skip suspended loans during mass deduction
                     except Exception as e:
                         errors.append((l_ref, str(e)))
 
@@ -407,6 +444,10 @@ class LoanService:
             raise LoanNotFoundError(loan_ref, individual_id)
         if loan['status'] != 'Active':
             raise LoanInactiveError(loan_ref, loan['status'])
+        
+        # --- Suspension Guard ---
+        if loan.get('is_suspended', 0):
+            raise LoanSuspendedError(loan_ref, loan.get('suspend_until'))
 
         previous_state_json = json.dumps(self._capture_loan_state(loan))
         date_str = loan['next_due_date']

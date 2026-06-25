@@ -346,7 +346,11 @@ class LedgerView(QWidget):
                     is_overdue = True
             
             title_text = f"<b>Loan Reference: {loan_ref}</b>"
-            if is_overdue:
+            if loan_info and loan_info.get('is_suspended', 0):
+                suspend_until = loan_info.get('suspend_until', '')
+                suffix = f" until {suspend_until}" if suspend_until else ""
+                title_text = f"<b style='color: #F59E0B;'>Loan Reference: {loan_ref} (\u23f8 SUSPENDED{suffix})</b>"
+            elif is_overdue:
                 title_text = f"<b style='color: {self.theme_manager.get_color('danger')};'>Loan Reference: {loan_ref} (OVERDUE)</b>"
             title_label = QLabel(title_text)
             header_layout.addWidget(title_label)
@@ -360,6 +364,10 @@ class LedgerView(QWidget):
             table.setColumnHidden(7, True) # Hide Interest Balance column as requested
             
             if loan_ref != "-":
+                # Check suspension status
+                is_suspended = loan_info.get('is_suspended', 0) if loan_info else 0
+                suspend_until = loan_info.get('suspend_until', '') if loan_info else ''
+                
                 # Header Buttons: Info -> Edit -> Catch Up ...
                 info_btn = QPushButton("Info")
                 info_btn.setMaximumWidth(40)
@@ -371,15 +379,27 @@ class LedgerView(QWidget):
                 edit_entry_btn.clicked.connect(lambda checked, t=table: self.edit_loan_entry_btn(t))
                 header_layout.addWidget(edit_entry_btn)
                 
-
-
-
+                # Suspend / Resume button
+                if is_suspended:
+                    resume_btn = QPushButton("\u25b6 Resume")
+                    resume_btn.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
+                    resume_btn.setToolTip(f"Suspended until {suspend_until}" if suspend_until else "Suspended indefinitely")
+                    resume_btn.clicked.connect(lambda checked, lid=loan_info['id']: self.resume_loan_btn(lid))
+                    header_layout.addWidget(resume_btn)
+                else:
+                    suspend_btn = QPushButton("\u23f8 Suspend")
+                    suspend_btn.setStyleSheet("background-color: #F59E0B; color: black; font-weight: bold;")
+                    suspend_btn.clicked.connect(lambda checked, lid=loan_info['id'], ref=loan_ref: self.suspend_loan_dialog(lid, ref))
+                    header_layout.addWidget(suspend_btn)
 
                 # Order: Catch Up (1) -> Top-Up (2) -> Delete (3) -> Deduct (4) -> Auto (5) -> Undo (6)
 
                 catch_up_btn = QPushButton("Catch Up")
                 catch_up_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
                 catch_up_btn.clicked.connect(lambda checked, ref=loan_ref: self.loans_catch_up_to_current(ref))
+                if is_suspended:
+                    catch_up_btn.setEnabled(False)
+                    catch_up_btn.setToolTip("Loan is suspended")
                 header_layout.addWidget(catch_up_btn)
 
                 top_up_btn = QPushButton("Top-Up Loan")
@@ -410,6 +430,9 @@ class LedgerView(QWidget):
                 
                 deduct_btn = QPushButton("Deduct")
                 deduct_btn.clicked.connect(lambda checked, ref=loan_ref, spin=deduct_multiplier: self.deduct_multiplier_btn(ref, spin))
+                if is_suspended:
+                    deduct_btn.setEnabled(False)
+                    deduct_btn.setToolTip("Loan is suspended")
                 header_layout.addWidget(deduct_btn)
 
                 undo_btn = QPushButton("Delete Last")
@@ -699,6 +722,54 @@ class LedgerView(QWidget):
                 self.refresh_loans_list()
             else:
                 QMessageBox.warning(self, "Error", "Could not process buyoff.")
+
+    def suspend_loan_dialog(self, loan_id, loan_ref):
+        """Show dialog to suspend a loan for N months or until a specific date."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Suspend Loan {loan_ref}")
+        dialog.setMinimumWidth(320)
+        
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"Suspend deductions for loan <b>{loan_ref}</b>:"))
+        
+        form = QFormLayout()
+        
+        months_spin = QSpinBox()
+        months_spin.setRange(1, 24)
+        months_spin.setValue(3)
+        form.addRow("Suspend for (months):", months_spin)
+        
+        layout.addLayout(form)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            months = months_spin.value()
+            from dateutil.relativedelta import relativedelta
+            until_date = (datetime.now() + relativedelta(months=months)).strftime("%Y-%m-%d")
+            
+            self.engine.db.suspend_loan(loan_id, until_date)
+            QMessageBox.information(self, "Suspended", 
+                f"Loan {loan_ref} suspended until {until_date}.\n"
+                f"Deductions will be skipped for {months} month(s).")
+            self.refresh_table()
+            self.refresh_loans_list()
+
+    def resume_loan_btn(self, loan_id):
+        """Resume a suspended loan."""
+        confirm = QMessageBox.question(self, "Resume Loan",
+            "Are you sure you want to resume deductions for this loan?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if confirm == QMessageBox.StandardButton.Yes:
+            self.engine.db.resume_loan(loan_id)
+            QMessageBox.information(self, "Resumed", "Loan deductions have been resumed.")
+            self.refresh_table()
+            self.refresh_loans_list()
+
 
 
     def deduct_single_loan_btn(self, loan_ref):

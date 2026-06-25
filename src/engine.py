@@ -488,6 +488,38 @@ class LoanEngine:
         Delegates to SavingsService.
         """
         return self.savings_service.add_withdrawal(individual_id, amount, date_str, notes)
+
+    # ===== RETIREMENT MANAGEMENT =====
+
+    def retire_individual(self, individual_id, date_str=None):
+        """Retire an individual: auto-withdraw savings and set retirement flag.
+        
+        Args:
+            individual_id: ID of the individual.
+            date_str: Retirement date (defaults to today).
+            
+        Returns:
+            dict with 'savings_withdrawn' amount.
+        """
+        if date_str is None:
+            from datetime import datetime
+            date_str = datetime.now().strftime("%Y-%m-%d")
+        
+        # 1. Auto-withdraw all savings
+        withdrawn = self.savings_service.withdraw_all(individual_id, date_str, "Retirement withdrawal")
+        
+        # 2. Set retirement flag
+        self.db.retire_individual(individual_id, date_str)
+        
+        return {'savings_withdrawn': withdrawn}
+
+    def reinstate_individual(self, individual_id):
+        """Clear retirement flag for an individual.
+        
+        Args:
+            individual_id: ID of the individual.
+        """
+        self.db.reinstate_individual(individual_id)
         
     def update_loan_transaction(self, trans_id, new_date, new_amount, new_notes, new_duration=None):
         trans_id = int(trans_id) # Ensure native int for sqlite

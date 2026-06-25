@@ -95,6 +95,15 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE individuals ADD COLUMN import_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        # Retirement flag migration
+        try:
+            cursor.execute("ALTER TABLE individuals ADD COLUMN is_retired INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE individuals ADD COLUMN retired_date TEXT")
+        except sqlite3.OperationalError:
+            pass
             
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
@@ -179,6 +188,15 @@ class DatabaseManager:
             pass
         try:
             cursor.execute("ALTER TABLE loans ADD COLUMN import_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        # Loan suspension migration
+        try:
+            cursor.execute("ALTER TABLE loans ADD COLUMN is_suspended INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE loans ADD COLUMN suspend_until TEXT")
         except sqlite3.OperationalError:
             pass
 
@@ -626,6 +644,50 @@ class DatabaseManager:
         cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=?", (individual_id, loan_ref))
         cursor.execute("DELETE FROM loans WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
         self.conn.commit()
+
+    # ========== LOAN SUSPENSION OPERATIONS ==========
+
+    def suspend_loan(self, loan_id, until_date=None):
+        """Suspend deductions for a loan.
+        
+        Args:
+            loan_id: The loan's primary key ID.
+            until_date: Optional YYYY-MM-DD date string. If None, suspended indefinitely.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE loans SET is_suspended=1, suspend_until=? WHERE id=?", (until_date, loan_id))
+        self.conn.commit()
+
+    def resume_loan(self, loan_id):
+        """Resume deductions for a suspended loan."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE loans SET is_suspended=0, suspend_until=NULL WHERE id=?", (loan_id,))
+        self.conn.commit()
+
+    # ========== RETIREMENT OPERATIONS ==========
+
+    def retire_individual(self, ind_id, date_str):
+        """Mark an individual as retired.
+        
+        Args:
+            ind_id: The individual's ID.
+            date_str: Retirement date in YYYY-MM-DD format.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE individuals SET is_retired=1, retired_date=? WHERE id=?", (date_str, ind_id))
+        self.conn.commit()
+
+    def reinstate_individual(self, ind_id):
+        """Clear retirement flag for an individual."""
+        cursor = self.conn.cursor()
+        cursor.execute("UPDATE individuals SET is_retired=0, retired_date=NULL WHERE id=?", (ind_id,))
+        self.conn.commit()
+
+    def has_outstanding_loans(self, ind_id):
+        """Check if an individual has any active (outstanding) loans."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM loans WHERE individual_id=? AND status='Active'", (ind_id,))
+        return cursor.fetchone()[0] > 0
 
     def delete_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from ledger."""

@@ -86,3 +86,18 @@ class LoanInactiveError(LoanMasterError):
         }
         message = f"Loan '{loan_ref}' is not active (status: {status})"
         super().__init__(message, details)
+
+
+class LoanSuspendedError(LoanMasterError):
+    """Raised when a deduction is attempted on a suspended loan."""
+    
+    def __init__(self, loan_ref: str, suspend_until: str = None):
+        details = {
+            'loan_ref': loan_ref,
+            'suspend_until': suspend_until
+        }
+        if suspend_until:
+            message = f"Loan '{loan_ref}' is suspended until {suspend_until}"
+        else:
+            message = f"Loan '{loan_ref}' is suspended indefinitely"
+        super().__init__(message, details)
