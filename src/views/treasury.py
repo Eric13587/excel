@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
 from src.services.gl_service import GLService
+from src.services.provisioning import ProvisioningService
 from src.exceptions import UnbalancedJournalError, UnknownAccountError
 
 
@@ -24,6 +25,7 @@ class TreasuryDialog(QDialog):
         self.db = db_manager
         self.theme_manager = theme_manager
         self.gl = GLService(db_manager)
+        self.prov = ProvisioningService(db_manager, self.gl)
         # Project member activity + migrate legacy treasury rows so everything
         # shown is current.
         self.gl.sync()
@@ -59,6 +61,7 @@ class TreasuryDialog(QDialog):
         self.tabs.addTab(self._build_trial_balance_tab(), "Trial Balance")
         self.tabs.addTab(self._build_account_ledger_tab(), "Account Ledger")
         self.tabs.addTab(self._build_journal_list_tab(), "Journal Register")
+        self.tabs.addTab(self._build_provisioning_tab(), "Loan Provisioning")
         self.layout.addWidget(self.tabs)
 
         btn_layout = QHBoxLayout()
@@ -375,6 +378,114 @@ class TreasuryDialog(QDialog):
             QMessageBox.information(self, "Reversed", f"Entry #{entry_id} reversed.")
             self.refresh_all()
 
+    # ----- Tab 5: Loan Provisioning (SASRA) ----- #
+    def _build_provisioning_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("As of:"))
+        self.pr_date = QDateEdit()
+        self.pr_date.setCalendarPopup(True)
+        self.pr_date.setDate(QDate.currentDate())
+        self.pr_date.dateChanged.connect(self.refresh_provisioning)
+        ctrl.addWidget(self.pr_date)
+        ctrl.addStretch()
+        self.pr_par = QLabel("")
+        self.pr_par.setStyleSheet("font-weight: bold;")
+        ctrl.addWidget(self.pr_par)
+        v.addLayout(ctrl)
+
+        self.pr_table = QTableWidget()
+        self.pr_table.setColumnCount(7)
+        self.pr_table.setHorizontalHeaderLabels(
+            ["Classification", "Days in Arrears", "Rate", "Loans",
+             "Gross Outstanding", "Net of Deposits", "Provision"])
+        self.pr_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.pr_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        v.addWidget(self.pr_table)
+
+        bottom = QHBoxLayout()
+        self.pr_allowance = QLabel("")
+        bottom.addWidget(self.pr_allowance)
+        bottom.addStretch()
+        self.btn_book = QPushButton("Book Provision to GL")
+        self.btn_book.setStyleSheet("background-color: #2563EB; color: white; font-weight: bold;")
+        self.btn_book.clicked.connect(self.book_provision_action)
+        bottom.addWidget(self.btn_book)
+        v.addLayout(bottom)
+        return w
+
+    @staticmethod
+    def _band_days_label(bucket):
+        from src.config import SASRA_PROVISION_BANDS
+        for label, lo, hi, _ in SASRA_PROVISION_BANDS:
+            if label == bucket:
+                return f"{lo}+" if hi is None else f"{lo}–{hi}"
+        return ""
+
+    def refresh_provisioning(self):
+        as_of = self.pr_date.date().toString("yyyy-MM-dd")
+        summary = self.prov.get_provisioning_summary(as_of)
+        self.pr_table.setRowCount(0)
+        for b in summary['bands']:
+            r = self.pr_table.rowCount()
+            self.pr_table.insertRow(r)
+            self.pr_table.setItem(r, 0, QTableWidgetItem(b['bucket']))
+            self.pr_table.setItem(r, 1, QTableWidgetItem(self._band_days_label(b['bucket'])))
+            self.pr_table.setItem(r, 2, QTableWidgetItem(f"{b['rate']*100:.0f}%"))
+            cnt = QTableWidgetItem(str(b['count']))
+            cnt.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.pr_table.setItem(r, 3, cnt)
+            self._pr_money(r, 4, b['gross'])
+            self._pr_money(r, 5, b['net'])
+            self._pr_money(r, 6, b['provision'])
+        # Totals row
+        r = self.pr_table.rowCount()
+        self.pr_table.insertRow(r)
+        tot = QTableWidgetItem("TOTAL")
+        tot.setForeground(QColor("#1e3a8a"))
+        self.pr_table.setItem(r, 0, tot)
+        self._pr_money(r, 4, summary['total_gross'], bold=True)
+        self._pr_money(r, 5, summary['total_net'], bold=True)
+        self._pr_money(r, 6, summary['total_provision'], bold=True)
+
+        self.pr_par.setText(f"Portfolio at Risk (>30d): {summary['par_ratio']*100:.1f}%")
+        current = self.gl.get_account_balance("1190", as_of)
+        required = summary['total_provision']
+        self.pr_allowance.setText(
+            f"Allowance booked: {current:,.2f}   |   Required: {required:,.2f}   "
+            f"|   To book: {required - current:,.2f}")
+
+    def _pr_money(self, row, col, value, bold=False):
+        item = QTableWidgetItem(f"{value:,.2f}")
+        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if bold:
+            f = item.font(); f.setBold(True); item.setFont(f)
+        self.pr_table.setItem(row, col, item)
+
+    def book_provision_action(self):
+        as_of = self.pr_date.date().toString("yyyy-MM-dd")
+        summary = self.prov.get_provisioning_summary(as_of)
+        current = self.gl.get_account_balance("1190", as_of)
+        delta = round(summary['total_provision'] - current, 2)
+        if abs(delta) < 0.005:
+            QMessageBox.information(self, "Up to Date",
+                                   "The allowance already matches the required provision.")
+            return
+        verb = "increase" if delta > 0 else "release"
+        if QMessageBox.question(
+                self, "Book Provision",
+                f"Post a journal to {verb} the loan-loss allowance by {abs(delta):,.2f} "
+                f"(to required level {summary['total_provision']:,.2f}) as of {as_of}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            res = self.prov.book_provision(as_of)
+            QMessageBox.information(
+                self, "Provision Booked",
+                f"Allowance set to {res['required']:,.2f} (change {res['change']:,.2f}).")
+            self.refresh_all()
+
     # ------------------------------------------------------------------ #
     # Shared refresh / theme
     # ------------------------------------------------------------------ #
@@ -383,6 +494,7 @@ class TreasuryDialog(QDialog):
         self.refresh_trial_balance()
         self.refresh_account_ledger()
         self.refresh_journal_list()
+        self.refresh_provisioning()
 
     def update_bank_cash_visual(self):
         # Single source of truth: the Cash at Bank balance from the ledger.

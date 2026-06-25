@@ -694,12 +694,26 @@ class ReportGenerator:
             # hand-assembled cash/equity equations (which were not guaranteed to
             # tie out). sync() brings the GL current with ledger/savings first.
             from src.services.gl_service import GLService
+            from src.services.provisioning import ProvisioningService
             gl = GLService(self.db)
             gl.sync()
 
             inc = gl.get_income_statement(None, target_date_str)
             bs = gl.get_balance_sheet(target_date_str)
             net_surplus = inc['net_surplus']
+
+            # SASRA loan classification schedule (informational; the booked
+            # allowance, if any, already shows inside the balance sheet assets).
+            prov = ProvisioningService(self.db, gl).get_provisioning_summary(target_date_str)
+            allowance_booked = gl.get_account_balance("1190", target_date_str)
+            prov_rows = "".join(
+                f'<tr><td class="label">{b["bucket"]} '
+                f'<span style="color:#94a3b8;">({b["rate"]*100:.0f}%, {b["count"]} loans)</span></td>'
+                f'<td class="amount">{b["gross"]:,.2f}</td>'
+                f'<td class="amount">{b["net"]:,.2f}</td>'
+                f'<td class="amount">{b["provision"]:,.2f}</td></tr>'
+                for b in prov['bands']
+            )
 
             def _rows(lines, empty_label):
                 if not lines:
@@ -778,6 +792,21 @@ class ReportGenerator:
                         <tr class="total-row"><td class="label">TOTAL LIABILITIES &amp; EQUITY</td><td class="amount">{bs['total_liabilities_and_equity']:,.2f}</td></tr>
                     </table>
                     {balance_banner}
+
+                    <div style="page-break-before: always;"></div>
+
+                    <h3>III. LOAN CLASSIFICATION &amp; PROVISIONING (SASRA)</h3>
+                    <table>
+                        <tr><td class="section-title">Classification</td><td class="amount">Gross Outstanding</td><td class="amount">Net of Deposits</td><td class="amount">Provision</td></tr>
+                        {prov_rows}
+                        <tr class="total-row"><td class="label">TOTAL PORTFOLIO</td><td class="amount">{prov['total_gross']:,.2f}</td><td class="amount">{prov['total_net']:,.2f}</td><td class="amount">{prov['total_provision']:,.2f}</td></tr>
+                    </table>
+                    <table>
+                        <tr><td class="label">Portfolio at Risk (&gt; 30 days)</td><td class="amount">{prov['par_ratio']*100:.1f}%</td></tr>
+                        <tr><td class="label">Required Provision</td><td class="amount">{prov['total_provision']:,.2f}</td></tr>
+                        <tr><td class="label">Allowance Booked in Ledger</td><td class="amount">{allowance_booked:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">Shortfall / (Excess) to Book</td><td class="amount">{prov['total_provision'] - allowance_booked:,.2f}</td></tr>
+                    </table>
 
                     <div style="margin-top: 40px; font-size: 11px; text-align: center; color: #64748b;">Generated securely by LoanMaster Treasury Engine on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
                 </body>

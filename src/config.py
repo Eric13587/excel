@@ -107,3 +107,29 @@ DEFAULT_CHART_OF_ACCOUNTS = [
     (GL_LOAN_LOSS_EXPENSE,    "Loan Loss Provision",       "Expense",   "debit"),
     (GL_OTHER_EXPENSE,        "Other Expenses",            "Expense",   "debit"),
 ]
+
+# =============================================================================
+# LOAN-LOSS PROVISIONING (SASRA classification)
+# =============================================================================
+# SACCO loan classification by days in arrears and the minimum provision rate
+# applied to the outstanding balance of loans in each band. These are the
+# standard SASRA (SACCO Societies Regulations) bands; edit here to match your
+# institution's approved policy. Each tuple is
+# (label, min_days, max_days_inclusive_or_None, provision_rate).
+SASRA_PROVISION_BANDS = [
+    ("Performing",  0,    30,   0.01),
+    ("Watch",       31,   180,  0.05),
+    ("Substandard", 181,  360,  0.25),
+    ("Doubtful",    361,  540,  0.50),
+    ("Loss",        541,  None, 1.00),
+]
+
+# Loans more than this many days in arrears count as non-performing (used for
+# the Portfolio-at-Risk ratio).
+PAR_THRESHOLD_DAYS = 30
+
+# SASRA allows a member's (non-withdrawable) deposits to be netted off their
+# loan exposure before provisioning, since the deposits are attachable. When
+# True, a member's savings reduce their loan balance (allocated across their
+# loans pro-rata) before the provision rate is applied.
+PROVISION_NET_OF_SAVINGS = True
