@@ -10,6 +10,7 @@ posted here through the ``post_*`` helpers, which means the existing ``ledger``
 and ``savings`` tables become subledgers that reconcile to GL control accounts
 rather than three disconnected sources of truth.
 """
+from contextlib import contextmanager
 from datetime import datetime
 
 from src.exceptions import UnbalancedJournalError, UnknownAccountError
@@ -17,6 +18,7 @@ from src.config import (
     GL_CASH, GL_LOANS_RECEIVABLE, GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS,
     GL_LOAN_INTEREST_INCOME, GL_OPENING_EQUITY, GL_FEES_INCOME,
     GL_BANK_INTEREST_INCOME, GL_OTHER_INCOME, GL_OTHER_EXPENSE,
+    GL_ALLOWANCE_LOAN_LOSS, GL_SHARE_CAPITAL, GL_RETAINED_EARNINGS,
 )
 
 # Money is tracked to whole cents; debits and credits must agree within this
@@ -30,6 +32,31 @@ class GLService:
     def __init__(self, db_manager):
         self.db = db_manager
         self._account_codes = None  # lazily-loaded cache of valid codes
+        self._bulk_depth = 0        # >0 while inside a batched transaction
+
+    @contextmanager
+    def _bulk(self):
+        """Batch many posts into one transaction (one commit, not one per row).
+
+        Committing per journal means an fsync per row; for the ~thousands of
+        projected member journals that is the difference between seconds and a
+        UI freeze. Inside this context post_journal defers committing; the
+        single commit happens when the outermost context exits.
+        """
+        self._bulk_depth += 1
+        try:
+            yield
+        except Exception:
+            self.db.conn.rollback()
+            raise
+        finally:
+            self._bulk_depth -= 1
+            if self._bulk_depth == 0:
+                self.db.conn.commit()
+
+    def _maybe_commit(self):
+        if self._bulk_depth == 0:
+            self.db.conn.commit()
 
     # ------------------------------------------------------------------ #
     # Account helpers
@@ -119,7 +146,7 @@ class GLService:
             "INSERT INTO journal_lines (entry_id, account_code, debit, credit, line_memo) VALUES (?, ?, ?, ?, ?)",
             [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm],
         )
-        self.db.conn.commit()
+        self._maybe_commit()
         return entry_id
 
     def reverse_entry(self, entry_id, reversal_date=None, memo=None):
@@ -316,6 +343,79 @@ class GLService:
             'is_balanced': is_balanced,
         }
 
+    # Cash-flow categorisation by the counterpart account.
+    _LENDING_ACCOUNTS = {GL_LOANS_RECEIVABLE, GL_ALLOWANCE_LOAN_LOSS}
+    _FINANCING_ACCOUNTS = {GL_MEMBER_DEPOSITS, "2100", GL_SHARE_CAPITAL,
+                           GL_RETAINED_EARNINGS, GL_OPENING_EQUITY}
+
+    @classmethod
+    def _cash_flow_category(cls, code):
+        if code in cls._LENDING_ACCOUNTS:
+            return 'Lending to members'
+        if code in cls._FINANCING_ACCOUNTS:
+            return 'Financing'
+        return 'Operating'
+
+    def get_cash_flow(self, start_date=None, end_date=None):
+        """Direct-method cash flow that ties to the cash account exactly.
+
+        Every cash movement is attributed to the counterpart leg of its journal
+        (contribution = credit − debit of the non-cash line), grouped into
+        Operating / Lending / Financing. Because entries balance, the section
+        subtotals sum to the change in the cash account, so opening + net change
+        == closing cash by construction.
+        """
+        cur = self.db.conn.cursor()
+
+        if start_date:
+            cur.execute(
+                "SELECT COALESCE(SUM(l.debit - l.credit),0) FROM journal_lines l "
+                "JOIN journal_entries e ON l.entry_id = e.id "
+                "WHERE l.account_code = ? AND e.entry_date < ?",
+                (GL_CASH, start_date))
+            opening = round(cur.fetchone()[0] or 0.0, 2)
+        else:
+            opening = 0.0
+
+        q = ("SELECT l.account_code, a.name, l.debit, l.credit "
+             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
+             "JOIN chart_of_accounts a ON a.code = l.account_code "
+             "WHERE l.account_code != ?")
+        params = [GL_CASH]
+        if start_date:
+            q += " AND e.entry_date >= ?"
+            params.append(start_date)
+        if end_date:
+            q += " AND e.entry_date <= ?"
+            params.append(end_date)
+        cur.execute(q, params)
+
+        cats = {'Operating': {}, 'Lending to members': {}, 'Financing': {}}
+        for code, name, debit, credit in cur.fetchall():
+            contrib = round((credit or 0.0) - (debit or 0.0), 2)  # +ve = cash in
+            if contrib == 0:
+                continue
+            bucket = cats[self._cash_flow_category(code)]
+            bucket[name] = round(bucket.get(name, 0.0) + contrib, 2)
+
+        sections = []
+        net = 0.0
+        for label in ('Operating', 'Lending to members', 'Financing'):
+            lines = sorted(
+                ({'name': n, 'amount': a} for n, a in cats[label].items() if abs(a) >= 0.005),
+                key=lambda x: x['name'])
+            subtotal = round(sum(l['amount'] for l in lines), 2)
+            net = round(net + subtotal, 2)
+            sections.append({'label': label, 'lines': lines, 'subtotal': subtotal})
+
+        return {
+            'period': (start_date, end_date),
+            'sections': sections,
+            'opening_cash': opening,
+            'net_change': net,
+            'closing_cash': round(opening + net, 2),
+        }
+
     # ------------------------------------------------------------------ #
     # Journal & account drill-down (for the Treasury UI)
     # ------------------------------------------------------------------ #
@@ -440,7 +540,7 @@ class GLService:
     # in this set and are never touched by a rebuild.
     _AUTO_SOURCES = ("loan_disbursement", "repayment", "interest", "savings")
 
-    def rebuild_auto_journals(self):
+    def rebuild_auto_journals(self, progress=None):
         """Drop and re-derive the subledger-projected journals.
 
         Member activity supports edits and undos, which incremental backfill
@@ -448,49 +548,67 @@ class GLService:
         keeps the GL exactly consistent with the current ledger/savings state
         while preserving manual and migration entries. Returns the new count.
         """
-        cur = self.db.conn.cursor()
-        placeholders = ",".join("?" * len(self._AUTO_SOURCES))
-        cur.execute(
-            f"DELETE FROM journal_lines WHERE entry_id IN "
-            f"(SELECT id FROM journal_entries WHERE source IN ({placeholders}))",
-            self._AUTO_SOURCES,
-        )
-        cur.execute(
-            f"DELETE FROM journal_entries WHERE source IN ({placeholders})",
-            self._AUTO_SOURCES,
-        )
-        self.db.conn.commit()
-        return self.backfill_from_subledgers()
+        with self._bulk():
+            cur = self.db.conn.cursor()
+            placeholders = ",".join("?" * len(self._AUTO_SOURCES))
+            cur.execute(
+                f"DELETE FROM journal_lines WHERE entry_id IN "
+                f"(SELECT id FROM journal_entries WHERE source IN ({placeholders}))",
+                self._AUTO_SOURCES,
+            )
+            cur.execute(
+                f"DELETE FROM journal_entries WHERE source IN ({placeholders})",
+                self._AUTO_SOURCES,
+            )
+            return self.backfill_from_subledgers(progress=progress)
 
-    def sync(self):
+    def sync(self, progress=None):
         """Bring the GL fully up to date before reading statements.
 
         Rebuilds the subledger projection (covering new activity, edits and
-        undos) and migrates any not-yet-migrated legacy treasury rows.
+        undos) and migrates any not-yet-migrated legacy treasury rows. The whole
+        operation runs in a single transaction (one commit), and reports coarse
+        progress via the optional callback ``progress(done, total, message)``.
         """
-        self.rebuild_auto_journals()
-        self.migrate_legacy_gl()
+        with self._bulk():
+            self.rebuild_auto_journals(progress=progress)
+            if progress:
+                progress(0, 0, "Migrating legacy treasury entries…")
+            self.migrate_legacy_gl()
+            if progress:
+                progress(1, 1, "Finalising…")
 
-    def backfill_from_subledgers(self):
+    def backfill_from_subledgers(self, progress=None):
         """Post journals for all existing ledger & savings activity.
 
         Idempotent (each row's source_ref guards against re-posting), so it is
         safe to run repeatedly. Returns the count of newly posted entries.
         """
         before = self._entry_count()
-        cur = self.db.conn.cursor()
+        with self._bulk():
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT id, date, event_type, added, deducted, "
+                        "principal_portion, interest_portion, interest_amount "
+                        "FROM ledger ORDER BY date, id")
+            ledger_rows = cur.fetchall()
+            cur.execute("SELECT id, date, transaction_type, amount FROM savings ORDER BY date, id")
+            savings_rows = cur.fetchall()
 
-        cur.execute("SELECT id, date, event_type, added, deducted, "
-                    "principal_portion, interest_portion, interest_amount "
-                    "FROM ledger ORDER BY date, id")
-        for row in cur.fetchall():
-            (lid, date, event, added, deducted, p_portion, i_portion, i_amt) = row
-            self._post_ledger_event(event, date, added, deducted,
-                                    p_portion, i_portion, i_amt, f"ledger:{lid}")
+            total = len(ledger_rows) + len(savings_rows)
+            done = 0
+            for row in ledger_rows:
+                (lid, date, event, added, deducted, p_portion, i_portion, i_amt) = row
+                self._post_ledger_event(event, date, added, deducted,
+                                        p_portion, i_portion, i_amt, f"ledger:{lid}")
+                done += 1
+                if progress and done % 200 == 0:
+                    progress(done, total, "Posting member activity to the ledger…")
 
-        cur.execute("SELECT id, date, transaction_type, amount FROM savings ORDER BY date, id")
-        for (sid, date, ttype, amount) in cur.fetchall():
-            self._post_savings_event(ttype, amount, date, f"savings:{sid}")
+            for (sid, date, ttype, amount) in savings_rows:
+                self._post_savings_event(ttype, amount, date, f"savings:{sid}")
+                done += 1
+                if progress and done % 200 == 0:
+                    progress(done, total, "Posting member activity to the ledger…")
 
         return self._entry_count() - before
 
@@ -542,31 +660,32 @@ class GLService:
         Returns the count of newly migrated entries.
         """
         before = self._entry_count()
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT id, date, category, type, amount, notes FROM general_ledger ORDER BY date, id")
-        for (gid, date, category, gtype, amount, notes) in cur.fetchall():
-            amount = round(float(amount or 0), 2)
-            if amount <= 0:
-                continue
-            ref = f"gl:{gid}"
-            memo = notes or category
+        with self._bulk():
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT id, date, category, type, amount, notes FROM general_ledger ORDER BY date, id")
+            for (gid, date, category, gtype, amount, notes) in cur.fetchall():
+                amount = round(float(amount or 0), 2)
+                if amount <= 0:
+                    continue
+                ref = f"gl:{gid}"
+                memo = notes or category
 
-            if gtype == "Expense":
-                acct = self._LEGACY_EXPENSE_MAP.get(category, GL_OTHER_EXPENSE)
-                lines = [{'account': acct, 'debit': amount},
-                         {'account': GL_CASH, 'credit': amount}]
-            elif gtype == "Income":
-                acct = self._LEGACY_INCOME_MAP.get(category, GL_OTHER_INCOME)
-                lines = [{'account': GL_CASH, 'debit': amount},
-                         {'account': acct, 'credit': amount}]
-            elif gtype == "Liability/Equity":
-                # Borrowings / capital received increased cash; park the credit in
-                # Opening Balance Equity (a later pass can reclassify).
-                lines = [{'account': GL_CASH, 'debit': amount},
-                         {'account': GL_OPENING_EQUITY, 'credit': amount}]
-            else:  # Asset (e.g. bank deposit / initial capital booked as asset)
-                lines = [{'account': GL_CASH, 'debit': amount},
-                         {'account': GL_OPENING_EQUITY, 'credit': amount}]
+                if gtype == "Expense":
+                    acct = self._LEGACY_EXPENSE_MAP.get(category, GL_OTHER_EXPENSE)
+                    lines = [{'account': acct, 'debit': amount},
+                             {'account': GL_CASH, 'credit': amount}]
+                elif gtype == "Income":
+                    acct = self._LEGACY_INCOME_MAP.get(category, GL_OTHER_INCOME)
+                    lines = [{'account': GL_CASH, 'debit': amount},
+                             {'account': acct, 'credit': amount}]
+                elif gtype == "Liability/Equity":
+                    # Borrowings / capital received increased cash; park the credit
+                    # in Opening Balance Equity (a later pass can reclassify).
+                    lines = [{'account': GL_CASH, 'debit': amount},
+                             {'account': GL_OPENING_EQUITY, 'credit': amount}]
+                else:  # Asset (e.g. bank deposit / initial capital booked as asset)
+                    lines = [{'account': GL_CASH, 'debit': amount},
+                             {'account': GL_OPENING_EQUITY, 'credit': amount}]
 
-            self.post_journal(date, lines, memo=memo, source="migration", source_ref=ref)
+                self.post_journal(date, lines, memo=memo, source="migration", source_ref=ref)
         return self._entry_count() - before

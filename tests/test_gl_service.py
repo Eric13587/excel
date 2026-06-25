@@ -331,3 +331,43 @@ def test_is_auto_source(gl):
     svc, _ = gl
     assert svc.is_auto_source("repayment") is True
     assert svc.is_auto_source("manual") is False
+
+
+# --------------------------------------------------------------------------- #
+# Cash flow statement
+# --------------------------------------------------------------------------- #
+def test_cash_flow_ties_to_cash_and_categorises(gl):
+    svc, _ = gl
+    svc.post_loan_disbursement(10000, "2026-01-01", "ledger:1")   # cash out, Lending
+    svc.post_repayment(800, 150, "2026-02-01", "ledger:2")        # Lending +800, Operating +150
+    svc.post_savings_deposit(2000, "2026-03-01", "ledger:3")      # Financing
+
+    cf = svc.get_cash_flow()
+    sect = {s['label']: s for s in cf['sections']}
+    assert sect['Lending to members']['subtotal'] == -9200.0
+    assert sect['Operating']['subtotal'] == 150.0
+    assert sect['Financing']['subtotal'] == 2000.0
+    assert cf['net_change'] == -7050.0
+    # Closing cash from the statement equals the cash account balance exactly.
+    assert cf['closing_cash'] == svc.get_account_balance(GL_CASH)
+
+
+def test_cash_flow_period_opening_and_closing(gl):
+    svc, _ = gl
+    svc.post_savings_deposit(1000, "2026-01-10", "s:1")  # before the period
+    svc.post_savings_deposit(500, "2026-02-10", "s:2")   # within the period
+    cf = svc.get_cash_flow("2026-02-01", "2026-02-28")
+    assert cf['opening_cash'] == 1000.0
+    assert cf['net_change'] == 500.0
+    assert cf['closing_cash'] == 1500.0
+
+
+def test_bulk_sync_is_one_transaction_and_balances(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+    # Re-sync is a no-op count-wise (rebuild then identical backfill).
+    n = svc.backfill_from_subledgers()
+    assert n == 0

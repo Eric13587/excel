@@ -683,8 +683,8 @@ class ReportGenerator:
             return False, f"Report Generation Failed: {e}"
 
     
-    def generate_financial_statements(self, output_path, target_date_str=None):
-        """Generates the Income Statement & Balance Sheet as PDF."""
+    def generate_financial_statements(self, output_path, target_date_str=None, progress_callback=None):
+        """Generates the Income Statement, Balance Sheet & Cash Flow as PDF."""
         try:
             if not target_date_str:
                 target_date_str = datetime.now().strftime("%Y-%m-%d")
@@ -696,10 +696,11 @@ class ReportGenerator:
             from src.services.gl_service import GLService
             from src.services.provisioning import ProvisioningService
             gl = GLService(self.db)
-            gl.sync()
+            gl.sync(progress=progress_callback)
 
             inc = gl.get_income_statement(None, target_date_str)
             bs = gl.get_balance_sheet(target_date_str)
+            cf = gl.get_cash_flow(None, target_date_str)
             net_surplus = inc['net_surplus']
 
             # SASRA loan classification schedule (informational; the booked
@@ -714,6 +715,19 @@ class ReportGenerator:
                 f'<td class="amount">{b["provision"]:,.2f}</td></tr>'
                 for b in prov['bands']
             )
+
+            # Cash flow statement sections (Operating / Lending / Financing).
+            cf_section_html = ""
+            for sec in cf['sections']:
+                cf_section_html += f'<tr><td class="section-title" colspan="2">{sec["label"]}</td></tr>'
+                if sec['lines']:
+                    for l in sec['lines']:
+                        cf_section_html += (f'<tr><td class="label">{l["name"]}</td>'
+                                            f'<td class="amount">{l["amount"]:,.2f}</td></tr>')
+                else:
+                    cf_section_html += '<tr><td class="label">No movement</td><td class="amount">0.00</td></tr>'
+                cf_section_html += (f'<tr class="total-row"><td class="label">Net cash from {sec["label"]}</td>'
+                                    f'<td class="amount">{sec["subtotal"]:,.2f}</td></tr>')
 
             def _rows(lines, empty_label):
                 if not lines:
@@ -806,6 +820,17 @@ class ReportGenerator:
                         <tr><td class="label">Required Provision</td><td class="amount">{prov['total_provision']:,.2f}</td></tr>
                         <tr><td class="label">Allowance Booked in Ledger</td><td class="amount">{allowance_booked:,.2f}</td></tr>
                         <tr class="total-row"><td class="label">Shortfall / (Excess) to Book</td><td class="amount">{prov['total_provision'] - allowance_booked:,.2f}</td></tr>
+                    </table>
+
+                    <div style="page-break-before: always;"></div>
+
+                    <h3>IV. CASH FLOW STATEMENT (to {target_date_str})</h3>
+                    <table>
+                        {cf_section_html}
+                        <tr style="height: 15px;"><td colspan="2"></td></tr>
+                        <tr class="total-row"><td class="label">NET CHANGE IN CASH</td><td class="amount">{cf['net_change']:,.2f}</td></tr>
+                        <tr><td class="label">Opening Cash Balance</td><td class="amount">{cf['opening_cash']:,.2f}</td></tr>
+                        <tr class="total-row"><td class="label">CLOSING CASH BALANCE</td><td class="amount">{cf['closing_cash']:,.2f}</td></tr>
                     </table>
 
                     <div style="margin-top: 40px; font-size: 11px; text-align: center; color: #64748b;">Generated securely by LoanMaster Treasury Engine on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>

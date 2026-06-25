@@ -1,7 +1,8 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QTableWidget, QTableWidgetItem, QHeaderView,
                              QMessageBox, QLabel, QGroupBox, QFormLayout,
-                             QComboBox, QLineEdit, QDateEdit, QTabWidget, QWidget)
+                             QComboBox, QLineEdit, QDateEdit, QTabWidget, QWidget,
+                             QProgressDialog, QApplication)
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
@@ -27,8 +28,11 @@ class TreasuryDialog(QDialog):
         self.gl = GLService(db_manager)
         self.prov = ProvisioningService(db_manager, self.gl)
         # Project member activity + migrate legacy treasury rows so everything
-        # shown is current.
-        self.gl.sync()
+        # shown is current. Runs under a progress dialog (only appears if it
+        # actually takes a moment) so the window never looks frozen.
+        self._run_with_progress(
+            "Updating general ledger…",
+            lambda progress: self.gl.sync(progress=progress))
         self.accounts = self.gl.get_accounts()
 
         self.setWindowTitle("Treasury & General Ledger")
@@ -36,6 +40,30 @@ class TreasuryDialog(QDialog):
         self.init_ui()
         self.apply_theme()
         self.refresh_all()
+
+    def _run_with_progress(self, label, work):
+        """Run a slow callable while showing a (deferred) progress dialog.
+
+        ``work`` receives a ``progress(done, total, message)`` callback. The
+        dialog only appears if the work runs longer than ~400ms, and
+        processEvents keeps the UI painting so it never shows 'Not Responding'.
+        """
+        pd = QProgressDialog(label, None, 0, 0, self.parent() or self)
+        pd.setWindowModality(Qt.WindowModality.WindowModal)
+        pd.setMinimumDuration(400)
+        pd.setCancelButton(None)
+
+        def progress(done, total, message):
+            pd.setLabelText(message)
+            if total:
+                pd.setRange(0, total)
+                pd.setValue(done)
+            QApplication.processEvents()
+
+        try:
+            return work(progress)
+        finally:
+            pd.close()
 
     # ------------------------------------------------------------------ #
     # Layout
@@ -59,9 +87,15 @@ class TreasuryDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_journal_entry_tab(), "New Journal Entry")
         self.tabs.addTab(self._build_trial_balance_tab(), "Trial Balance")
-        self.tabs.addTab(self._build_account_ledger_tab(), "Account Ledger")
+        self._ledger_tab = self._build_account_ledger_tab()
+        self.tabs.addTab(self._ledger_tab, "Account Ledger")
         self.tabs.addTab(self._build_journal_list_tab(), "Journal Register")
-        self.tabs.addTab(self._build_provisioning_tab(), "Loan Provisioning")
+        self._prov_tab = self._build_provisioning_tab()
+        self.tabs.addTab(self._prov_tab, "Loan Provisioning")
+        # The Account Ledger (thousands of cash lines) and Provisioning (a query
+        # per member) are heavy; load them only when their tab is opened so the
+        # dialog itself opens instantly.
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self.layout.addWidget(self.tabs)
 
         btn_layout = QHBoxLayout()
@@ -490,11 +524,22 @@ class TreasuryDialog(QDialog):
     # Shared refresh / theme
     # ------------------------------------------------------------------ #
     def refresh_all(self):
+        # Only the cheap, always-relevant views; the heavy tabs load lazily.
         self.update_bank_cash_visual()
         self.refresh_trial_balance()
-        self.refresh_account_ledger()
         self.refresh_journal_list()
-        self.refresh_provisioning()
+        idx = self.tabs.currentIndex() if hasattr(self, 'tabs') else -1
+        if self.tabs.widget(idx) is self._ledger_tab:
+            self.refresh_account_ledger()
+        elif self.tabs.widget(idx) is self._prov_tab:
+            self.refresh_provisioning()
+
+    def _on_tab_changed(self, idx):
+        w = self.tabs.widget(idx)
+        if w is self._ledger_tab:
+            self.refresh_account_ledger()
+        elif w is self._prov_tab:
+            self.refresh_provisioning()
 
     def update_bank_cash_visual(self):
         # Single source of truth: the Cash at Bank balance from the ledger.
@@ -543,8 +588,11 @@ class TreasuryDialog(QDialog):
             return
 
         generator = ReportGenerator(self.db, printer_view_getter=getter)
-        success, msg = generator.generate_financial_statements(
-            path, target_date_str=datetime.now().strftime("%Y-%m-%d"))
+        success, msg = self._run_with_progress(
+            "Generating financial statements…",
+            lambda progress: generator.generate_financial_statements(
+                path, target_date_str=datetime.now().strftime("%Y-%m-%d"),
+                progress_callback=progress))
 
         if success:
             QMessageBox.information(self, "Success", msg + f"\nSaved to: {path}")
