@@ -710,6 +710,8 @@ class DatabaseManager:
 
         # If an open span already exists (re-suspending an already-suspended loan,
         # or extending it), update it in place rather than creating a duplicate.
+        # Only the intended resume date moves; the original start_date is
+        # preserved so the recorded span still covers the full skipped period.
         cursor.execute(
             "SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL AND status='active' ORDER BY id DESC LIMIT 1",
             (loan_id,),
@@ -717,8 +719,8 @@ class DatabaseManager:
         existing = cursor.fetchone()
         if existing:
             cursor.execute(
-                "UPDATE loan_suspensions SET suspend_until=?, start_date=? WHERE id=?",
-                (until_date, start_date, existing[0]),
+                "UPDATE loan_suspensions SET suspend_until=? WHERE id=?",
+                (until_date, existing[0]),
             )
         else:
             cursor.execute(

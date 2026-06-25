@@ -124,12 +124,26 @@ class StatementGenerator:
             by_year[y].append(calendar.month_abbr[m])
         return "; ".join(f"{', '.join(by_year[y])} {y}" for y in order)
 
+    @staticmethod
+    def _clip_months(months, from_date, to_date):
+        """Keep only (year, month) tuples whose month falls within the window.
+
+        A period-bounded statement must not name months outside [from_date,
+        to_date], so the skipped-month list is intersected with the statement
+        window (compared at month granularity).
+        """
+        lo = (int(from_date[:4]), int(from_date[5:7]))
+        hi = (int(to_date[:4]), int(to_date[5:7]))
+        return [(y, m) for (y, m) in months if lo <= (y, m) <= hi]
+
     def _build_suspension_annotations(self, loan_ref, suspensions, from_date, to_date, date_format):
         """Build greyed-out annotation rows for suspension spans on one loan.
 
-        Only spans overlapping [from_date, to_date] produce a row. Each row is
-        placed (for chronological sorting) at its start date, clamped to the
-        statement window.
+        Only spans overlapping [from_date, to_date] produce a row, and the
+        listed months are clipped to that window so the statement never names
+        months outside its own period. Each row is placed (for chronological
+        sorting) at its start date, clamped to the window. A span whose dates
+        fail to parse is skipped rather than failing the whole statement.
         """
         annotations = []
         for s in suspensions:
@@ -152,24 +166,33 @@ class StatementGenerator:
             if end is not None and end < from_date:
                 continue
 
-            if resumed:
-                # Resume month receives a deduction, so exclude it.
-                months = self._months_between(start, resumed, end_inclusive=False)
-                if not months:  # suspended and resumed within the same month
-                    months = self._months_between(start, start, end_inclusive=True)
-                month_text = self._format_months(months)
-                text = f"Loan suspended — no deductions for {month_text}"
-            elif until:
-                # suspend_until is the intended *resume* date, so exclude its month.
-                months = self._months_between(start, until, end_inclusive=False)
-                if not months:
-                    months = self._months_between(start, start, end_inclusive=True)
-                month_text = self._format_months(months)
-                until_disp = datetime.strptime(until, "%Y-%m-%d").strftime(date_format)
-                text = f"Loan suspended — no deductions for {month_text} (resumes {until_disp})"
-            else:
-                start_disp = datetime.strptime(start, "%Y-%m-%d").strftime(date_format)
-                text = f"Loan suspended on {start_disp} — deductions paused indefinitely"
+            try:
+                if resumed:
+                    # Resume month receives a deduction, so exclude it.
+                    months = self._months_between(start, resumed, end_inclusive=False)
+                    if not months:  # suspended and resumed within the same month
+                        months = self._months_between(start, start, end_inclusive=True)
+                    months = self._clip_months(months, from_date, to_date)
+                    if not months:
+                        continue  # skipped months all fall outside this statement
+                    text = f"Loan suspended — no deductions for {self._format_months(months)}"
+                elif until:
+                    # suspend_until is the intended *resume* date, so exclude its month.
+                    months = self._months_between(start, until, end_inclusive=False)
+                    if not months:
+                        months = self._months_between(start, start, end_inclusive=True)
+                    months = self._clip_months(months, from_date, to_date)
+                    if not months:
+                        continue
+                    until_disp = datetime.strptime(until, "%Y-%m-%d").strftime(date_format)
+                    text = f"Loan suspended — no deductions for {self._format_months(months)} (resumes {until_disp})"
+                else:
+                    start_disp = datetime.strptime(start, "%Y-%m-%d").strftime(date_format)
+                    text = f"Loan suspended on {start_disp} — deductions paused indefinitely"
+            except (ValueError, TypeError):
+                # Malformed/legacy date on this span — skip it rather than
+                # aborting the entire statement.
+                continue
 
             placement = max(start, from_date)
             annotations.append(StatementRow(
