@@ -89,7 +89,15 @@ class MainApp(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
         
         self.db = DatabaseManager(db_path)
-        
+
+        # Live general-ledger posting: member loan/savings activity posts to the
+        # double-entry GL the moment it is written. Idempotent and defensive, so
+        # it never breaks a core write; edits/undos reconcile on the next sync.
+        from src.services.gl_service import GLService
+        self.gl = GLService(self.db)
+        self.db.ledger_post_hook = self.gl.post_ledger_rows
+        self.db.savings_post_hook = self.gl.post_savings_rows
+
         # Persistent date defaults
         self.last_operation_date = QDate.currentDate()
         self.last_report_range = (QDate.currentDate().addMonths(-12), QDate.currentDate())

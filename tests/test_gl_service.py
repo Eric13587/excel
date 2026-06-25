@@ -371,3 +371,66 @@ def test_bulk_sync_is_one_transaction_and_balances(gl):
     # Re-sync is a no-op count-wise (rebuild then identical backfill).
     n = svc.backfill_from_subledgers()
     assert n == 0
+
+
+# --------------------------------------------------------------------------- #
+# Live write-path hooks
+# --------------------------------------------------------------------------- #
+def test_ledger_hook_posts_journal_on_insert(gl):
+    svc, db = gl
+    db.ledger_post_hook = svc.post_ledger_rows
+    ind = db.add_individual("H", "0", "h@x")
+    db.add_loan_record(ind, "L1", 10000, 11500, 11500, 1000, 0, "2026-01-01", "2026-02-01")
+    # No sync() called — the hook should have posted the journal already.
+    db.add_transaction(ind, "2026-01-01", "Loan Issued", "L1", 10000, 0, 11500, "issue")
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == 10000.0
+    assert svc.get_account_balance(GL_CASH) == -10000.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_savings_hook_posts_journal_on_insert(gl):
+    svc, db = gl
+    db.savings_post_hook = svc.post_savings_rows
+    ind = db.add_individual("H", "0", "h@x")
+    db.add_savings_transaction(ind, "2026-01-05", "Deposit", 2000, "dep")
+    assert svc.get_account_balance(GL_MEMBER_DEPOSITS) == 2000.0
+    assert svc.get_account_balance(GL_CASH) == 2000.0
+
+
+def test_bulk_insert_hook_posts_all(gl):
+    svc, db = gl
+    db.ledger_post_hook = svc.post_ledger_rows
+    ind = db.add_individual("H", "0", "h@x")
+    db.add_loan_record(ind, "L1", 5000, 5750, 5750, 500, 0, "2026-01-01", "2026-02-01")
+    db.bulk_insert_transactions([
+        {'individual_id': ind, 'date': "2026-02-01", 'event_type': "Repayment",
+         'loan_id': "L1", 'deducted': 500, 'principal_portion': 450, 'interest_portion': 50},
+        {'individual_id': ind, 'date': "2026-03-01", 'event_type': "Repayment",
+         'loan_id': "L1", 'deducted': 500, 'principal_portion': 460, 'interest_portion': 40},
+    ])
+    # Both repayments posted live (Cr Loans Receivable 450+460).
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == -910.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_hook_failure_does_not_break_insert(gl):
+    svc, db = gl
+    def boom(ids):
+        raise RuntimeError("GL down")
+    db.ledger_post_hook = boom
+    ind = db.add_individual("H", "0", "h@x")
+    # The insert must still succeed and return the new row id.
+    rid = db.add_transaction(ind, "2026-01-01", "Loan Issued", "L1", 100, 0, 100, "x")
+    assert isinstance(rid, int) and rid > 0
+
+
+def test_hook_then_rebuild_is_consistent(gl):
+    svc, db = gl
+    db.ledger_post_hook = svc.post_ledger_rows
+    db.savings_post_hook = svc.post_savings_rows
+    _seed_subledgers(db)  # writes go through the hooks live
+    live = svc.get_account_balance(GL_LOANS_RECEIVABLE)
+    svc.sync()  # full rebuild from subledgers
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == live  # identical

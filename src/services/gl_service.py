@@ -612,6 +612,36 @@ class GLService:
 
         return self._entry_count() - before
 
+    # ----- Live write-path hooks (post journals as rows are created) ----- #
+    # Registered on DatabaseManager so member activity posts to the GL the moment
+    # it is written, rather than only on the next rebuild. Idempotent via
+    # source_ref, so they never conflict with backfill/rebuild; edits and undos
+    # are still reconciled by rebuild_auto_journals on the next sync.
+    def post_ledger_rows(self, ledger_ids):
+        """Post journals for the given ledger rows (one batched transaction)."""
+        with self._bulk():
+            cur = self.db.conn.cursor()
+            for lid in ledger_ids:
+                cur.execute(
+                    "SELECT date, event_type, added, deducted, principal_portion, "
+                    "interest_portion, interest_amount FROM ledger WHERE id=?", (lid,))
+                row = cur.fetchone()
+                if row:
+                    date, event, added, deducted, p_portion, i_portion, i_amt = row
+                    self._post_ledger_event(event, date, added, deducted,
+                                            p_portion, i_portion, i_amt, f"ledger:{lid}")
+
+    def post_savings_rows(self, savings_ids):
+        """Post journals for the given savings rows (one batched transaction)."""
+        with self._bulk():
+            cur = self.db.conn.cursor()
+            for sid in savings_ids:
+                cur.execute("SELECT date, transaction_type, amount FROM savings WHERE id=?", (sid,))
+                row = cur.fetchone()
+                if row:
+                    date, ttype, amount = row
+                    self._post_savings_event(ttype, amount, date, f"savings:{sid}")
+
     def _post_ledger_event(self, event, date, added, deducted,
                            p_portion, i_portion, i_amt, ref):
         """Dispatch one ledger row to the matching journal helper."""

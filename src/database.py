@@ -16,7 +16,21 @@ class DatabaseManager:
         self.db_name = db_name
         self.conn = sqlite3.connect(db_name)
         self._closed = False
+        # Optional write-path hooks: called with a list of just-inserted row ids
+        # after a ledger/savings insert, so the general ledger can post the
+        # matching journals live (see GLService.post_ledger_rows). Left as None
+        # in tests / headless contexts; a failing hook never breaks the insert.
+        self.ledger_post_hook = None
+        self.savings_post_hook = None
         self.create_tables()
+
+    def _fire_post_hook(self, hook, ids):
+        """Invoke a write-path hook defensively — never break the core write."""
+        if hook and ids:
+            try:
+                hook(ids)
+            except Exception as e:
+                print(f"GL post hook failed (will reconcile on next sync): {e}")
     
     def close(self):
         """Close the database connection."""
@@ -521,10 +535,13 @@ class DatabaseManager:
                 principal_balance, interest_balance, principal_portion, interest_portion, previous_state
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
+        """, (individual_id, date, event_type, loan_id, added, deducted, balance, notes,
               installment_amount, interest_amount, batch_id,
               principal_balance, interest_balance, principal_portion, interest_portion, previous_state))
+        new_id = cursor.lastrowid
         self.conn.commit()
+        self._fire_post_hook(self.ledger_post_hook, [new_id])
+        return new_id
 
     def bulk_insert_transactions(self, transactions):
         """Bulk insert multiple transactions into the ledger."""
@@ -554,14 +571,26 @@ class DatabaseManager:
                 tx.get('previous_state', None)
             ))
             
+        # lastrowid is unreliable after executemany; if a GL hook is registered,
+        # snapshot the max id first and read back the new rows afterwards.
+        prev_max = None
+        if self.ledger_post_hook:
+            cursor.execute("SELECT COALESCE(MAX(id), 0) FROM ledger")
+            prev_max = cursor.fetchone()[0]
+
         cursor.executemany("""
             INSERT INTO ledger (
-                individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
-                installment_amount, interest_amount, batch_id, 
+                individual_id, date, event_type, loan_id, added, deducted, balance, notes,
+                installment_amount, interest_amount, batch_id,
                 principal_balance, interest_balance, principal_portion, interest_portion, previous_state
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, vals)
         self.conn.commit()
+
+        if self.ledger_post_hook and prev_max is not None:
+            cursor.execute("SELECT id FROM ledger WHERE id > ? ORDER BY id", (prev_max,))
+            new_ids = [r[0] for r in cursor.fetchall()]
+            self._fire_post_hook(self.ledger_post_hook, new_ids)
 
     def update_transaction(self, id, date, added, deducted, notes, principal_portion=None, interest_portion=None, mark_edited=False, interest_amount=None):
         """Update a transaction with parameterized queries (SQL injection safe)."""
@@ -907,7 +936,9 @@ class DatabaseManager:
             INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes, batch_id)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
+        new_id = cursor.lastrowid
         self.conn.commit()
+        self._fire_post_hook(self.savings_post_hook, [new_id])
         return new_balance
     
     def get_savings_balance(self, individual_id):
