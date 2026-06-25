@@ -101,3 +101,29 @@ class LoanSuspendedError(LoanMasterError):
         else:
             message = f"Loan '{loan_ref}' is suspended indefinitely"
         super().__init__(message, details)
+
+
+class UnbalancedJournalError(LoanMasterError):
+    """Raised when a journal entry's debits do not equal its credits."""
+
+    def __init__(self, total_debit: float, total_credit: float):
+        details = {
+            'total_debit': round(total_debit, 2),
+            'total_credit': round(total_credit, 2),
+            'difference': round(total_debit - total_credit, 2),
+        }
+        message = (
+            f"Journal does not balance: debits {total_debit:,.2f} "
+            f"!= credits {total_credit:,.2f}"
+        )
+        super().__init__(message, details)
+
+
+class UnknownAccountError(LoanMasterError):
+    """Raised when a journal line references an account not in the chart."""
+
+    def __init__(self, account_code: str):
+        super().__init__(
+            f"Account '{account_code}' is not in the chart of accounts",
+            {'account_code': account_code},
+        )

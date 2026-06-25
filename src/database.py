@@ -319,7 +319,59 @@ class DatabaseManager:
             )
         """)
 
-            
+        # ===== Double-entry General Ledger =====
+        # chart_of_accounts is the account master; journal_entries are balanced
+        # transaction headers; journal_lines carry the debit/credit detail. Every
+        # posted entry satisfies SUM(debit) == SUM(credit), so the books balance
+        # by construction (enforced in GLService.post_journal, not the schema).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chart_of_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,            -- Asset|Liability|Equity|Income|Expense
+                normal_balance TEXT NOT NULL,  -- 'debit' | 'credit'
+                is_active INTEGER DEFAULT 1,
+                description TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS journal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_date TEXT NOT NULL,
+                memo TEXT,
+                source TEXT,            -- manual|loan_disbursement|repayment|savings|interest|migration|backfill
+                source_ref TEXT,        -- link back to the originating subledger row (idempotency key)
+                status TEXT DEFAULT 'posted',  -- posted|reversed|reversal
+                reversal_of INTEGER,    -- journal_entries.id this reverses, if any
+                created_at TEXT,
+                created_by TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS journal_lines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                account_code TEXT NOT NULL,
+                debit REAL DEFAULT 0,
+                credit REAL DEFAULT 0,
+                line_memo TEXT,
+                FOREIGN KEY(entry_id) REFERENCES journal_entries(id),
+                FOREIGN KEY(account_code) REFERENCES chart_of_accounts(code)
+            )
+        """)
+        # Indexes for the hot lookups (posting balance checks, trial balance).
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_entry ON journal_lines(entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_source ON journal_entries(source, source_ref)")
+
+        # Seed the standard chart of accounts (idempotent — UNIQUE code + IGNORE).
+        from src.config import DEFAULT_CHART_OF_ACCOUNTS
+        cursor.executemany(
+            "INSERT OR IGNORE INTO chart_of_accounts (code, name, type, normal_balance) VALUES (?, ?, ?, ?)",
+            DEFAULT_CHART_OF_ACCOUNTS,
+        )
+
         self.conn.commit()
 
     # Individual operations
