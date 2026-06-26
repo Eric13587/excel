@@ -958,6 +958,9 @@ class LedgerView(QWidget):
         catchup_btn = QPushButton("Catch Up")
         catchup_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
         catchup_btn.clicked.connect(self.benevolent_catch_up)
+        payout_btn = QPushButton("Payout")
+        payout_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
+        payout_btn.clicked.connect(self.benevolent_payout)
         edit_btn = QPushButton("Edit")
         edit_btn.clicked.connect(lambda: self._fund_edit_entry(self.benevolent_table, "benevolent_ledger"))
         delete_btn = QPushButton("Delete")
@@ -966,7 +969,7 @@ class LedgerView(QWidget):
         deleteall_btn = QPushButton("Delete All")
         deleteall_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
         deleteall_btn.clicked.connect(lambda: self._fund_delete_all("benevolent_ledger"))
-        for b in (enrol_btn, deduct_btn, catchup_btn, edit_btn, delete_btn, deleteall_btn):
+        for b in (enrol_btn, deduct_btn, catchup_btn, payout_btn, edit_btn, delete_btn, deleteall_btn):
             header.addWidget(b)
         v.addLayout(header)
 
@@ -1057,6 +1060,17 @@ class LedgerView(QWidget):
         self.refresh_table()
         if n == 0:
             QMessageBox.information(self, "Catch Up", "Already up to date.")
+
+    def benevolent_payout(self):
+        """Record a welfare payout (claim) from the fund against this member."""
+        if self.current_individual_id is None:
+            return
+        res = self._amount_date_dialog("Benevolent Payout (Welfare Claim)", "Payout amount:")
+        if not res:
+            return
+        amount, date = res
+        self.engine.benevolent_service.add_payout(self.current_individual_id, amount, date)
+        self.refresh_table()
 
     def buyoff_loan_btn(self, loan_ref):
         """Show dialog to buyoff/settle the loan fully."""

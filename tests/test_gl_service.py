@@ -371,6 +371,22 @@ def test_christmas_and_benevolent_post_to_gl(gl):
     assert svc.backfill_from_subledgers() == 0  # idempotent
 
 
+def test_benevolent_payout_posts_to_gl(gl):
+    svc, db = gl
+    ind = db.add_individual("M", "0", "m@x")
+    b = BenevolentService(db)
+    b.enroll(ind, 500, "2026-01-01")
+    b.catch_up(ind, target_date="2026-03-01")  # 1500 contributed
+    b.add_payout(ind, 400, "2026-04-01")        # welfare claim paid out
+
+    svc.sync()
+    # Fund liability = 1500 - 400; Cash reflects the payout outflow.
+    assert svc.get_account_balance(GL_BENEVOLENT_FUND) == 1100.0
+    assert svc.get_account_balance(GL_CASH) == 1100.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
 # --------------------------------------------------------------------------- #
 # Cash flow statement
 # --------------------------------------------------------------------------- #

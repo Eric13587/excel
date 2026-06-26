@@ -240,6 +240,20 @@ def test_benevolent_delete_all_resets_schedule(env):
     assert svc.get_account(ind)['next_due_date'] == "2026-01-01"
 
 
+def test_benevolent_payout_reduces_total(env):
+    db, ind = env
+    svc = BenevolentService(db)
+    svc.enroll(ind, 200, "2026-01-01")
+    svc.catch_up(ind, target_date="2026-05-01")  # 5 x 200 = 1000
+    due_before = svc.get_account(ind)['next_due_date']
+    svc.add_payout(ind, 300, "2026-06-01")  # welfare claim
+    assert svc.get_total(ind) == 700.0  # 1000 - 300
+    # a payout records a Withdrawal but does not touch the contribution schedule
+    assert svc.get_account(ind)['next_due_date'] == due_before
+    txns = svc.get_transactions(ind)
+    assert (txns['transaction_type'] == 'Withdrawal').sum() == 1
+
+
 def test_funds_are_independent_of_savings(env):
     """Christmas/Benevolent must not touch the regular savings pot."""
     db, ind = env

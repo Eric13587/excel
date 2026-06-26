@@ -55,6 +55,19 @@ class BenevolentService:
     # ------------------------------------------------------------------ #
     # Deductions
     # ------------------------------------------------------------------ #
+    def add_payout(self, individual_id, amount, date_str, notes="", batch_id=None):
+        """Record a welfare payout (claim) from the fund against a member.
+
+        Stored as a Withdrawal, which reduces the running total and, in the GL,
+        posts Dr Benevolent Fund / Cr Cash. Does not touch the contribution
+        schedule (next_due) — contributions continue as normal.
+        """
+        if float(amount) <= 0:
+            return False
+        self.db.fund_add_transaction(_TABLE, individual_id, date_str, "Withdrawal",
+                                     float(amount), notes or "Benevolent Payout", batch_id)
+        return True
+
     def deduct_single(self, individual_id, batch_id=None):
         """Take one contribution at the next due date and advance the schedule."""
         acc = self.get_account(individual_id)
