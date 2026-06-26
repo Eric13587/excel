@@ -149,6 +149,11 @@ class LedgerView(QWidget):
         loan_btn.clicked.connect(self.process_loan)
         sidebar.addWidget(loan_btn)
 
+        # Loan controls live in the shared sidebar; greyed out when not on the
+        # Loans tab (see _on_main_tab_changed).
+        self._loan_controls = [self.amount_input, self.duration_input, self.interest_input,
+                               self.date_input, loan_btn, calc_btn]
+
         
         sidebar.addWidget(QLabel("<b>Active Loans</b>"))
         self.loans_list = QListWidget()
@@ -170,33 +175,9 @@ class LedgerView(QWidget):
 
         
 
-        # Savings Section
-        sidebar.addSpacing(10)
-        sidebar.addWidget(QLabel("<b>Savings / Shares</b>"))
-        self.savings_label = QLabel("Balance: 0")
-        self.savings_label = QLabel("Balance: 0")
-        self.savings_label.setStyleSheet(f"font-size: 12px; color: {self.theme_manager.get_color('success')}; font-weight: bold;")
-        sidebar.addWidget(self.savings_label)
-        sidebar.addWidget(self.savings_label)
-        
-        # Increment amount setting
-        increment_layout = QHBoxLayout()
-        increment_layout.addWidget(QLabel("Monthly:"))
-        self.savings_increment_input = QLineEdit("2500")
-        self.savings_increment_input.setMaximumWidth(80)
-        increment_layout.addWidget(self.savings_increment_input)
-        sidebar.addLayout(increment_layout)
-        
-        savings_deposit_btn = QPushButton("Balance")
-        savings_deposit_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white; font-weight: bold;")
-        savings_deposit_btn.clicked.connect(self.savings_deposit_dialog)
-        sidebar.addWidget(savings_deposit_btn)
-        
-        savings_withdraw_btn = QPushButton("Withdraw")
-        savings_withdraw_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white; font-weight: bold;")
-        savings_withdraw_btn.clicked.connect(self.savings_withdraw_dialog)
-        sidebar.addWidget(savings_withdraw_btn)
-        
+        # Savings/Shares controls now live in the Savings tab header
+        # (see _build_savings_tab), keeping the sidebar loan-only.
+
         sidebar.addStretch()
         
         sidebar_scroll.setWidget(sidebar_widget)
@@ -211,18 +192,13 @@ class LedgerView(QWidget):
         self.scroll_layout = QVBoxLayout(self.scroll_content)
         self.scroll_area.setWidget(self.scroll_content)
 
-        # Savings/Shares tab gets its own scroll area / layout.
-        savings_scroll = QScrollArea()
-        savings_scroll.setWidgetResizable(True)
-        savings_content = QWidget()
-        self.savings_scroll_layout = QVBoxLayout(savings_content)
-        savings_scroll.setWidget(savings_content)
-
         self.main_tabs = QTabWidget()
         self.main_tabs.addTab(self.scroll_area, "Loans")
-        self.main_tabs.addTab(savings_scroll, "Savings / Shares")
+        self.main_tabs.addTab(self._build_savings_tab(), "Savings / Shares")
         self.main_tabs.addTab(self._build_christmas_tab(), "Christmas")
         self.main_tabs.addTab(self._build_benevolent_tab(), "Benevolent")
+        # Grey the sidebar loan controls when not on the Loans tab.
+        self.main_tabs.currentChanged.connect(self._on_main_tab_changed)
 
         # === SPLITTER IMPLEMENTATION ===
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -329,13 +305,11 @@ class LedgerView(QWidget):
         if self.current_individual_id is None:
             return
 
-        for layout in (self.scroll_layout, self.savings_scroll_layout):
-            for i in reversed(range(layout.count())):
-                w = layout.itemAt(i).widget()
-                if w is not None:
-                    w.setParent(None)
+        for i in reversed(range(self.scroll_layout.count())):
+            w = self.scroll_layout.itemAt(i).widget()
+            if w is not None:
+                w.setParent(None)
         self.tables = {}
-        self.savings_table = None
 
         df = self.engine.get_ledger_df(self.current_individual_id)
         
@@ -601,114 +575,9 @@ class LedgerView(QWidget):
             if not group.empty:
                 total_balance += float(group.iloc[-1]['balance'])
 
-        # ===== SAVINGS TABLE =====
-        savings_df = self.db.get_savings_transactions(self.current_individual_id)
-        savings_balance = self.db.get_savings_balance(self.current_individual_id)
-        
-        if not savings_df.empty:
-            savings_box = QGroupBox()
-            savings_layout = QVBoxLayout()
-            
-            header_layout = QHBoxLayout()
-            title_label = QLabel(f"<b style='color: {self.theme_manager.get_color('success')};'>Savings / Shares (Balance: {savings_balance:,.0f})</b>")
-            header_layout.addWidget(title_label)
-            header_layout.addStretch()
-            
-            header_layout.addStretch()
-            
-            # Button Order: Catch Up -> Quick -> Delete All -> Auto... -> Undo Last
-            
-            catch_up_savings_btn = QPushButton("Catch Up")
-            catch_up_savings_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
-            catch_up_savings_btn.clicked.connect(self.savings_catch_up_to_current)
-            header_layout.addWidget(catch_up_savings_btn)
 
-            quick_increment_btn = QPushButton("+ Quick")
-            quick_increment_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white;")
-            quick_increment_btn.clicked.connect(self.savings_quick_increment)
-            header_layout.addWidget(quick_increment_btn)
-
-            delete_all_btn = QPushButton("Delete All")
-            delete_all_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
-            delete_all_btn.clicked.connect(self.clear_all_savings)
-            header_layout.addWidget(delete_all_btn)
-            
-            auto_increment_btn = QPushButton("Auto...")
-            auto_increment_btn.clicked.connect(self.savings_auto_increment_dialog)
-            header_layout.addWidget(auto_increment_btn)
-
-            undo_savings_btn = QPushButton("Delete Last")
-            undo_savings_btn.setToolTip("Delete last savings transaction")
-            undo_savings_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('warning')}; color: black;")
-            undo_savings_btn.clicked.connect(self.undo_last_savings)
-            header_layout.addWidget(undo_savings_btn)
-            
-            # New Buttons
-            edit_savings_btn = QPushButton("Edit Entry")
-            edit_savings_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('bg_secondary')}; color: {self.theme_manager.get_color('text_primary')}; border: 1px solid {self.theme_manager.get_color('border')};")
-            edit_savings_btn.clicked.connect(lambda: self.edit_savings_entry_btn(savings_table))
-            header_layout.addWidget(edit_savings_btn)
-            
-            info_savings_btn = QPushButton("Info")
-            info_savings_btn.clicked.connect(lambda: self.show_savings_info(savings_table))
-            header_layout.addWidget(info_savings_btn)
-            
-            savings_layout.addLayout(header_layout)
-            
-            savings_table = QTableWidget()
-            savings_table.setColumnCount(6)
-            savings_table.setHorizontalHeaderLabels(["ID", "Date", "Type", "Amount", "Balance", "Notes"])
-            savings_table.setColumnHidden(0, True)
-            savings_table.setRowCount(len(savings_df))
-            
-            for i, (_, row) in enumerate(savings_df.iterrows()):
-                id_item = QTableWidgetItem(str(int(row['id'])))
-                id_item.setData(Qt.ItemDataRole.UserRole, int(row['id']))
-                id_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                savings_table.setItem(i, 0, id_item)
-                
-                savings_table.setItem(i, 1, QTableWidgetItem(str(row['date'])))
-                
-                type_item = QTableWidgetItem(str(row['transaction_type']))
-                type_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                savings_table.setItem(i, 2, type_item)
-                
-                savings_table.setItem(i, 3, QTableWidgetItem(f"{float(row['amount']):,.0f}"))
-                
-                balance_item = QTableWidgetItem(f"{float(row['balance']):,.0f}")
-                balance_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                savings_table.setItem(i, 4, balance_item)
-                
-                savings_table.setItem(i, 5, QTableWidgetItem(str(row['notes']) if row['notes'] else ""))
-                
-                # Color code: green for deposit, red for withdrawal
-                if row['transaction_type'] == 'Deposit':
-                    bg = QColor(self.theme_manager.get_color("success_bg"))
-                    fg = QColor(self.theme_manager.get_color("text_primary"))
-                    for c in range(6):
-                        savings_table.item(i, c).setBackground(bg)
-                        savings_table.item(i, c).setForeground(fg)
-                else:
-                    bg = QColor(self.theme_manager.get_color("danger_bg"))
-                    fg = QColor(self.theme_manager.get_color("text_primary"))
-                    for c in range(6):
-                        savings_table.item(i, c).setBackground(bg)
-                        savings_table.item(i, c).setForeground(fg)
-
-            
-            savings_table.itemChanged.connect(self.on_savings_item_changed)
-            savings_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            savings_table.customContextMenuRequested.connect(lambda pos, t=savings_table: self.open_savings_context_menu(pos, t))
-            
-            savings_table.resizeRowsToContents()
-            savings_table.setFixedHeight(savings_table.verticalHeader().length() + savings_table.horizontalHeader().height() + 10)
-            
-            savings_layout.addWidget(savings_table)
-            savings_box.setLayout(savings_layout)
-            self.savings_scroll_layout.addWidget(savings_box)
-            self.savings_table = savings_table
-
-        # Refresh the two new fund tabs.
+        # Refresh the fund tabs.
+        self.refresh_savings()
         self.refresh_christmas()
         self.refresh_benevolent()
 
@@ -824,6 +693,118 @@ class LedgerView(QWidget):
         menu.addAction(edit)
         menu.addAction(delete)
         menu.exec(table.viewport().mapToGlobal(position))
+
+    def _on_main_tab_changed(self, index):
+        """Grey the sidebar loan controls when not on the Loans tab (index 0)."""
+        on_loans = (index == 0)
+        for ctrl in getattr(self, '_loan_controls', []):
+            ctrl.setEnabled(on_loans)
+
+    # ==================================================================== #
+    # Savings / Shares tab (controls moved here from the sidebar)
+    # ==================================================================== #
+    def _build_savings_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        header = QHBoxLayout()
+        self.savings_label = QLabel("Savings / Shares — Balance: 0")
+        self.savings_label.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {self.theme_manager.get_color('success')};")
+        header.addWidget(self.savings_label)
+        header.addStretch()
+        header.addWidget(QLabel("Monthly:"))
+        self.savings_increment_input = QLineEdit("2500")
+        self.savings_increment_input.setMaximumWidth(80)
+        header.addWidget(self.savings_increment_input)
+
+        deposit_btn = QPushButton("Deposit")
+        deposit_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white;")
+        deposit_btn.clicked.connect(self.savings_deposit_dialog)
+        withdraw_btn = QPushButton("Withdraw")
+        withdraw_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
+        withdraw_btn.clicked.connect(self.savings_withdraw_dialog)
+        catchup_btn = QPushButton("Catch Up")
+        catchup_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
+        catchup_btn.clicked.connect(self.savings_catch_up_to_current)
+        quick_btn = QPushButton("+ Quick")
+        quick_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white;")
+        quick_btn.clicked.connect(self.savings_quick_increment)
+        auto_btn = QPushButton("Auto...")
+        auto_btn.clicked.connect(self.savings_auto_increment_dialog)
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(lambda: self.savings_table and self.edit_savings_entry_btn(self.savings_table))
+        info_btn = QPushButton("Info")
+        info_btn.clicked.connect(lambda: self.savings_table and self.show_savings_info(self.savings_table))
+        deletelast_btn = QPushButton("Delete Last")
+        deletelast_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('warning')}; color: black;")
+        deletelast_btn.clicked.connect(self.undo_last_savings)
+        deleteall_btn = QPushButton("Delete All")
+        deleteall_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
+        deleteall_btn.clicked.connect(self.clear_all_savings)
+        for b in (deposit_btn, withdraw_btn, catchup_btn, quick_btn, auto_btn,
+                  edit_btn, info_btn, deletelast_btn, deleteall_btn):
+            header.addWidget(b)
+        v.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        self.savings_scroll_layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        v.addWidget(scroll)
+        return w
+
+    def refresh_savings(self):
+        if self.current_individual_id is None:
+            return
+        for i in reversed(range(self.savings_scroll_layout.count())):
+            wdg = self.savings_scroll_layout.itemAt(i).widget()
+            if wdg is not None:
+                wdg.setParent(None)
+
+        savings_df = self.db.get_savings_transactions(self.current_individual_id)
+        balance = self.db.get_savings_balance(self.current_individual_id)
+        self.savings_label.setText(f"Savings / Shares — Balance: {balance:,.0f}")
+        self.savings_table = None
+        if savings_df.empty:
+            return
+
+        table = QTableWidget()
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["ID", "Date", "Type", "Amount", "Balance", "Notes"])
+        table.setColumnHidden(0, True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setRowCount(len(savings_df))
+        no_edit = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        for i, (_, row) in enumerate(savings_df.iterrows()):
+            id_item = QTableWidgetItem(str(int(row['id'])))
+            id_item.setData(Qt.ItemDataRole.UserRole, int(row['id']))
+            id_item.setFlags(no_edit)
+            table.setItem(i, 0, id_item)
+            table.setItem(i, 1, QTableWidgetItem(str(row['date'])))  # editable
+            type_item = QTableWidgetItem(str(row['transaction_type']))
+            type_item.setFlags(no_edit)
+            table.setItem(i, 2, type_item)
+            table.setItem(i, 3, QTableWidgetItem(f"{float(row['amount']):,.0f}"))  # editable
+            bal_item = QTableWidgetItem(f"{float(row['balance']):,.0f}")
+            bal_item.setFlags(no_edit)
+            table.setItem(i, 4, bal_item)
+            table.setItem(i, 5, QTableWidgetItem(str(row['notes']) if row['notes'] else ""))  # editable
+            is_deposit = row['transaction_type'] == 'Deposit'
+            bg = QColor(self.theme_manager.get_color("success_bg" if is_deposit else "danger_bg"))
+            fg = QColor(self.theme_manager.get_color("text_primary"))
+            for c in range(6):
+                table.item(i, c).setBackground(bg)
+                table.item(i, c).setForeground(fg)
+
+        table.itemChanged.connect(self.on_savings_item_changed)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(
+            lambda pos, t=table: self.open_savings_context_menu(pos, t))
+        table.resizeRowsToContents()
+        self.savings_scroll_layout.addWidget(table)
+        self.savings_table = table
 
     # ==================================================================== #
     # Christmas fund tab
@@ -1984,7 +1965,7 @@ class LedgerView(QWidget):
     def refresh_savings_balance(self):
         """Update the savings balance display."""
         balance = self.db.get_savings_balance(self.current_individual_id)
-        self.savings_label.setText(f"Balance: {balance:,.0f}")
+        self.savings_label.setText(f"Savings / Shares — Balance: {balance:,.0f}")
     
     def savings_deposit_dialog(self):
         """Dialog to add a deposit."""
