@@ -82,6 +82,14 @@ class LoanActionController:
                         "PF numbers must be unique.")
                     return False
 
+                id_owner = self.db.id_no_owner(id_no)
+                if id_owner:
+                    QMessageBox.warning(
+                        self.parent, "Duplicate ID Number",
+                        f"ID No '{id_no}' is already assigned to '{id_owner}'. "
+                        "ID numbers must be unique.")
+                    return False
+
                 new_id = self.db.add_individual(name, phone, email,
                                                 employment_status=employment_status,
                                                 pf_no=pf_no, id_no=id_no)
@@ -128,6 +136,13 @@ class LoanActionController:
                         self.parent, "Duplicate PF Number",
                         f"PF No '{pf_no}' is already assigned to '{owner}'. "
                         "PF numbers must be unique.")
+                    return False
+                id_owner = self.db.id_no_owner(id_no, exclude_id=ind_id)
+                if id_owner:
+                    QMessageBox.warning(
+                        self.parent, "Duplicate ID Number",
+                        f"ID No '{id_no}' is already assigned to '{id_owner}'. "
+                        "ID numbers must be unique.")
                     return False
                 self.db.update_individual(ind_id, name, phone, email,
                                           employment_status=employment_status,

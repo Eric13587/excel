@@ -131,11 +131,16 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE individuals ADD COLUMN id_no TEXT")
         except sqlite3.OperationalError:
             pass
-        # PF numbers must be unique, but only when set (NULL/'' are exempt so the
-        # many members without a PF number don't collide).
+        # PF and ID numbers must be unique, but only when set (NULL/'' are exempt
+        # so the many members without one don't collide).
         try:
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_individuals_pf_no "
                            "ON individuals(pf_no) WHERE pf_no IS NOT NULL AND pf_no != ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_individuals_id_no "
+                           "ON individuals(id_no) WHERE id_no IS NOT NULL AND id_no != ''")
         except sqlite3.OperationalError:
             pass
 
@@ -474,6 +479,22 @@ class DatabaseManager:
                            (str(pf_no).strip(), exclude_id))
         else:
             cursor.execute("SELECT name FROM individuals WHERE pf_no=?", (str(pf_no).strip(),))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def id_no_owner(self, id_no, exclude_id=None):
+        """Return the name of the individual already using this ID number, or None.
+
+        Empty/blank ID numbers are never considered duplicates.
+        """
+        if not id_no or not str(id_no).strip():
+            return None
+        cursor = self.conn.cursor()
+        if exclude_id is not None:
+            cursor.execute("SELECT name FROM individuals WHERE id_no=? AND id<>?",
+                           (str(id_no).strip(), exclude_id))
+        else:
+            cursor.execute("SELECT name FROM individuals WHERE id_no=?", (str(id_no).strip(),))
         row = cursor.fetchone()
         return row[0] if row else None
 

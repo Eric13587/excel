@@ -83,6 +83,25 @@ def test_pf_no_unique_index_blocks_duplicate():
         db.conn.execute("INSERT INTO individuals (name, pf_no) VALUES ('Eve','PF-1')")
 
 
+def test_id_no_owner_detects_duplicates():
+    db = _db()
+    a = db.add_individual("Alice", "0", "a@x", id_no="ID-100")
+    db.add_individual("Bob", "0", "b@x", id_no="ID-200")
+    assert db.id_no_owner("ID-100") == "Alice"
+    assert db.id_no_owner("ID-999") is None
+    assert db.id_no_owner("") is None
+    assert db.id_no_owner("ID-100", exclude_id=a) is None      # excluding self
+    assert db.id_no_owner("ID-200", exclude_id=a) == "Bob"
+
+
+def test_id_no_unique_index_blocks_duplicate():
+    import sqlite3
+    db = _db()
+    db.add_individual("Alice", "0", "a@x", id_no="ID-1")
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("INSERT INTO individuals (name, id_no) VALUES ('Eve','ID-1')")
+
+
 def test_existing_positional_columns_unchanged():
     """get_individuals returns tuples indexed positionally elsewhere; the new
     columns must append after is_retired(7)/retired_date(8)."""
