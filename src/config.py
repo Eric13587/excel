@@ -67,6 +67,8 @@ GL_LOANS_RECEIVABLE = "1100"
 GL_ALLOWANCE_LOAN_LOSS = "1190"
 GL_INTEREST_RECEIVABLE = "1200"
 GL_MEMBER_DEPOSITS = "2000"
+GL_CHRISTMAS_SAVINGS = "2010"
+GL_BENEVOLENT_FUND = "2300"
 GL_SHARE_CAPITAL = "3000"
 GL_RETAINED_EARNINGS = "3100"
 GL_OPENING_EQUITY = "3900"          # suspense / opening balance for migrations
@@ -86,8 +88,10 @@ DEFAULT_CHART_OF_ACCOUNTS = [
     (GL_INTEREST_RECEIVABLE,  "Interest Receivable",       "Asset",     "debit"),
     # Liabilities (2000s) — normal credit
     (GL_MEMBER_DEPOSITS,      "Member Deposits / Savings", "Liability", "credit"),
+    (GL_CHRISTMAS_SAVINGS,    "Christmas Savings",         "Liability", "credit"),
     ("2100",                  "External Borrowings",       "Liability", "credit"),
     ("2200",                  "Accounts Payable",          "Liability", "credit"),
+    (GL_BENEVOLENT_FUND,      "Benevolent Fund",           "Liability", "credit"),
     # Equity (3000s) — normal credit
     (GL_SHARE_CAPITAL,        "Member Share Capital",      "Equity",    "credit"),
     (GL_RETAINED_EARNINGS,    "Retained Earnings",         "Equity",    "credit"),

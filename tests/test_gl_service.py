@@ -13,7 +13,10 @@ from src.exceptions import UnbalancedJournalError, UnknownAccountError
 from src.config import (
     DEFAULT_CHART_OF_ACCOUNTS, GL_CASH, GL_LOANS_RECEIVABLE,
     GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS, GL_LOAN_INTEREST_INCOME,
+    GL_CHRISTMAS_SAVINGS, GL_BENEVOLENT_FUND,
 )
+from src.services.christmas_service import ChristmasService
+from src.services.benevolent_service import BenevolentService
 
 
 @pytest.fixture
@@ -331,6 +334,41 @@ def test_is_auto_source(gl):
     svc, _ = gl
     assert svc.is_auto_source("repayment") is True
     assert svc.is_auto_source("manual") is False
+
+
+# --------------------------------------------------------------------------- #
+# Christmas & Benevolent funds post to the GL
+# --------------------------------------------------------------------------- #
+def test_christmas_and_benevolent_post_to_gl(gl):
+    svc, db = gl
+    ind = db.add_individual("M", "0", "m@x")
+    c = ChristmasService(db)
+    c.add_deposit(ind, 3000, "2026-01-01")
+    c.add_withdrawal(ind, 1000, "2026-12-15")  # December -> allowed
+    b = BenevolentService(db)
+    b.enroll(ind, 200, "2026-01-01")
+    b.catch_up(ind, target_date="2026-03-01")  # 3 x 200 = 600
+
+    svc.backfill_from_subledgers()
+
+    # Christmas Savings liability = 3000 - 1000; Benevolent Fund = 600.
+    assert svc.get_account_balance(GL_CHRISTMAS_SAVINGS) == 2000.0
+    assert svc.get_account_balance(GL_BENEVOLENT_FUND) == 600.0
+    # Cash from these flows = +3000 -1000 +600 = 2600.
+    assert svc.get_account_balance(GL_CASH) == 2600.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+    # The funds appear as liabilities on the balance sheet.
+    bs = svc.get_balance_sheet()
+    liab_codes = {l['code'] for l in bs['liabilities']}
+    assert {GL_CHRISTMAS_SAVINGS, GL_BENEVOLENT_FUND} <= liab_codes
+    assert bs['is_balanced']
+
+    # Rebuild (the projection slice includes the funds) stays consistent.
+    svc.rebuild_auto_journals()
+    assert svc.get_account_balance(GL_BENEVOLENT_FUND) == 600.0
+    assert svc.backfill_from_subledgers() == 0  # idempotent
 
 
 # --------------------------------------------------------------------------- #

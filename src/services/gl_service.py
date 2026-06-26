@@ -19,6 +19,7 @@ from src.config import (
     GL_LOAN_INTEREST_INCOME, GL_OPENING_EQUITY, GL_FEES_INCOME,
     GL_BANK_INTEREST_INCOME, GL_OTHER_INCOME, GL_OTHER_EXPENSE,
     GL_ALLOWANCE_LOAN_LOSS, GL_SHARE_CAPITAL, GL_RETAINED_EARNINGS,
+    GL_CHRISTMAS_SAVINGS, GL_BENEVOLENT_FUND,
 )
 
 # Money is tracked to whole cents; debits and credits must agree within this
@@ -345,8 +346,8 @@ class GLService:
 
     # Cash-flow categorisation by the counterpart account.
     _LENDING_ACCOUNTS = {GL_LOANS_RECEIVABLE, GL_ALLOWANCE_LOAN_LOSS}
-    _FINANCING_ACCOUNTS = {GL_MEMBER_DEPOSITS, "2100", GL_SHARE_CAPITAL,
-                           GL_RETAINED_EARNINGS, GL_OPENING_EQUITY}
+    _FINANCING_ACCOUNTS = {GL_MEMBER_DEPOSITS, GL_CHRISTMAS_SAVINGS, GL_BENEVOLENT_FUND,
+                           "2100", GL_SHARE_CAPITAL, GL_RETAINED_EARNINGS, GL_OPENING_EQUITY}
 
     @classmethod
     def _cash_flow_category(cls, code):
@@ -532,13 +533,54 @@ class GLService:
             {'account': GL_MEMBER_DEPOSITS, 'credit': amount},
         ], memo=memo or "Interest on member deposits", source="savings", source_ref=source_ref)
 
+    def post_christmas_deposit(self, amount, date, source_ref, memo=None):
+        """Dr Cash / Cr Christmas Savings (a member-held liability)."""
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            return None
+        return self.post_journal(date, [
+            {'account': GL_CASH, 'debit': amount},
+            {'account': GL_CHRISTMAS_SAVINGS, 'credit': amount},
+        ], memo=memo or "Christmas deposit", source="christmas", source_ref=source_ref)
+
+    def post_christmas_withdrawal(self, amount, date, source_ref, memo=None):
+        """Dr Christmas Savings / Cr Cash."""
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            return None
+        return self.post_journal(date, [
+            {'account': GL_CHRISTMAS_SAVINGS, 'debit': amount},
+            {'account': GL_CASH, 'credit': amount},
+        ], memo=memo or "Christmas withdrawal", source="christmas", source_ref=source_ref)
+
+    def post_benevolent_contribution(self, amount, date, source_ref, memo=None):
+        """Dr Cash / Cr Benevolent Fund (welfare reserve held for the membership)."""
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            return None
+        return self.post_journal(date, [
+            {'account': GL_CASH, 'debit': amount},
+            {'account': GL_BENEVOLENT_FUND, 'credit': amount},
+        ], memo=memo or "Benevolent contribution", source="benevolent", source_ref=source_ref)
+
+    def post_benevolent_payout(self, amount, date, source_ref, memo=None):
+        """Dr Benevolent Fund / Cr Cash (welfare paid out)."""
+        amount = round(float(amount), 2)
+        if amount <= 0:
+            return None
+        return self.post_journal(date, [
+            {'account': GL_BENEVOLENT_FUND, 'debit': amount},
+            {'account': GL_CASH, 'credit': amount},
+        ], memo=memo or "Benevolent payout", source="benevolent", source_ref=source_ref)
+
     # ------------------------------------------------------------------ #
     # Backfill, sync & migration
     # ------------------------------------------------------------------ #
     # Journals whose truth lives in the member subledgers — a pure projection
     # that can be wiped and re-derived. Manual and migration journals are not
     # in this set and are never touched by a rebuild.
-    _AUTO_SOURCES = ("loan_disbursement", "repayment", "interest", "savings")
+    _AUTO_SOURCES = ("loan_disbursement", "repayment", "interest", "savings",
+                     "christmas", "benevolent")
 
     def rebuild_auto_journals(self, progress=None):
         """Drop and re-derive the subledger-projected journals.
@@ -593,8 +635,12 @@ class GLService:
             ledger_rows = cur.fetchall()
             cur.execute("SELECT id, date, transaction_type, amount FROM savings ORDER BY date, id")
             savings_rows = cur.fetchall()
+            cur.execute("SELECT id, date, transaction_type, amount FROM christmas_savings ORDER BY date, id")
+            christmas_rows = cur.fetchall()
+            cur.execute("SELECT id, date, transaction_type, amount FROM benevolent_ledger ORDER BY date, id")
+            benevolent_rows = cur.fetchall()
 
-            total = len(ledger_rows) + len(savings_rows)
+            total = len(ledger_rows) + len(savings_rows) + len(christmas_rows) + len(benevolent_rows)
             done = 0
             for row in ledger_rows:
                 (lid, date, event, added, deducted, p_portion, i_portion, i_amt) = row
@@ -606,6 +652,18 @@ class GLService:
 
             for (sid, date, ttype, amount) in savings_rows:
                 self._post_savings_event(ttype, amount, date, f"savings:{sid}")
+                done += 1
+                if progress and done % 200 == 0:
+                    progress(done, total, "Posting member activity to the ledger…")
+
+            for (cid, date, ttype, amount) in christmas_rows:
+                self._post_christmas_event(ttype, amount, date, f"christmas:{cid}")
+                done += 1
+                if progress and done % 200 == 0:
+                    progress(done, total, "Posting member activity to the ledger…")
+
+            for (bid, date, ttype, amount) in benevolent_rows:
+                self._post_benevolent_event(ttype, amount, date, f"benevolent:{bid}")
                 done += 1
                 if progress and done % 200 == 0:
                     progress(done, total, "Posting member activity to the ledger…")
@@ -667,6 +725,20 @@ class GLService:
             return self.post_savings_withdrawal(amount, date, ref)
         if ttype == "Interest":
             return self.post_savings_interest(amount, date, ref)
+        return None
+
+    def _post_christmas_event(self, ttype, amount, date, ref):
+        if ttype in ("Deposit", "Interest"):
+            return self.post_christmas_deposit(amount, date, ref)
+        if ttype == "Withdrawal":
+            return self.post_christmas_withdrawal(amount, date, ref)
+        return None
+
+    def _post_benevolent_event(self, ttype, amount, date, ref):
+        if ttype == "Contribution":
+            return self.post_benevolent_contribution(amount, date, ref)
+        if ttype == "Withdrawal":  # welfare payout (rare)
+            return self.post_benevolent_payout(amount, date, ref)
         return None
 
     # Best-effort mapping of legacy treasury categories to chart accounts.
