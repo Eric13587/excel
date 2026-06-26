@@ -1,8 +1,9 @@
 import json
-from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton, 
-                             QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, 
+from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton,
+                             QVBoxLayout, QHBoxLayout, QLabel, QCheckBox,
                              QFileDialog, QGroupBox, QListWidget, QListWidgetItem, QDateEdit, QDialogButtonBox,
-                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView, QColorDialog, QFrame)
+                             QTableWidget, QTableWidgetItem, QComboBox, QHeaderView, QColorDialog, QFrame,
+                             QSpinBox, QMessageBox)
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 from .data_structures import StatementConfig
@@ -810,3 +811,182 @@ class ExcelFormatDialog(QDialog):
         self.accept()
 
 
+
+
+class ExcelImportDialog(QDialog):
+    """Import members and fund contributions from an .xlsx file.
+
+    Auto-detects the sheet shape (roster vs contribution) and column mapping,
+    fuzzy-matches names to existing members, previews the plan with per-row
+    actions, backs up the DB, then applies.
+    """
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        from .services.excel_import import ExcelImporter
+        self.db = db
+        self.importer = ExcelImporter(db)
+        self.path = None
+        self.mapping = None
+        self.rows = None
+        self.plan = None
+
+        self.setWindowTitle("Import from Excel")
+        self.setMinimumSize(720, 560)
+        layout = QVBoxLayout(self)
+
+        # File row
+        file_row = QHBoxLayout()
+        self.file_label = QLabel("No file selected")
+        self.file_label.setStyleSheet("color: gray; font-style: italic;")
+        pick = QPushButton("Select Excel File…")
+        pick.clicked.connect(self._pick_file)
+        file_row.addWidget(self.file_label, 1)
+        file_row.addWidget(pick)
+        layout.addLayout(file_row)
+
+        # Detection info
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("color: #444; font-size: 12px;")
+        layout.addWidget(self.info)
+
+        # Contribution-only controls
+        self.contrib_box = QGroupBox("Contribution settings")
+        cb = QHBoxLayout(self.contrib_box)
+        cb.addWidget(QLabel("Fund:"))
+        self.fund_combo = QComboBox(); self.fund_combo.addItems(["Christmas", "Benevolent"])
+        cb.addWidget(self.fund_combo)
+        cb.addWidget(QLabel("Fiscal year start:"))
+        self.year_spin = QSpinBox(); self.year_spin.setRange(2000, 2100)
+        self.year_spin.setValue(QDate.currentDate().year())
+        cb.addWidget(self.year_spin)
+        cb.addStretch()
+        self.contrib_box.setVisible(False)
+        layout.addWidget(self.contrib_box)
+
+        # Preview button + table
+        self.preview_btn = QPushButton("Preview")
+        self.preview_btn.setEnabled(False)
+        self.preview_btn.clicked.connect(self._preview)
+        layout.addWidget(self.preview_btn)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Sheet Name", "Best DB Match", "Score", "Action"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table, 1)
+
+        self.summary = QLabel("")
+        self.summary.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.summary)
+
+        # Buttons
+        btns = QDialogButtonBox()
+        self.import_btn = btns.addButton("Import", QDialogButtonBox.ButtonRole.AcceptRole)
+        btns.addButton(QDialogButtonBox.StandardButton.Cancel)
+        self.import_btn.setEnabled(False)
+        self.import_btn.clicked.connect(self._do_import)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _pick_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Excel File", "", "Excel Files (*.xlsx)")
+        if not path:
+            return
+        try:
+            headers, rows = self.importer.read_sheet(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Read Error", f"Could not read the spreadsheet:\n{e}")
+            return
+        self.path = path
+        self.rows = rows
+        self.mapping = self.importer.detect_mapping(headers)
+        self.file_label.setText(path.split("/")[-1])
+        self.file_label.setStyleSheet("color: #111;")
+
+        f = self.mapping["fields"]
+        detected = ", ".join(f"{k}→{v}" for k, v in f.items()) or "none"
+        kind = self.mapping["type"]
+        extra = ""
+        if kind == "contribution":
+            extra = f" | {len(self.mapping['month_columns'])} month columns"
+        self.info.setText(f"Detected a <b>{kind}</b> sheet ({len(rows)} rows).<br>"
+                          f"Columns: {detected}{extra}")
+        self.contrib_box.setVisible(kind == "contribution")
+        self.preview_btn.setEnabled(bool(f.get("name")))
+        if not f.get("name"):
+            self.info.setText(self.info.text() + "<br><span style='color:#b00'>No Name column found — cannot import.</span>")
+        self.table.setRowCount(0)
+        self.summary.setText("")
+        self.import_btn.setEnabled(False)
+
+    def _preview(self):
+        fund = self.fund_combo.currentText().lower()
+        self.plan = self.importer.build_plan(
+            self.rows, self.mapping, fund=fund, fy_start_year=self.year_spin.value())
+        rows = self.plan["rows"]
+        self.table.setRowCount(len(rows))
+        self._action_combos = []
+        for i, e in enumerate(rows):
+            self.table.setItem(i, 0, QTableWidgetItem(e["source_name"]))
+            match = e["match"]
+            self.table.setItem(i, 1, QTableWidgetItem(match["name"] if match else "—"))
+            self.table.setItem(i, 2, QTableWidgetItem(f"{match['score']:.2f}" if match else "—"))
+            combo = QComboBox()
+            if match:
+                combo.addItem(f"Update: {match['name']}", "update")
+            combo.addItem("Create new member", "create")
+            combo.addItem("Skip", "skip")
+            combo.setCurrentIndex(0 if e["action"] == "update" and match else
+                                  (combo.findData("create")))
+            self.table.setCellWidget(i, 3, combo)
+            self._action_combos.append(combo)
+        upd = sum(1 for e in rows if e["action"] == "update")
+        new = len(rows) - upd
+        self.summary.setText(f"{len(rows)} rows — {upd} match/update, {new} new. Review actions, then Import.")
+        self.import_btn.setEnabled(bool(rows))
+
+    def _do_import(self):
+        if not self.plan:
+            return
+        # apply per-row action overrides from the combos
+        for e, combo in zip(self.plan["rows"], self._action_combos):
+            e["action"] = combo.currentData()
+
+        if QMessageBox.question(
+                self, "Confirm Import",
+                "Apply this import? The database will be backed up first.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) \
+                != QMessageBox.StandardButton.Yes:
+            return
+
+        # Backup
+        try:
+            import shutil
+            from datetime import datetime
+            src = getattr(self.db, "db_name", None)
+            if src:
+                bak = f"{src}.pre-excel-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak"
+                shutil.copy(src, bak)
+        except Exception as e:
+            QMessageBox.warning(self, "Backup", f"Could not back up the DB ({e}). Import cancelled.")
+            return
+
+        fund = self.fund_combo.currentText().lower()
+        try:
+            stats = self.importer.apply(self.plan, fund=fund)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Import failed:\n{e}")
+            return
+
+        warnings = stats.pop("warnings", [])
+        summary = ", ".join(f"{k}: {v}" for k, v in stats.items())
+        msg = f"Import complete.\n{summary}"
+        if warnings:
+            msg += f"\n\n{len(warnings)} warning(s):\n" + "\n".join(warnings[:15])
+            if len(warnings) > 15:
+                msg += f"\n…and {len(warnings) - 15} more."
+        QMessageBox.information(self, "Import Complete", msg)
+        self.accept()

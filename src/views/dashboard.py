@@ -11,7 +11,7 @@ import os
 import sys
 
 
-from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog, ImportHistoryDialog, ImportPreviewDialog
+from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog, ImportHistoryDialog, ImportPreviewDialog, ExcelImportDialog
 from src.reports import ReportGenerator
 from ..theme import ThemeManager
 from ..database import DatabaseManager
@@ -296,8 +296,15 @@ class Dashboard(QWidget):
         
         self.import_btn = QPushButton("Import Data")
         self.import_btn.setFixedSize(130, 38)
-        self.import_btn.clicked.connect(self.import_individuals)
-        
+        import_menu = QMenu(self)
+        act_db = QAction("From Database (.db)…", self)
+        act_db.triggered.connect(self.import_individuals)
+        act_xlsx = QAction("From Excel (.xlsx)…", self)
+        act_xlsx.triggered.connect(self.import_from_excel)
+        import_menu.addAction(act_db)
+        import_menu.addAction(act_xlsx)
+        self.import_btn.setMenu(import_menu)
+
         quick_actions_layout.addWidget(self.add_btn)
         quick_actions_layout.addWidget(self.import_btn)
         header_layout.addLayout(quick_actions_layout)
@@ -1738,6 +1745,12 @@ class Dashboard(QWidget):
         dlg.exec()
         # Refresh UI after potential undo
         self.load_individuals()
+
+    def import_from_excel(self):
+        """Import members / fund contributions from an .xlsx file."""
+        dlg = ExcelImportDialog(self.db, self)
+        if dlg.exec():
+            self.load_individuals()
 
     def import_individuals(self):
         """Import individuals from another database with selection and progress."""
