@@ -145,5 +145,6 @@ Thumbs.db
 *.pre-migration-*.bak
 .gemini/
 test_*
+*.xlsx
 updates.md
 scratch
