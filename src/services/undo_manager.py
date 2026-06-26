@@ -564,7 +564,54 @@ class MassSavingsCatchUpCommand(UndoableCommand):
         self.batch_id = batch_id
         self.result = (processed, total, errors)
         return True
-            
+
     def undo(self) -> bool:
         if not self.batch_id: return False
         return self.service.revert_batch_savings(self.batch_id)
+
+
+class _MassFundCatchUpCommand(UndoableCommand):
+    """Shared base for the Christmas/Benevolent mass catch-up commands.
+
+    Both services expose mass_catch_up(...) -> (processed, total, batch_id, errors)
+    and revert_batch(batch_id), so the command logic is identical; subclasses just
+    supply the label.
+    """
+    label = "Mass Fund"
+
+    def __init__(self, service, items, progress_callback=None, target_date=None):
+        self.service = service
+        self.items = items
+        self.callback = progress_callback
+        self.target_date = target_date
+        self.batch_id = None
+        self.result = (0, 0, [])
+
+    @property
+    def description(self) -> str:
+        count = self.result[0] if self.result else "?"
+        errors = len(self.result[2]) if self.result and len(self.result) > 2 else 0
+        desc = f"{self.label} ({count} processed"
+        if errors > 0:
+            desc += f", {errors} failed"
+        return desc + ")"
+
+    def execute(self) -> bool:
+        processed, total, batch_id, errors = self.service.mass_catch_up(
+            self.items, self.callback, target_date=self.target_date)
+        self.batch_id = batch_id
+        self.result = (processed, total, errors)
+        return True
+
+    def undo(self) -> bool:
+        if not self.batch_id:
+            return False
+        return self.service.revert_batch(self.batch_id)
+
+
+class MassChristmasCatchUpCommand(_MassFundCatchUpCommand):
+    label = "Mass Christmas Contribution"
+
+
+class MassBenevolentCatchUpCommand(_MassFundCatchUpCommand):
+    label = "Mass Benevolent Deduction"

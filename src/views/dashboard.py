@@ -1057,7 +1057,7 @@ class Dashboard(QWidget):
             QApplication.processEvents()
 
         try:
-            processed, total, _batch, errors = engine_method(ids, cb, target_date=target)
+            processed, total, errors = engine_method(ids, cb, target_date=target)
         except Exception as e:
             progress.close()
             if "Canceled" in str(e):
@@ -1071,8 +1071,10 @@ class Dashboard(QWidget):
         if total == 0:
             QMessageBox.information(self, "Up to Date", "All members are already up to date.")
         else:
+            extra = f"\n{len(errors)} member(s) had errors." if errors else ""
             QMessageBox.information(self, "Success",
-                                   f"Members updated: {processed}\nTotal {noun} created: {total}")
+                                   f"Members updated: {processed}\nTotal {noun} created: {total}"
+                                   f"\n\n(Use Mass Operations → Undo Last to revert.){extra}")
 
     def open_mass_deduction_dialog(self):
         """Open dialog for Mass Loan Deduction."""

@@ -189,6 +189,35 @@ def test_mass_catch_up_benevolent(env):
     assert b.get_total(ind2) == 0.0
 
 
+# --------------------------------------------------------------------------- #
+# Undo support for mass catch-up
+# --------------------------------------------------------------------------- #
+def test_undo_mass_christmas(env):
+    from src.engine import LoanEngine
+    db, ind = env
+    eng = LoanEngine(db)
+    eng.christmas_service.add_deposit(ind, 500, "2026-01-01")
+    eng.mass_catch_up_christmas([ind], target_date="2026-04-01")  # +3 -> 2000
+    assert eng.christmas_service.get_balance(ind) == 2000.0
+    assert eng.can_undo()
+    eng.undo()
+    assert eng.christmas_service.get_balance(ind) == 500.0  # reverted
+
+
+def test_undo_mass_benevolent_restores_next_due(env):
+    from src.engine import LoanEngine
+    db, ind = env
+    eng = LoanEngine(db)
+    eng.benevolent_service.enroll(ind, 100, "2026-01-01")
+    eng.mass_catch_up_benevolent([ind], target_date="2026-03-01")  # Jan..Mar -> 300
+    assert eng.benevolent_service.get_total(ind) == 300.0
+    assert eng.benevolent_service.get_account(ind)['next_due_date'] == "2026-04-01"
+    eng.undo()
+    assert eng.benevolent_service.get_total(ind) == 0.0
+    # schedule restored to where it was before the run
+    assert eng.benevolent_service.get_account(ind)['next_due_date'] == "2026-01-01"
+
+
 def test_funds_are_independent_of_savings(env):
     """Christmas/Benevolent must not touch the regular savings pot."""
     db, ind = env

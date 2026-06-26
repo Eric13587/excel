@@ -109,3 +109,19 @@ class BenevolentService:
                 if progress_callback:
                     progress_callback(i, ind)
         return processed, total, batch_id, errors
+
+    def revert_batch(self, batch_id):
+        """Undo a catch-up batch: delete its contributions, restore each member's
+        next-due to the batch's earliest date, and recalc the running total."""
+        if not batch_id:
+            return False
+        cur = self.db.conn.cursor()
+        # earliest contribution per member == that member's next_due before the run
+        cur.execute(f"SELECT individual_id, MIN(date) FROM {_TABLE} WHERE batch_id=? "
+                    f"GROUP BY individual_id", (batch_id,))
+        rows = cur.fetchall()
+        self.db.fund_delete_batch(_TABLE, batch_id)
+        for ind, earliest in rows:
+            self.db.set_benevolent_next_due(ind, earliest)
+            self.db.fund_recalculate(_TABLE, ind)
+        return True
