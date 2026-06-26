@@ -23,7 +23,8 @@ from src.exceptions import (
 )
 from src.config import DEFAULT_INTEREST_RATE
 
-from src.services import LoanService, SavingsService, BalanceRecalculator, TransactionManager
+from src.services import (LoanService, SavingsService, ChristmasService, BenevolentService,
+                          BalanceRecalculator, TransactionManager)
 from src.services.undo_manager import UndoManager, MassLoanCatchUpCommand, MassSavingsCatchUpCommand
 
 
@@ -69,6 +70,20 @@ class LoanEngine:
         if self._savings_service is None:
             self._savings_service = SavingsService(self.db)
         return self._savings_service
+
+    @property
+    def christmas_service(self):
+        """Lazy-load ChristmasService instance."""
+        if getattr(self, '_christmas_service', None) is None:
+            self._christmas_service = ChristmasService(self.db)
+        return self._christmas_service
+
+    @property
+    def benevolent_service(self):
+        """Lazy-load BenevolentService instance."""
+        if getattr(self, '_benevolent_service', None) is None:
+            self._benevolent_service = BenevolentService(self.db)
+        return self._benevolent_service
     
     @property
     def balance_recalculator(self):

@@ -3,18 +3,20 @@ import math
 import pandas as pd
 from datetime import datetime
 
-from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, 
+from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                              QPushButton, QLineEdit, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QScrollArea, QGroupBox,
                              QMessageBox, QFileDialog, QMenu, QDialog,
                              QFormLayout, QDateEdit, QCheckBox, QSpinBox, QDialogButtonBox,
-                             QHeaderView, QSplitter, QProgressDialog, QApplication)
+                             QHeaderView, QSplitter, QProgressDialog, QApplication,
+                             QTabWidget, QDoubleSpinBox)
 from PyQt6.QtGui import QAction, QColor, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QDate, QTimer
 
 
 from ..theme import ThemeManager
 from ..engine import LoanEngine
+from ..exceptions import ChristmasLockedError
 
 
 class LedgerView(QWidget):
@@ -201,19 +203,31 @@ class LedgerView(QWidget):
         # self.layout.addWidget(sidebar_scroll, 1) # OLD
 
         
-        # Main Content Area
+        # Main Content Area — one tab per fund.
+        # Loans tab keeps the existing scroll_area / scroll_layout untouched.
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_content = QWidget()
         self.scroll_layout = QVBoxLayout(self.scroll_content)
         self.scroll_area.setWidget(self.scroll_content)
-        
-        # self.layout.addWidget(self.scroll_area, 3) # OLD
+
+        # Savings/Shares tab gets its own scroll area / layout.
+        savings_scroll = QScrollArea()
+        savings_scroll.setWidgetResizable(True)
+        savings_content = QWidget()
+        self.savings_scroll_layout = QVBoxLayout(savings_content)
+        savings_scroll.setWidget(savings_content)
+
+        self.main_tabs = QTabWidget()
+        self.main_tabs.addTab(self.scroll_area, "Loans")
+        self.main_tabs.addTab(savings_scroll, "Savings / Shares")
+        self.main_tabs.addTab(self._build_christmas_tab(), "Christmas")
+        self.main_tabs.addTab(self._build_benevolent_tab(), "Benevolent")
 
         # === SPLITTER IMPLEMENTATION ===
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(sidebar_scroll)
-        splitter.addWidget(self.scroll_area)
+        splitter.addWidget(self.main_tabs)
         
         # Set Initial Sizes (approx 1:3 ratio)
         splitter.setSizes([300, 900])
@@ -267,8 +281,13 @@ class LedgerView(QWidget):
                 border: 1px solid {t.get_color('border')};
             }}
             QLabel {{ color: {t.get_color('text_primary')}; }}
-            QGroupBox {{ 
-                border: 1px solid {t.get_color('border')}; 
+            QTabWidget::pane {{ border: 1px solid {t.get_color('border')}; }}
+            QTabBar::tab {{ background: {t.get_color('bg_secondary')}; color: {t.get_color('text_primary')}; padding: 8px 16px; border: 1px solid {t.get_color('border')}; }}
+            QTabBar::tab:selected {{ background: {t.get_color('accent')}; color: white; font-weight: bold; }}
+            QTableWidget {{ background-color: {t.get_color('bg_secondary')}; color: {t.get_color('text_primary')}; gridline-color: {t.get_color('border')}; }}
+            QHeaderView::section {{ background-color: {t.get_color('bg_header')}; color: {t.get_color('text_secondary')}; padding: 4px; border: none; border-right: 1px solid {t.get_color('border')}; }}
+            QGroupBox {{
+                border: 1px solid {t.get_color('border')};
                 border-radius: 6px; 
                 margin-top: 10px; 
                 font-weight: bold;
@@ -309,9 +328,12 @@ class LedgerView(QWidget):
     def refresh_table(self):
         if self.current_individual_id is None:
             return
-        
-        for i in reversed(range(self.scroll_layout.count())): 
-            self.scroll_layout.itemAt(i).widget().setParent(None)
+
+        for layout in (self.scroll_layout, self.savings_scroll_layout):
+            for i in reversed(range(layout.count())):
+                w = layout.itemAt(i).widget()
+                if w is not None:
+                    w.setParent(None)
         self.tables = {}
         self.savings_table = None
 
@@ -683,15 +705,269 @@ class LedgerView(QWidget):
             
             savings_layout.addWidget(savings_table)
             savings_box.setLayout(savings_layout)
-            self.scroll_layout.addWidget(savings_box)
-            
+            self.savings_scroll_layout.addWidget(savings_box)
             self.savings_table = savings_table
+
+        # Refresh the two new fund tabs.
+        self.refresh_christmas()
+        self.refresh_benevolent()
 
         name = self.engine.db.get_individual_name(self.current_individual_id)
         self.title_label.setText(f"<b>Ledger for {name} | Total Debt: {total_balance:.2f}</b>")
 
+    # ==================================================================== #
+    # Shared helpers for the fund tabs
+    # ==================================================================== #
+    def _amount_date_dialog(self, title, amount_label="Amount:"):
+        """Small modal: amount + date. Returns (amount, 'YYYY-MM-DD') or None."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        form = QFormLayout(dlg)
+        amt = QDoubleSpinBox()
+        amt.setRange(0.01, 1_000_000_000.0)
+        amt.setGroupSeparatorShown(True)
+        amt.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        date = QDateEdit()
+        date.setCalendarPopup(True)
+        date.setDate(self.main_window.last_operation_date)
+        form.addRow(amount_label, amt)
+        form.addRow("Date:", date)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return amt.value(), date.date().toString("yyyy-MM-dd")
+        return None
 
+    def _populate_fund_table(self, table, df, columns):
+        """columns: list of (header, df_key). 'amount'/'balance' keys are money-formatted."""
+        table.setRowCount(0)
+        if df is None or df.empty:
+            return
+        for _, row in df.iterrows():
+            r = table.rowCount()
+            table.insertRow(r)
+            for c, (_header, key) in enumerate(columns):
+                raw = row.get(key, "")
+                if key in ("amount", "balance"):
+                    item = QTableWidgetItem(f"{float(raw or 0):,.0f}")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item = QTableWidgetItem(str(raw) if raw is not None else "")
+                table.setItem(r, c, item)
+        table.resizeRowsToContents()
 
+    # ==================================================================== #
+    # Christmas fund tab
+    # ==================================================================== #
+    def _build_christmas_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        header = QHBoxLayout()
+        self.christmas_label = QLabel("Christmas Fund — Balance: 0")
+        self.christmas_label.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {self.theme_manager.get_color('success')};")
+        header.addWidget(self.christmas_label)
+        header.addStretch()
+        header.addWidget(QLabel("Monthly:"))
+        self.christmas_monthly_input = QLineEdit("2500")
+        self.christmas_monthly_input.setMaximumWidth(90)
+        header.addWidget(self.christmas_monthly_input)
+
+        deposit_btn = QPushButton("Deposit")
+        deposit_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white;")
+        deposit_btn.clicked.connect(self.christmas_deposit_dialog)
+        withdraw_btn = QPushButton("Withdraw")
+        withdraw_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
+        withdraw_btn.clicked.connect(self.christmas_withdraw_dialog)
+        catchup_btn = QPushButton("Catch Up")
+        catchup_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
+        catchup_btn.clicked.connect(self.christmas_catch_up)
+        for b in (deposit_btn, withdraw_btn, catchup_btn):
+            header.addWidget(b)
+        v.addLayout(header)
+
+        self.christmas_hint = QLabel("")
+        self.christmas_hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        v.addWidget(self.christmas_hint)
+
+        self.christmas_table = QTableWidget()
+        self.christmas_table.setColumnCount(5)
+        self.christmas_table.setHorizontalHeaderLabels(["Date", "Type", "Amount", "Balance", "Notes"])
+        self.christmas_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.christmas_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        v.addWidget(self.christmas_table)
+        return w
+
+    def refresh_christmas(self):
+        if self.current_individual_id is None:
+            return
+        import calendar
+        svc = self.engine.christmas_service
+        bal = svc.get_balance(self.current_individual_id)
+        self.christmas_label.setText(f"Christmas Fund — Balance: {bal:,.0f}")
+        self.christmas_hint.setText(
+            f"Withdrawals are locked until {calendar.month_name[svc.get_unlock_month()]}.")
+        self._populate_fund_table(
+            self.christmas_table, svc.get_transactions(self.current_individual_id),
+            [("Date", "date"), ("Type", "transaction_type"), ("Amount", "amount"),
+             ("Balance", "balance"), ("Notes", "notes")])
+
+    def christmas_deposit_dialog(self):
+        if self.current_individual_id is None:
+            return
+        res = self._amount_date_dialog("Christmas Deposit", "Deposit:")
+        if not res:
+            return
+        amount, date_str = res
+        self.engine.christmas_service.add_deposit(self.current_individual_id, amount, date_str)
+        self.refresh_table()
+
+    def christmas_withdraw_dialog(self):
+        if self.current_individual_id is None:
+            return
+        res = self._amount_date_dialog("Christmas Withdrawal", "Withdraw:")
+        if not res:
+            return
+        amount, date_str = res
+        svc = self.engine.christmas_service
+        try:
+            svc.add_withdrawal(self.current_individual_id, amount, date_str)
+        except ChristmasLockedError as e:
+            override = QMessageBox.question(
+                self, "Withdrawals Locked",
+                f"{e.message}.\n\nOverride and withdraw anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if override != QMessageBox.StandardButton.Yes:
+                return
+            svc.add_withdrawal(self.current_individual_id, amount, date_str, allow_override=True)
+        self.refresh_table()
+
+    def christmas_catch_up(self):
+        if self.current_individual_id is None:
+            return
+        try:
+            monthly = float(self.christmas_monthly_input.text())
+        except ValueError:
+            monthly = 0
+        n = self.engine.christmas_service.catch_up(self.current_individual_id, monthly)
+        self.refresh_table()
+        if n == 0:
+            QMessageBox.information(self, "Catch Up",
+                                   "Nothing to catch up — add an initial deposit first.")
+
+    # ==================================================================== #
+    # Benevolent fund tab
+    # ==================================================================== #
+    def _build_benevolent_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        header = QHBoxLayout()
+        self.benevolent_label = QLabel("Benevolent Fund — Total: 0")
+        self.benevolent_label.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {self.theme_manager.get_color('accent')};")
+        header.addWidget(self.benevolent_label)
+        header.addStretch()
+
+        enrol_btn = QPushButton("Enrol / Edit")
+        enrol_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('accent')}; color: white;")
+        enrol_btn.clicked.connect(self.benevolent_enroll_dialog)
+        deduct_btn = QPushButton("Deduct")
+        deduct_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white;")
+        deduct_btn.clicked.connect(self.benevolent_deduct)
+        catchup_btn = QPushButton("Catch Up")
+        catchup_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
+        catchup_btn.clicked.connect(self.benevolent_catch_up)
+        for b in (enrol_btn, deduct_btn, catchup_btn):
+            header.addWidget(b)
+        v.addLayout(header)
+
+        self.benevolent_info = QLabel("Not enrolled.")
+        self.benevolent_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        v.addWidget(self.benevolent_info)
+
+        self.benevolent_table = QTableWidget()
+        self.benevolent_table.setColumnCount(4)
+        self.benevolent_table.setHorizontalHeaderLabels(["Date", "Amount", "Total", "Notes"])
+        self.benevolent_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.benevolent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        v.addWidget(self.benevolent_table)
+        return w
+
+    def refresh_benevolent(self):
+        if self.current_individual_id is None:
+            return
+        svc = self.engine.benevolent_service
+        total = svc.get_total(self.current_individual_id)
+        self.benevolent_label.setText(f"Benevolent Fund — Total Contributed: {total:,.0f}")
+        acc = svc.get_account(self.current_individual_id)
+        if acc and acc.get('active') and (acc.get('monthly_amount') or 0) > 0:
+            self.benevolent_info.setText(
+                f"Monthly contribution: {acc['monthly_amount']:,.0f}   |   Next due: {acc['next_due_date']}")
+        else:
+            self.benevolent_info.setText("Not enrolled — use 'Enrol / Edit' to set a monthly contribution.")
+        self._populate_fund_table(
+            self.benevolent_table, svc.get_transactions(self.current_individual_id),
+            [("Date", "date"), ("Amount", "amount"), ("Total", "balance"), ("Notes", "notes")])
+
+    def benevolent_enroll_dialog(self):
+        if self.current_individual_id is None:
+            return
+        acc = self.engine.benevolent_service.get_account(self.current_individual_id)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Benevolent Enrolment")
+        form = QFormLayout(dlg)
+        amt = QDoubleSpinBox()
+        amt.setRange(0.0, 1_000_000_000.0)
+        amt.setGroupSeparatorShown(True)
+        amt.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        if acc:
+            amt.setValue(float(acc.get('monthly_amount') or 0))
+        start = QDateEdit()
+        start.setCalendarPopup(True)
+        if acc and acc.get('start_date'):
+            start.setDate(QDate.fromString(acc['start_date'], "yyyy-MM-dd"))
+        else:
+            start.setDate(self.main_window.last_operation_date)
+        form.addRow("Monthly amount:", amt)
+        form.addRow("First contribution:", start)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if amt.value() <= 0:
+            QMessageBox.warning(self, "Invalid", "Monthly amount must be greater than 0.")
+            return
+        self.engine.benevolent_service.enroll(
+            self.current_individual_id, amt.value(), start.date().toString("yyyy-MM-dd"))
+        self.refresh_table()
+
+    def benevolent_deduct(self):
+        if self.current_individual_id is None:
+            return
+        if not self.engine.benevolent_service.is_enrolled(self.current_individual_id):
+            QMessageBox.information(self, "Not Enrolled",
+                                   "Enrol this member in the Benevolent fund first.")
+            return
+        self.engine.benevolent_service.deduct_single(self.current_individual_id)
+        self.refresh_table()
+
+    def benevolent_catch_up(self):
+        if self.current_individual_id is None:
+            return
+        if not self.engine.benevolent_service.is_enrolled(self.current_individual_id):
+            QMessageBox.information(self, "Not Enrolled",
+                                   "Enrol this member in the Benevolent fund first.")
+            return
+        n = self.engine.benevolent_service.catch_up(self.current_individual_id)
+        self.refresh_table()
+        if n == 0:
+            QMessageBox.information(self, "Catch Up", "Already up to date.")
 
     def buyoff_loan_btn(self, loan_ref):
         """Show dialog to buyoff/settle the loan fully."""

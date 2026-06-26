@@ -6,10 +6,13 @@ LoanEngine class to improve separation of concerns.
 
 from .loan_service import LoanService
 from .savings_service import SavingsService
+from .christmas_service import ChristmasService
+from .benevolent_service import BenevolentService
 from .balance_calculator import BalanceRecalculator
 from .transaction_manager import TransactionManager
 from .undo_manager import UndoManager, UndoableCommand, DeleteTransactionCommand, UndoTransactionCommand, LoanSnapshot, TransactionSnapshot
 
-__all__ = ['LoanService', 'SavingsService', 'BalanceRecalculator', 'TransactionManager', 
+__all__ = ['LoanService', 'SavingsService', 'ChristmasService', 'BenevolentService',
+           'BalanceRecalculator', 'TransactionManager',
            'UndoManager', 'UndoableCommand', 'DeleteTransactionCommand', 'UndoTransactionCommand',
            'LoanSnapshot', 'TransactionSnapshot']

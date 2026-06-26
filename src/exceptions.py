@@ -1,4 +1,5 @@
 """Custom exceptions for LoanMaster application."""
+import calendar
 
 
 class LoanMasterError(Exception):
@@ -126,4 +127,15 @@ class UnknownAccountError(LoanMasterError):
         super().__init__(
             f"Account '{account_code}' is not in the chart of accounts",
             {'account_code': account_code},
+        )
+
+
+class ChristmasLockedError(LoanMasterError):
+    """Raised when a Christmas-fund withdrawal is attempted outside the unlock month."""
+
+    def __init__(self, unlock_month: int):
+        month_name = calendar.month_name[unlock_month] if 1 <= unlock_month <= 12 else str(unlock_month)
+        super().__init__(
+            f"Christmas withdrawals are locked until {month_name}",
+            {'unlock_month': unlock_month},
         )

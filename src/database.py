@@ -270,6 +270,37 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE savings ADD COLUMN import_id INTEGER")
         except sqlite3.OperationalError:
             pass
+
+        # ===== Christmas fund (a second savings pot, withdrawals lock outside
+        # the unlock month) and Benevolent fund (perpetual welfare contribution
+        # with a loan-like deduction schedule). Both share the savings-style
+        # ledger shape and the generic fund_* DB methods. =====
+        for fund_table in ("christmas_savings", "benevolent_ledger"):
+            cursor.execute(f"""
+                CREATE TABLE IF NOT EXISTS {fund_table} (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    individual_id INTEGER,
+                    date TEXT,
+                    transaction_type TEXT,  -- Deposit | Withdrawal | Contribution | Interest
+                    amount REAL,
+                    balance REAL,
+                    notes TEXT,
+                    batch_id TEXT,
+                    FOREIGN KEY(individual_id) REFERENCES individuals(id)
+                )
+            """)
+        # Per-member Benevolent enrolment + recurring-deduction schedule.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS benevolent_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                individual_id INTEGER UNIQUE,
+                monthly_amount REAL DEFAULT 0,
+                start_date TEXT,
+                next_due_date TEXT,
+                active INTEGER DEFAULT 1,
+                FOREIGN KEY(individual_id) REFERENCES individuals(id)
+            )
+        """)
             
         # Import History Table
         cursor.execute("""
@@ -1077,6 +1108,96 @@ class DatabaseManager:
                 running_balance -= amount
             cursor.execute("UPDATE savings SET balance=? WHERE id=?", (running_balance, trans_id))
         self.conn.commit()
+
+    # ========== GENERIC FUND LEDGER (Christmas / Benevolent) ==========
+    # A savings-style ledger reused by the Christmas and Benevolent funds.
+    # Table is whitelisted (never user input) so the f-string is injection-safe.
+    _FUND_TABLES = ("christmas_savings", "benevolent_ledger")
+
+    def _fund_table(self, table):
+        if table not in self._FUND_TABLES:
+            raise ValueError(f"Unknown fund table: {table}")
+        return table
+
+    def fund_balance(self, table, individual_id):
+        t = self._fund_table(table)
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT balance FROM {t} WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1",
+                    (individual_id,))
+        row = cur.fetchone()
+        return row[0] if row else 0.0
+
+    def fund_add_transaction(self, table, individual_id, date, transaction_type, amount,
+                             notes="", batch_id=None):
+        """Append a fund transaction with a running balance. Withdrawals reduce
+        the balance; everything else (Deposit/Contribution/Interest) increases it."""
+        t = self._fund_table(table)
+        current = self.fund_balance(table, individual_id)
+        new_balance = round(current - amount, 2) if transaction_type == "Withdrawal" \
+            else round(current + amount, 2)
+        cur = self.conn.cursor()
+        cur.execute(
+            f"INSERT INTO {t} (individual_id, date, transaction_type, amount, balance, notes, batch_id) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
+        self.conn.commit()
+        return new_balance
+
+    def fund_transactions(self, table, individual_id):
+        t = self._fund_table(table)
+        return pd.read_sql_query(
+            f"SELECT * FROM {t} WHERE individual_id=? ORDER BY date, id",
+            self.conn, params=(individual_id,))
+
+    def fund_recalculate(self, table, individual_id):
+        t = self._fund_table(table)
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT id, transaction_type, amount FROM {t} WHERE individual_id=? ORDER BY date ASC, id ASC",
+                    (individual_id,))
+        running = 0.0
+        for tid, ttype, amount in cur.fetchall():
+            running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
+            cur.execute(f"UPDATE {t} SET balance=? WHERE id=?", (running, tid))
+        self.conn.commit()
+
+    def fund_delete_transaction(self, table, trans_id):
+        t = self._fund_table(table)
+        self.conn.cursor().execute(f"DELETE FROM {t} WHERE id=?", (trans_id,))
+        self.conn.commit()
+
+    def fund_delete_batch(self, table, batch_id):
+        t = self._fund_table(table)
+        self.conn.cursor().execute(f"DELETE FROM {t} WHERE batch_id=?", (batch_id,))
+        self.conn.commit()
+
+    # ========== BENEVOLENT ENROLMENT ==========
+
+    def get_benevolent_account(self, individual_id):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, individual_id, monthly_amount, start_date, next_due_date, active "
+                    "FROM benevolent_accounts WHERE individual_id=?", (individual_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip([d[0] for d in cur.description], row))
+
+    def upsert_benevolent_account(self, individual_id, monthly_amount, start_date, next_due_date):
+        cur = self.conn.cursor()
+        if self.get_benevolent_account(individual_id):
+            cur.execute("UPDATE benevolent_accounts SET monthly_amount=?, start_date=?, "
+                        "next_due_date=?, active=1 WHERE individual_id=?",
+                        (monthly_amount, start_date, next_due_date, individual_id))
+        else:
+            cur.execute("INSERT INTO benevolent_accounts (individual_id, monthly_amount, start_date, "
+                        "next_due_date, active) VALUES (?, ?, ?, ?, 1)",
+                        (individual_id, monthly_amount, start_date, next_due_date))
+        self.conn.commit()
+
+    def set_benevolent_next_due(self, individual_id, next_due_date):
+        self.conn.cursor().execute("UPDATE benevolent_accounts SET next_due_date=? WHERE individual_id=?",
+                                   (next_due_date, individual_id))
+        self.conn.commit()
+
     def get_setting(self, key, default=None):
         """Get a setting value."""
         cursor = self.conn.cursor()
