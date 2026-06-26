@@ -118,6 +118,15 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE individuals ADD COLUMN retired_date TEXT")
         except sqlite3.OperationalError:
             pass
+        # Employment status + Provident Fund number
+        try:
+            cursor.execute("ALTER TABLE individuals ADD COLUMN employment_status TEXT DEFAULT 'Active'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE individuals ADD COLUMN pf_no TEXT")
+        except sqlite3.OperationalError:
+            pass
             
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
@@ -423,10 +432,15 @@ class DatabaseManager:
         self.conn.commit()
 
     # Individual operations
-    def add_individual(self, name, phone, email, default_deduction=0):
+    def add_individual(self, name, phone, email, default_deduction=0,
+                       employment_status='Active', pf_no=''):
         cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO individuals (name, phone, email, default_deduction, created_at) VALUES (?, ?, ?, ?, ?)",
-                       (name, phone, email, default_deduction, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        cursor.execute(
+            "INSERT INTO individuals (name, phone, email, default_deduction, created_at, "
+            "employment_status, pf_no) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (name, phone, email, default_deduction,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+             employment_status or 'Active', pf_no or ''))
         self.conn.commit()
         return cursor.lastrowid
 
@@ -456,9 +470,18 @@ class DatabaseManager:
             return dict(zip(cols, row))
         return None
 
-    def update_individual(self, id, name, phone, email):
+    def update_individual(self, id, name, phone, email,
+                          employment_status=None, pf_no=None):
         cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET name=?, phone=?, email=? WHERE id=?", (name, phone, email, id))
+        cursor.execute("UPDATE individuals SET name=?, phone=?, email=? WHERE id=?",
+                       (name, phone, email, id))
+        # Only touch the new fields when supplied, so callers that pass just the
+        # core details don't clobber an existing status / PF number.
+        if employment_status is not None:
+            cursor.execute("UPDATE individuals SET employment_status=? WHERE id=?",
+                           (employment_status, id))
+        if pf_no is not None:
+            cursor.execute("UPDATE individuals SET pf_no=? WHERE id=?", (pf_no, id))
         self.conn.commit()
 
     def update_individual_deduction(self, id, amount):
@@ -950,13 +973,15 @@ class DatabaseManager:
             date_str: Retirement date in YYYY-MM-DD format.
         """
         cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET is_retired=1, retired_date=? WHERE id=?", (date_str, ind_id))
+        cursor.execute("UPDATE individuals SET is_retired=1, retired_date=?, "
+                       "employment_status='Retired' WHERE id=?", (date_str, ind_id))
         self.conn.commit()
 
     def reinstate_individual(self, ind_id):
         """Clear retirement flag for an individual."""
         cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET is_retired=0, retired_date=NULL WHERE id=?", (ind_id,))
+        cursor.execute("UPDATE individuals SET is_retired=0, retired_date=NULL, "
+                       "employment_status='Active' WHERE id=?", (ind_id,))
         self.conn.commit()
 
     def has_outstanding_loans(self, ind_id):

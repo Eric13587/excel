@@ -11,8 +11,12 @@ import re
 
 class IndividualDialog(QDialog):
     """Dialog for adding/editing individual details with input validation."""
-    
-    def __init__(self, parent=None, name="", phone="", email="", mode="add"):
+
+    EMPLOYMENT_STATUSES = ["Active", "Retired", "Resigned", "Terminated",
+                           "Deceased", "Suspended"]
+
+    def __init__(self, parent=None, name="", phone="", email="", mode="add",
+                 employment_status="Active", pf_no=""):
         super().__init__(parent)
         is_edit = mode == "edit"
         self.setWindowTitle("Edit Individual" if is_edit else "Add Individual")
@@ -67,6 +71,23 @@ class IndividualDialog(QDialog):
         email_layout.addWidget(self.email_input)
         email_layout.addWidget(self.email_error)
         self.layout.addRow("Email:", email_layout)
+
+        # PF (Provident Fund) number — optional, free text
+        self.pf_input = QLineEdit(pf_no)
+        self.pf_input.setPlaceholderText("e.g., PF-12345")
+        self.pf_input.setStyleSheet(self._normal_style)
+        self.layout.addRow("PF No:", self.pf_input)
+
+        # Employment status — drives the 'Retired' label automatically when the
+        # retirement flag is set; can also capture Resigned / Deceased / etc.
+        self.status_input = QComboBox()
+        self.status_input.addItems(self.EMPLOYMENT_STATUSES)
+        if employment_status and employment_status in self.EMPLOYMENT_STATUSES:
+            self.status_input.setCurrentText(employment_status)
+        elif employment_status:
+            self.status_input.addItem(employment_status)
+            self.status_input.setCurrentText(employment_status)
+        self.layout.addRow("Employment Status:", self.status_input)
 
         # Real-time validation on text change
         self.name_input.textChanged.connect(self.validate_name)
@@ -143,7 +164,9 @@ class IndividualDialog(QDialog):
         name = " ".join(self.name_input.text().strip().split())
         phone = self.phone_input.text().strip()
         email = self.email_input.text().strip()
-        return name, phone, email
+        employment_status = self.status_input.currentText()
+        pf_no = self.pf_input.text().strip()
+        return name, phone, email, employment_status, pf_no
 
 
 class ImportDialog(QDialog):

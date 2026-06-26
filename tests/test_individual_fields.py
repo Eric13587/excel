@@ -1,0 +1,68 @@
+"""Tests for the employment_status and pf_no individual fields."""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.database import DatabaseManager
+
+
+def _db():
+    return DatabaseManager(os.path.join(tempfile.mkdtemp(), "i.db"))
+
+
+def test_add_individual_stores_status_and_pf():
+    db = _db()
+    ind = db.add_individual("Jane", "0712", "j@x", employment_status="Resigned", pf_no="PF-99")
+    row = db.get_individual(ind)
+    assert row["employment_status"] == "Resigned"
+    assert row["pf_no"] == "PF-99"
+
+
+def test_add_individual_defaults_to_active():
+    db = _db()
+    ind = db.add_individual("Jane", "0", "j@x")
+    assert db.get_individual(ind)["employment_status"] == "Active"
+
+
+def test_update_individual_changes_status_and_pf():
+    db = _db()
+    ind = db.add_individual("Jane", "0", "j@x")
+    db.update_individual(ind, "Jane K", "0722", "jk@x",
+                         employment_status="Suspended", pf_no="PF-1")
+    row = db.get_individual(ind)
+    assert row["name"] == "Jane K"
+    assert row["employment_status"] == "Suspended"
+    assert row["pf_no"] == "PF-1"
+
+
+def test_update_individual_without_fields_preserves_them():
+    db = _db()
+    ind = db.add_individual("Jane", "0", "j@x", employment_status="Resigned", pf_no="PF-7")
+    db.update_individual(ind, "Jane", "0", "j2@x")  # no status/pf passed
+    row = db.get_individual(ind)
+    assert row["employment_status"] == "Resigned"
+    assert row["pf_no"] == "PF-7"
+
+
+def test_retire_sets_status_and_reinstate_clears_it():
+    db = _db()
+    ind = db.add_individual("Jane", "0", "j@x")
+    db.retire_individual(ind, "2026-01-31")
+    row = db.get_individual(ind)
+    assert row["is_retired"] == 1 and row["employment_status"] == "Retired"
+    db.reinstate_individual(ind)
+    row = db.get_individual(ind)
+    assert row["is_retired"] == 0 and row["employment_status"] == "Active"
+
+
+def test_existing_positional_columns_unchanged():
+    """get_individuals returns tuples indexed positionally elsewhere; the new
+    columns must append after is_retired(7)/retired_date(8)."""
+    db = _db()
+    db.add_individual("Jane", "0", "j@x")
+    row = db.get_individuals()[0]
+    # id, name, phone, email, default_deduction, created_at, import_id, is_retired, retired_date, ...
+    assert row[1] == "Jane"
+    assert row[7] == 0  # is_retired still at index 7

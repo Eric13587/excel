@@ -62,7 +62,7 @@ class LoanActionController:
         """
         dialog = dialog_class(self.parent)
         if dialog.exec():
-            name, phone, email = dialog.get_data()
+            name, phone, email, employment_status, pf_no = dialog.get_data()
             if name:
                 # Efficient SQL duplicate check
                 if self.db.individual_name_exists(name):
@@ -74,7 +74,9 @@ class LoanActionController:
                     if confirm == QMessageBox.StandardButton.No:
                         return False
 
-                new_id = self.db.add_individual(name, phone, email)
+                new_id = self.db.add_individual(name, phone, email,
+                                                employment_status=employment_status,
+                                                pf_no=pf_no)
                 if self.on_refresh:
                     self.on_refresh(select_id=new_id)
                 
@@ -99,16 +101,21 @@ class LoanActionController:
         
         ind_id = self.ui_state.get_selected_id()
         card = self.ui_state.selected_card
-        
+        details = self.db.get_individual(ind_id) or {}
+
         dialog = dialog_class(
-            self.parent, card.name, card.phone, 
+            self.parent, card.name, card.phone,
             getattr(card, 'email', ''),
-            mode="edit"
+            mode="edit",
+            employment_status=details.get('employment_status') or 'Active',
+            pf_no=details.get('pf_no') or '',
         )
         if dialog.exec():
-            name, phone, email = dialog.get_data()
+            name, phone, email, employment_status, pf_no = dialog.get_data()
             if name:
-                self.db.update_individual(ind_id, name, phone, email)
+                self.db.update_individual(ind_id, name, phone, email,
+                                          employment_status=employment_status,
+                                          pf_no=pf_no)
                 if self.on_refresh:
                     self.on_refresh(select_id=ind_id)
                 return True
