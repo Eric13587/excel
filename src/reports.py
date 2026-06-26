@@ -572,6 +572,15 @@ class ReportGenerator:
                 if progress_callback:
                     progress_callback(i + 1, total, f"Processing {name}...")
 
+                # Match the savings report: skip members who retired BEFORE this
+                # period; include those who retired during it, so their closing
+                # activity still shows.
+                details = self.db.get_individual(ind_id)
+                if details and details.get('is_retired', 0):
+                    retired_date = details.get('retired_date', '')
+                    if retired_date and retired_date < start_date_str:
+                        continue
+
                 df_tx = self._fund_report_transactions(fund, ind_id)
                 if df_tx.empty:
                     continue

@@ -89,6 +89,28 @@ def test_christmas_quarter_report_has_monthly_columns(env):
     assert row["Sub Total"] == 1500
 
 
+def test_retired_member_excluded_before_period_included_during(env):
+    db, d = env
+    # retired BEFORE the period -> excluded
+    early = db.add_individual("Early", "0", "e@x")
+    ChristmasService(db).add_deposit(early, 1000, "2025-06-01")
+    db.retire_individual(early, "2025-09-01")
+    # retired DURING the period -> included
+    during = db.add_individual("During", "0", "u@x")
+    ChristmasService(db).add_deposit(during, 800, "2026-01-10")
+    db.retire_individual(during, "2026-02-15")
+    # active -> included
+    active = db.add_individual("Active", "0", "a@x")
+    ChristmasService(db).add_deposit(active, 500, "2026-01-20")
+
+    out = os.path.join(d, "r.csv")
+    ok, msg = ReportGenerator(db).generate_fund_report("christmas", out, "2026-01-01", "2026-03-31")
+    assert ok, msg
+    names = set(pd.read_csv(out)["Name"].values)
+    assert "Early" not in names
+    assert {"During", "Active"} <= names
+
+
 def test_custom_end_before_start_errors(env):
     db, d = env
     db.add_individual("Jane", "0", "j@x")
