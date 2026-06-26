@@ -62,7 +62,7 @@ class LoanActionController:
         """
         dialog = dialog_class(self.parent)
         if dialog.exec():
-            name, phone, email, employment_status, pf_no = dialog.get_data()
+            name, phone, email, employment_status, pf_no, id_no = dialog.get_data()
             if name:
                 # Efficient SQL duplicate check
                 if self.db.individual_name_exists(name):
@@ -76,7 +76,7 @@ class LoanActionController:
 
                 new_id = self.db.add_individual(name, phone, email,
                                                 employment_status=employment_status,
-                                                pf_no=pf_no)
+                                                pf_no=pf_no, id_no=id_no)
                 if self.on_refresh:
                     self.on_refresh(select_id=new_id)
                 
@@ -109,13 +109,14 @@ class LoanActionController:
             mode="edit",
             employment_status=details.get('employment_status') or 'Active',
             pf_no=details.get('pf_no') or '',
+            id_no=details.get('id_no') or '',
         )
         if dialog.exec():
-            name, phone, email, employment_status, pf_no = dialog.get_data()
+            name, phone, email, employment_status, pf_no, id_no = dialog.get_data()
             if name:
                 self.db.update_individual(ind_id, name, phone, email,
                                           employment_status=employment_status,
-                                          pf_no=pf_no)
+                                          pf_no=pf_no, id_no=id_no)
                 if self.on_refresh:
                     self.on_refresh(select_id=ind_id)
                 return True

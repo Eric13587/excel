@@ -127,6 +127,10 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE individuals ADD COLUMN pf_no TEXT")
         except sqlite3.OperationalError:
             pass
+        try:
+            cursor.execute("ALTER TABLE individuals ADD COLUMN id_no TEXT")
+        except sqlite3.OperationalError:
+            pass
             
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
@@ -433,14 +437,14 @@ class DatabaseManager:
 
     # Individual operations
     def add_individual(self, name, phone, email, default_deduction=0,
-                       employment_status='Active', pf_no=''):
+                       employment_status='Active', pf_no='', id_no=''):
         cursor = self.conn.cursor()
         cursor.execute(
             "INSERT INTO individuals (name, phone, email, default_deduction, created_at, "
-            "employment_status, pf_no) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "employment_status, pf_no, id_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (name, phone, email, default_deduction,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             employment_status or 'Active', pf_no or ''))
+             employment_status or 'Active', pf_no or '', id_no or ''))
         self.conn.commit()
         return cursor.lastrowid
 
@@ -471,17 +475,19 @@ class DatabaseManager:
         return None
 
     def update_individual(self, id, name, phone, email,
-                          employment_status=None, pf_no=None):
+                          employment_status=None, pf_no=None, id_no=None):
         cursor = self.conn.cursor()
         cursor.execute("UPDATE individuals SET name=?, phone=?, email=? WHERE id=?",
                        (name, phone, email, id))
         # Only touch the new fields when supplied, so callers that pass just the
-        # core details don't clobber an existing status / PF number.
+        # core details don't clobber an existing status / PF / ID number.
         if employment_status is not None:
             cursor.execute("UPDATE individuals SET employment_status=? WHERE id=?",
                            (employment_status, id))
         if pf_no is not None:
             cursor.execute("UPDATE individuals SET pf_no=? WHERE id=?", (pf_no, id))
+        if id_no is not None:
+            cursor.execute("UPDATE individuals SET id_no=? WHERE id=?", (id_no, id))
         self.conn.commit()
 
     def update_individual_deduction(self, id, amount):

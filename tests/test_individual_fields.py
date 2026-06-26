@@ -14,10 +14,12 @@ def _db():
 
 def test_add_individual_stores_status_and_pf():
     db = _db()
-    ind = db.add_individual("Jane", "0712", "j@x", employment_status="Resigned", pf_no="PF-99")
+    ind = db.add_individual("Jane", "0712", "j@x", employment_status="Resigned",
+                            pf_no="PF-99", id_no="12345678")
     row = db.get_individual(ind)
     assert row["employment_status"] == "Resigned"
     assert row["pf_no"] == "PF-99"
+    assert row["id_no"] == "12345678"
 
 
 def test_add_individual_defaults_to_active():
@@ -30,20 +32,23 @@ def test_update_individual_changes_status_and_pf():
     db = _db()
     ind = db.add_individual("Jane", "0", "j@x")
     db.update_individual(ind, "Jane K", "0722", "jk@x",
-                         employment_status="Suspended", pf_no="PF-1")
+                         employment_status="Suspended", pf_no="PF-1", id_no="ID-7")
     row = db.get_individual(ind)
     assert row["name"] == "Jane K"
     assert row["employment_status"] == "Suspended"
     assert row["pf_no"] == "PF-1"
+    assert row["id_no"] == "ID-7"
 
 
 def test_update_individual_without_fields_preserves_them():
     db = _db()
-    ind = db.add_individual("Jane", "0", "j@x", employment_status="Resigned", pf_no="PF-7")
-    db.update_individual(ind, "Jane", "0", "j2@x")  # no status/pf passed
+    ind = db.add_individual("Jane", "0", "j@x", employment_status="Resigned",
+                            pf_no="PF-7", id_no="ID-9")
+    db.update_individual(ind, "Jane", "0", "j2@x")  # no status/pf/id passed
     row = db.get_individual(ind)
     assert row["employment_status"] == "Resigned"
     assert row["pf_no"] == "PF-7"
+    assert row["id_no"] == "ID-9"
 
 
 def test_retire_sets_status_and_reinstate_clears_it():

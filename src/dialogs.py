@@ -16,7 +16,7 @@ class IndividualDialog(QDialog):
                            "Deceased", "Suspended"]
 
     def __init__(self, parent=None, name="", phone="", email="", mode="add",
-                 employment_status="Active", pf_no=""):
+                 employment_status="Active", pf_no="", id_no=""):
         super().__init__(parent)
         is_edit = mode == "edit"
         self.setWindowTitle("Edit Individual" if is_edit else "Add Individual")
@@ -71,6 +71,12 @@ class IndividualDialog(QDialog):
         email_layout.addWidget(self.email_input)
         email_layout.addWidget(self.email_error)
         self.layout.addRow("Email:", email_layout)
+
+        # National ID number — optional, free text
+        self.id_input = QLineEdit(id_no)
+        self.id_input.setPlaceholderText("e.g., 12345678")
+        self.id_input.setStyleSheet(self._normal_style)
+        self.layout.addRow("ID No:", self.id_input)
 
         # PF (Provident Fund) number — optional, free text
         self.pf_input = QLineEdit(pf_no)
@@ -166,7 +172,8 @@ class IndividualDialog(QDialog):
         email = self.email_input.text().strip()
         employment_status = self.status_input.currentText()
         pf_no = self.pf_input.text().strip()
-        return name, phone, email, employment_status, pf_no
+        id_no = self.id_input.text().strip()
+        return name, phone, email, employment_status, pf_no, id_no
 
 
 class ImportDialog(QDialog):
