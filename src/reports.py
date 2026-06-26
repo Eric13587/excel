@@ -526,111 +526,178 @@ class ReportGenerator:
         table = "christmas_savings" if fund == "christmas" else "benevolent_ledger"
         return self.db.fund_transactions(table, ind_id)
 
+    def _fy_end_for_date(self, d):
+        """Last day of the fiscal year containing datetime ``d``."""
+        return self._get_fy_start_date(d) + relativedelta(years=1, days=-1)
+
+    def _months_in_range(self, start_date, end_date):
+        """(label, month_start, next_month_start) per calendar month in [start, end]."""
+        out = []
+        cur = start_date.replace(day=1)
+        last = end_date.replace(day=1)
+        while cur <= last:
+            nxt = cur + relativedelta(months=1)
+            out.append((cur.strftime("%b-%y"), cur.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")))
+            cur = nxt
+        return out
+
+    def _retired_excluded(self, details, period_start_str):
+        """True if a retired member should be dropped: their retirement fiscal
+        year ended before the report period began. Within that FY they stay on
+        (as zero rows)."""
+        if not (details and details.get('is_retired', 0)):
+            return False
+        rd = details.get('retired_date') or ''
+        if not rd:
+            return False
+        fy_end = self._fy_end_for_date(datetime.strptime(rd[:10], "%Y-%m-%d"))
+        return period_start_str > fy_end.strftime("%Y-%m-%d")
+
     def generate_fund_report(self, fund, output_path, start_date_str, end_date_str=None,
                              progress_callback=None):
-        """Savings-style report for a fund (savings / christmas / benevolent).
+        """Report for a fund (savings / christmas / benevolent).
 
-        Quarter mode (end_date_str=None): three monthly columns from the quarter
-        starting at start_date_str. Custom mode (end_date_str given): a single
-        'Contributions' column for the inclusive range [start, end]. Both list one
-        row per member with B/F, contributions, Cash Out, and Grand Total, then a
-        TOTAL row, exported to CSV/PDF/Excel by extension.
+        Custom mode (end_date_str given): one column per calendar month in
+        [start, end] showing deposits that month, laid out as
+        PF No | Name | Employment Status | <months…> | Total (the xmas.xlsx
+        structure). Quarter mode (end_date_str=None): the legacy B/F / 3-month /
+        Cash Out layout. Exported to CSV/PDF/Excel by extension.
         """
         try:
             deposit_types = self._FUND_DEPOSIT_TYPES[fund]
             label = self._FUND_LABELS[fund]
             start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
-            custom = end_date_str is not None
-
-            bf_obj = start_date + relativedelta(days=-1)
-            bf_label = f"B/F {bf_obj.strftime('%d %b %Y')}".upper()
-
-            if custom:
-                end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
-                if end_date < start_date:
-                    return False, "End date is before start date."
-                end_excl = (end_date + relativedelta(days=1)).strftime("%Y-%m-%d")
-                period_start, period_end = start_date, end_date
-                contrib_col = f"Contributions ({start_date.strftime('%d %b %y')}–{end_date.strftime('%d %b %y')})"
-                columns = ["Name", bf_label, contrib_col, "Cash Out", "Grand Total"]
-            else:
-                q_dates = self._get_quarter_dates(start_date)
-                m1_start, m2_start, m3_start, _, m3_next = q_dates
-                period_start, period_end = m1_start, m3_next
-                m1_name, m2_name, m3_name = (m1_start.strftime("%b-%y"), m2_start.strftime("%b-%y"),
-                                             m3_start.strftime("%b-%y"))
-                bounds = [(m1_start.strftime("%Y-%m-%d"), m2_start.strftime("%Y-%m-%d"), m1_name),
-                          (m2_start.strftime("%Y-%m-%d"), m3_start.strftime("%Y-%m-%d"), m2_name),
-                          (m3_start.strftime("%Y-%m-%d"), m3_next.strftime("%Y-%m-%d"), m3_name)]
-                columns = ["Name", bf_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"]
-
-            individuals = self.db.get_individuals()
-            total = len(individuals)
-            report_data = []
-            for i, ind in enumerate(individuals):
-                ind_id, name = ind[0], ind[1]
-                if progress_callback:
-                    progress_callback(i + 1, total, f"Processing {name}...")
-
-                # Match the savings report: skip members who retired BEFORE this
-                # period; include those who retired during it, so their closing
-                # activity still shows.
-                details = self.db.get_individual(ind_id)
-                if details and details.get('is_retired', 0):
-                    retired_date = details.get('retired_date', '')
-                    if retired_date and retired_date < start_date_str:
-                        continue
-
-                df_tx = self._fund_report_transactions(fund, ind_id)
-                if df_tx.empty:
-                    continue
-
-                def period_sum(s, e, types):
-                    mask = (df_tx['date'] >= s) & (df_tx['date'] < e) & \
-                           (df_tx['transaction_type'].isin(types))
-                    return float(df_tx[mask]['amount'].sum()) if mask.any() else 0.0
-
-                bf_txs = df_tx[df_tx['date'] < start_date_str]
-                bf = (bf_txs[bf_txs['transaction_type'].isin(deposit_types)]['amount'].sum()
-                      - bf_txs[bf_txs['transaction_type'] == 'Withdrawal']['amount'].sum()) \
-                    if not bf_txs.empty else 0.0
-                bf = math.ceil(bf)
-
-                if custom:
-                    contrib = math.ceil(period_sum(start_date_str, end_excl, deposit_types))
-                    cashout = math.ceil(period_sum(start_date_str, end_excl, ['Withdrawal']))
-                    if bf == 0 and contrib == 0 and cashout == 0:
-                        continue
-                    report_data.append({"Name": name, bf_label: bf, contrib_col: contrib,
-                                        "Cash Out": cashout, "Grand Total": bf + contrib - cashout})
-                else:
-                    months = [math.ceil(period_sum(s, e, deposit_types)) for s, e, _ in bounds]
-                    cashout = math.ceil(period_sum(bounds[0][0], bounds[2][1], ['Withdrawal']))
-                    if bf == 0 and sum(months) == 0 and cashout == 0:
-                        continue
-                    sub = sum(months)
-                    report_data.append({"Name": name, bf_label: bf, m1_name: months[0],
-                                        m2_name: months[1], m3_name: months[2], "Sub Total": sub,
-                                        "Cash Out": cashout, "Grand Total": bf + sub - cashout})
-
-            df = pd.DataFrame(report_data, columns=columns)
-            if not df.empty:
-                sums = df.select_dtypes(include=['number']).sum()
-                total_row = {col: (sums[col] if col in sums else '') for col in df.columns}
-                total_row["Name"] = "TOTAL"
-                df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
-
-            title = f"{label} Report"
-            if output_path.endswith('.csv'):
-                return self._export_to_csv(df, output_path)
-            if output_path.endswith('.pdf'):
-                return self._export_to_pdf(df, output_path, period_start, period_end, title=title)
-            return self._export_to_excel(df, output_path, sheet_name=title[:31])
-
+            if end_date_str is not None:
+                return self._fund_report_custom(
+                    fund, output_path, start_date, start_date_str, end_date_str,
+                    deposit_types, label, progress_callback)
+            return self._fund_report_quarter(
+                fund, output_path, start_date, start_date_str,
+                deposit_types, label, progress_callback)
         except Exception as e:
             import traceback
             traceback.print_exc()
             return False, str(e)
+
+    def _fund_report_custom(self, fund, output_path, start_date, start_date_str,
+                            end_date_str, deposit_types, label, progress_callback):
+        end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+        if end_date < start_date:
+            return False, "End date is before start date."
+        months = self._months_in_range(start_date, end_date)
+        columns = ["PF No", "Name", "Employment Status"] + [m[0] for m in months] + ["Total"]
+
+        individuals = self.db.get_individuals()
+        total = len(individuals)
+        report_data = []
+        for i, ind in enumerate(individuals):
+            ind_id, name = ind[0], ind[1]
+            if progress_callback:
+                progress_callback(i + 1, total, f"Processing {name}...")
+
+            details = self.db.get_individual(ind_id) or {}
+            if self._retired_excluded(details, start_date_str):
+                continue
+
+            df_tx = self._fund_report_transactions(fund, ind_id)
+            is_participant = (not df_tx.empty) or \
+                (fund == "benevolent" and self.db.get_benevolent_account(ind_id))
+            if not is_participant:
+                continue
+
+            def month_sum(s, e):
+                if df_tx.empty:
+                    return 0.0
+                mask = (df_tx['date'] >= s) & (df_tx['date'] < e) & \
+                       (df_tx['transaction_type'].isin(deposit_types))
+                return float(df_tx[mask]['amount'].sum()) if mask.any() else 0.0
+
+            row = {"PF No": details.get('pf_no') or "", "Name": name,
+                   "Employment Status": details.get('employment_status') or ""}
+            rtotal = 0
+            for (lbl, s, e) in months:
+                v = math.ceil(month_sum(s, e))
+                row[lbl] = v
+                rtotal += v
+            row["Total"] = rtotal
+            report_data.append(row)
+
+        df = pd.DataFrame(report_data, columns=columns)
+        if not df.empty:
+            sums = df.select_dtypes(include=['number']).sum()
+            total_row = {col: (sums[col] if col in sums else '') for col in df.columns}
+            total_row["Name"] = "TOTAL"
+            df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+        title = f"{label} Report"
+        if output_path.endswith('.csv'):
+            return self._export_to_csv(df, output_path)
+        if output_path.endswith('.pdf'):
+            return self._export_to_pdf(df, output_path, start_date, end_date, title=title)
+        return self._export_to_excel(df, output_path, sheet_name=title[:31])
+
+    def _fund_report_quarter(self, fund, output_path, start_date, start_date_str,
+                             deposit_types, label, progress_callback):
+        bf_obj = start_date + relativedelta(days=-1)
+        bf_label = f"B/F {bf_obj.strftime('%d %b %Y')}".upper()
+        q_dates = self._get_quarter_dates(start_date)
+        m1_start, m2_start, m3_start, _, m3_next = q_dates
+        m1_name, m2_name, m3_name = (m1_start.strftime("%b-%y"), m2_start.strftime("%b-%y"),
+                                     m3_start.strftime("%b-%y"))
+        bounds = [(m1_start.strftime("%Y-%m-%d"), m2_start.strftime("%Y-%m-%d"), m1_name),
+                  (m2_start.strftime("%Y-%m-%d"), m3_start.strftime("%Y-%m-%d"), m2_name),
+                  (m3_start.strftime("%Y-%m-%d"), m3_next.strftime("%Y-%m-%d"), m3_name)]
+        columns = ["Name", bf_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"]
+
+        individuals = self.db.get_individuals()
+        total = len(individuals)
+        report_data = []
+        for i, ind in enumerate(individuals):
+            ind_id, name = ind[0], ind[1]
+            if progress_callback:
+                progress_callback(i + 1, total, f"Processing {name}...")
+
+            details = self.db.get_individual(ind_id) or {}
+            if self._retired_excluded(details, start_date_str):
+                continue
+
+            df_tx = self._fund_report_transactions(fund, ind_id)
+            if df_tx.empty:
+                continue
+
+            def period_sum(s, e, types):
+                mask = (df_tx['date'] >= s) & (df_tx['date'] < e) & \
+                       (df_tx['transaction_type'].isin(types))
+                return float(df_tx[mask]['amount'].sum()) if mask.any() else 0.0
+
+            bf_txs = df_tx[df_tx['date'] < start_date_str]
+            bf = (bf_txs[bf_txs['transaction_type'].isin(deposit_types)]['amount'].sum()
+                  - bf_txs[bf_txs['transaction_type'] == 'Withdrawal']['amount'].sum()) \
+                if not bf_txs.empty else 0.0
+            bf = math.ceil(bf)
+
+            months = [math.ceil(period_sum(s, e, deposit_types)) for s, e, _ in bounds]
+            cashout = math.ceil(period_sum(bounds[0][0], bounds[2][1], ['Withdrawal']))
+            if bf == 0 and sum(months) == 0 and cashout == 0:
+                continue
+            sub = sum(months)
+            report_data.append({"Name": name, bf_label: bf, m1_name: months[0],
+                                m2_name: months[1], m3_name: months[2], "Sub Total": sub,
+                                "Cash Out": cashout, "Grand Total": bf + sub - cashout})
+
+        df = pd.DataFrame(report_data, columns=columns)
+        if not df.empty:
+            sums = df.select_dtypes(include=['number']).sum()
+            total_row = {col: (sums[col] if col in sums else '') for col in df.columns}
+            total_row["Name"] = "TOTAL"
+            df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+        title = f"{label} Report"
+        if output_path.endswith('.csv'):
+            return self._export_to_csv(df, output_path)
+        if output_path.endswith('.pdf'):
+            return self._export_to_pdf(df, output_path, m1_start, m3_next, title=title)
+        return self._export_to_excel(df, output_path, sheet_name=title[:31])
 
     def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report'):
         """Export DataFrame to Excel with formatting."""
@@ -652,10 +719,18 @@ class ReportGenerator:
                 # Apply header format
                 for col_num, value in enumerate(df.columns.values):
                     worksheet.write(0, col_num, value, header_fmt)
-                    
-                # Set column widths
-                worksheet.set_column('A:A', 25) # Name
-                worksheet.set_column('B:H', 15, num_fmt)
+
+                # Set column widths (header-driven so dynamic month columns work)
+                text_cols = {"Name", "Employment Status", "PF No"}
+                for col_num, col_name in enumerate(df.columns):
+                    if col_name == "Name":
+                        worksheet.set_column(col_num, col_num, 26)
+                    elif col_name == "Employment Status":
+                        worksheet.set_column(col_num, col_num, 18)
+                    elif col_name == "PF No":
+                        worksheet.set_column(col_num, col_num, 12)
+                    else:
+                        worksheet.set_column(col_num, col_num, 14, num_fmt)
                 
                 # Apply Totals Row Format
                 if not df.empty:

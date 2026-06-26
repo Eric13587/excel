@@ -21,30 +21,28 @@ def env():
     return db, d
 
 
-def _bf_col(df):
-    return [c for c in df.columns if c.startswith("B/F")][0]
-
-
-def test_christmas_custom_report(env):
+def test_christmas_custom_report_monthly_layout(env):
     db, d = env
-    ind = db.add_individual("Jane", "0", "j@x")
+    ind = db.add_individual("Jane", "0", "j@x", pf_no="PF-1")
     c = ChristmasService(db)
-    c.add_deposit(ind, 1000, "2025-12-01")  # before period -> B/F
-    c.add_deposit(ind, 500, "2026-01-15")   # in period
-    c.add_deposit(ind, 500, "2026-02-15")   # in period
+    c.add_deposit(ind, 1000, "2025-12-01")  # before period -> not counted
+    c.add_deposit(ind, 500, "2026-01-15")   # Jan
+    c.add_deposit(ind, 500, "2026-02-15")   # Feb
     out = os.path.join(d, "x.csv")
     ok, msg = ReportGenerator(db).generate_fund_report("christmas", out, "2026-01-01", "2026-02-28")
     assert ok, msg
     df = pd.read_csv(out)
+    # xmas.xlsx structure: PF No | Name | Employment Status | <months> | Total
+    assert list(df.columns) == ["PF No", "Name", "Employment Status", "Jan-26", "Feb-26", "Total"]
     row = df[df["Name"] == "Jane"].iloc[0]
-    assert row[_bf_col(df)] == 1000
-    assert row[[c for c in df.columns if c.startswith("Contributions")][0]] == 1000
-    assert row["Cash Out"] == 0
-    assert row["Grand Total"] == 2000
+    assert str(row["PF No"]) == "PF-1"
+    assert row["Employment Status"] == "Active"
+    assert row["Jan-26"] == 500 and row["Feb-26"] == 500
+    assert row["Total"] == 1000  # the Dec deposit (pre-period) is excluded
     assert "TOTAL" in df["Name"].values
 
 
-def test_benevolent_custom_report_no_cashout(env):
+def test_benevolent_custom_report_monthly(env):
     db, d = env
     ind = db.add_individual("Jane", "0", "j@x")
     b = BenevolentService(db)
@@ -54,24 +52,38 @@ def test_benevolent_custom_report_no_cashout(env):
     ok, msg = ReportGenerator(db).generate_fund_report("benevolent", out, "2026-01-01", "2026-03-31")
     assert ok, msg
     df = pd.read_csv(out)
+    assert list(df.columns) == ["PF No", "Name", "Employment Status", "Jan-26", "Feb-26", "Mar-26", "Total"]
     row = df[df["Name"] == "Jane"].iloc[0]
-    assert row[[c for c in df.columns if c.startswith("Contributions")][0]] == 600
-    assert row["Cash Out"] == 0
-    assert row["Grand Total"] == 600
+    assert row["Jan-26"] == 200 and row["Feb-26"] == 200 and row["Mar-26"] == 200
+    assert row["Total"] == 600
 
 
-def test_savings_custom_report(env):
+def test_savings_custom_report_deposits_only(env):
     db, d = env
     ind = db.add_individual("Jane", "0", "j@x")
     db.add_savings_transaction(ind, "2026-01-10", "Deposit", 2000, "")
-    db.add_savings_transaction(ind, "2026-02-10", "Withdrawal", 500, "")
+    db.add_savings_transaction(ind, "2026-02-10", "Withdrawal", 500, "")  # ignored
     out = os.path.join(d, "s.csv")
     ok, msg = ReportGenerator(db).generate_fund_report("savings", out, "2026-01-01", "2026-03-31")
     assert ok, msg
     df = pd.read_csv(out)
     row = df[df["Name"] == "Jane"].iloc[0]
-    assert row["Cash Out"] == 500
-    assert row["Grand Total"] == 1500  # 0 bf + 2000 - 500
+    assert row["Jan-26"] == 2000
+    assert row["Feb-26"] == 0    # withdrawal excluded (deposits only)
+    assert row["Total"] == 2000
+
+
+def test_custom_report_includes_zero_row_participant(env):
+    """A fund participant with no deposits in the period still appears (zero row)."""
+    db, d = env
+    ind = db.add_individual("Quiet", "0", "q@x")
+    ChristmasService(db).add_deposit(ind, 1000, "2025-03-01")  # participant, but outside period
+    out = os.path.join(d, "z.csv")
+    ok, msg = ReportGenerator(db).generate_fund_report("christmas", out, "2026-01-01", "2026-02-28")
+    assert ok, msg
+    df = pd.read_csv(out)
+    row = df[df["Name"] == "Quiet"].iloc[0]
+    assert row["Jan-26"] == 0 and row["Feb-26"] == 0 and row["Total"] == 0
 
 
 def test_christmas_quarter_report_has_monthly_columns(env):

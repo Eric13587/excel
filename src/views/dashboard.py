@@ -1316,12 +1316,17 @@ class Dashboard(QWidget):
              QMessageBox.warning(self, "Undo", "Failed to undo.")
 
     def _open_fund_report_dialog(self, fund, label):
-        """Report dialog for a savings-style fund, supporting quarter OR custom period."""
+        """Report dialog for a savings-style fund.
+
+        Savings offers Quarter OR Custom; Christmas/Benevolent are custom-only
+        (the monthly PF/Name/Status/months/Total layout).
+        """
         from ..reports import ReportGenerator
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QDialogButtonBox,
                                      QFileDialog, QComboBox, QPushButton, QRadioButton, QDateEdit)
         from PyQt6.QtCore import QDate
         from dateutil.relativedelta import relativedelta
+        from datetime import datetime
         import platform, subprocess, os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
@@ -1331,11 +1336,9 @@ class Dashboard(QWidget):
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
 
+        allow_quarter = (fund == "savings")  # Christmas/Benevolent are custom-only
         rb_quarter = QRadioButton("Quarter")
-        rb_quarter.setChecked(True)
         rb_custom = QRadioButton("Custom period")
-        form.addRow(rb_quarter)
-        form.addRow(rb_custom)
 
         quarter_combo = QComboBox()
         def_dt = generator.get_default_quarter_date()
@@ -1347,12 +1350,22 @@ class Dashboard(QWidget):
             if q_start.year == def_dt.year and q_start.month == def_dt.month:
                 default_idx = i
         quarter_combo.setCurrentIndex(default_idx)
-        form.addRow("Quarter:", quarter_combo)
 
+        if allow_quarter:
+            rb_quarter.setChecked(True)
+            form.addRow(rb_quarter)
+            form.addRow(rb_custom)
+            form.addRow("Quarter:", quarter_combo)
+        else:
+            rb_custom.setChecked(True)
+
+        # Custom period defaults to the current fiscal year.
+        today = QDate.currentDate()
+        fy = generator._get_fy_start_date(datetime(today.year(), today.month(), today.day()))
         from_date = QDateEdit(); from_date.setCalendarPopup(True)
-        from_date.setDate(QDate.currentDate().addMonths(-3))
+        from_date.setDate(QDate(fy.year, fy.month, fy.day))
         to_date = QDateEdit(); to_date.setCalendarPopup(True)
-        to_date.setDate(QDate.currentDate())
+        to_date.setDate(today)
         form.addRow("From:", from_date)
         form.addRow("To:", to_date)
 
