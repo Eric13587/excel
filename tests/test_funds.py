@@ -218,6 +218,23 @@ def test_undo_mass_benevolent_restores_next_due(env):
     assert eng.benevolent_service.get_account(ind)['next_due_date'] == "2026-01-01"
 
 
+def test_mass_christmas_noop_not_recorded_on_undo_stack(env):
+    """A mass run that writes nothing must not shadow the real last undoable op."""
+    from src.engine import LoanEngine
+    db, ind1 = env
+    ind2 = db.add_individual("Bob", "0", "b@x")  # no christmas deposits -> ineligible
+    eng = LoanEngine(db)
+    eng.christmas_service.add_deposit(ind1, 500, "2026-01-01")
+    eng.mass_catch_up_christmas([ind1], target_date="2026-04-01")  # real op (total>0)
+    assert eng.can_undo()
+    desc_before = eng.undo_manager.get_undo_description()
+    _p, total, _e = eng.mass_catch_up_christmas([ind2], target_date="2026-06-01")  # no-op
+    assert total == 0
+    assert eng.undo_manager.get_undo_description() == desc_before  # no-op not recorded
+    eng.undo()  # undoes the REAL op
+    assert eng.christmas_service.get_balance(ind1) == 500
+
+
 def test_christmas_delete_all(env):
     db, ind = env
     svc = ChristmasService(db)

@@ -531,11 +531,16 @@ class MassLoanCatchUpCommand(UndoableCommand):
         processed, total, batch_id, errors = self.service.mass_catch_up_loans(self.items, self.callback, target_date=self.target_date)
         self.batch_id = batch_id
         self.result = (processed, total, errors)
-        return True
-            
+        # Only record on the undo stack if something was actually written, so a
+        # no-op run doesn't shadow the user's real last undoable action.
+        return total > 0
+
     def undo(self) -> bool:
         if not self.batch_id: return False
-        return self.service.revert_batch_loans(self.batch_id)
+        ok = self.service.revert_batch_loans(self.batch_id)
+        if ok:
+            self.batch_id = None  # reverted; redo() re-executes with a fresh batch
+        return bool(ok)
 
 
 class MassSavingsCatchUpCommand(UndoableCommand):
@@ -563,11 +568,14 @@ class MassSavingsCatchUpCommand(UndoableCommand):
         processed, total, batch_id, errors = self.service.mass_catch_up_savings(self.items, self.callback, target_date=self.target_date)
         self.batch_id = batch_id
         self.result = (processed, total, errors)
-        return True
+        return total > 0  # skip recording a no-op run
 
     def undo(self) -> bool:
         if not self.batch_id: return False
-        return self.service.revert_batch_savings(self.batch_id)
+        ok = self.service.revert_batch_savings(self.batch_id)
+        if ok:
+            self.batch_id = None
+        return bool(ok)
 
 
 class _MassFundCatchUpCommand(UndoableCommand):
@@ -601,12 +609,17 @@ class _MassFundCatchUpCommand(UndoableCommand):
             self.items, self.callback, target_date=self.target_date)
         self.batch_id = batch_id
         self.result = (processed, total, errors)
-        return True
+        # Don't occupy the undo slot if nothing was written (e.g. no eligible
+        # members), otherwise Undo would silently revert nothing.
+        return total > 0
 
     def undo(self) -> bool:
         if not self.batch_id:
             return False
-        return self.service.revert_batch(self.batch_id)
+        ok = self.service.revert_batch(self.batch_id)
+        if ok:
+            self.batch_id = None  # reverted; redo() re-runs with a fresh batch
+        return bool(ok)
 
 
 class MassChristmasCatchUpCommand(_MassFundCatchUpCommand):
