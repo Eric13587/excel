@@ -113,7 +113,92 @@ class LoanService:
         self.balance_recalculator.recalculate_balances(individual_id)
         self._recalculate_default_deduction(individual_id)
         return monthly_deduction
-    
+
+    def _suspension_windows(self, individual_id, loan_pk):
+        """Recorded suspension spans for one loan as (start, end) date pairs.
+
+        ``end`` is the resume date for a closed span, the intended resume date
+        for an open one, or None for an indefinite suspension. A due date with
+        ``start <= due < end`` is treated as suspended (no deduction), which
+        matches how statements annotate the same span.
+        """
+        windows = []
+        for s in self.db.get_loan_suspensions(individual_id):
+            if s.get('loan_id') != loan_pk:
+                continue
+            start = s.get('start_date')
+            if not start:
+                continue
+            end = s.get('resumed_date') or s.get('suspend_until')
+            windows.append((str(start)[:10], str(end)[:10] if end else None))
+        return windows
+
+    @staticmethod
+    def _date_in_suspension(date_str, windows):
+        """True if a due date falls inside any suspension window."""
+        d = str(date_str)[:10]
+        for start, end in windows:
+            if d >= start and (end is None or d < end):
+                return True
+        return False
+
+    def has_loan_restructure_events(self, individual_id, loan_ref):
+        """True if the loan has top-ups or buy-offs (a plain rebuild is unsafe)."""
+        cursor = self.db.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
+            "AND event_type IN ('Loan Top-Up', 'Loan Buyoff')",
+            (individual_id, loan_ref))
+        return cursor.fetchone()[0] > 0
+
+    def rebuild_loan_schedule(self, individual_id, loan_ref, target_date=None):
+        """Re-derive a loan's repayment schedule from issue, applying suspensions.
+
+        Wipes the auto-generated repayment/interest rows, resets the loan to its
+        issued state, and re-runs catch-up — which now skips any recorded
+        suspension months (including backdated ones). Used when a past suspension
+        is recorded over months that were already deducted, so the ledger matches
+        the record. Intended for plain monthly-deduction loans; refuses loans
+        with top-ups / buy-offs. Returns the number of deductions re-created.
+        """
+        loan = self.db.get_loan_by_ref(individual_id, loan_ref)
+        if not loan:
+            return 0
+        if self.has_loan_restructure_events(individual_id, loan_ref):
+            raise ValueError(
+                "Cannot auto-rebuild a loan with top-ups or buy-offs; adjust it manually.")
+
+        cursor = self.db.conn.cursor()
+        # Rebuild up to the latest existing deduction (or an explicit target).
+        cursor.execute("SELECT MAX(date) FROM ledger WHERE individual_id=? AND loan_id=? "
+                       "AND event_type='Repayment'", (individual_id, loan_ref))
+        last = cursor.fetchone()[0]
+        limit = target_date or last or datetime.now().strftime("%Y-%m-%d")
+
+        # Wipe auto rows (keep the Loan Issued record).
+        cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=? "
+                       "AND event_type IN ('Repayment', 'Interest Earned')",
+                       (individual_id, loan_ref))
+
+        # Reset to issued state: full principal outstanding, all interest unearned.
+        principal = float(loan.get('principal') or 0)
+        unearned = round(principal * DEFAULT_INTEREST_RATE, 2)
+        cursor.execute("SELECT MIN(date) FROM ledger WHERE individual_id=? AND loan_id=? "
+                       "AND event_type='Loan Issued'", (individual_id, loan_ref))
+        issue = cursor.fetchone()[0] or loan.get('start_date')
+        deduct_same = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+        issue_dt = datetime.strptime(str(issue)[:10], "%Y-%m-%d")
+        next_due = (issue_dt if deduct_same else issue_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
+
+        cursor.execute(
+            "UPDATE loans SET balance=?, interest_balance=0, unearned_interest=?, "
+            "next_due_date=?, status='Active' WHERE id=?",
+            (principal, unearned, next_due, loan['id']))
+        self.db.conn.commit()
+
+        self.balance_recalculator.recalculate_balances(individual_id)
+        return self.catch_up_loan(individual_id, loan_ref, target_date=limit)
+
     def catch_up_loan(self, individual_id, loan_ref, batch_id=None, target_date=None):
         """Perform deductions until loan is caught up to current date (or target date).
         
@@ -204,10 +289,24 @@ class LoanService:
         if not next_due or next_due.strip() == "":
             print(f"Warning: Loan {loan_ref} has invalid next_due_date '{next_due}'. Skipping catch-up.")
             return 0
-        
+
+        # Recorded suspension spans (including backdated/past ones) so the loop
+        # skips deductions for any due month inside a suspension, regardless of
+        # the live is_suspended flag.
+        suspension_windows = self._suspension_windows(individual_id, loan['id'])
+        skipped_count = 0
+
         while sim_loan['next_due_date'] <= limit_date_str:
             # Logic similar to deduct_single_loan but in-memory
-            
+
+            # 0. Skip suspended months: extend the term (advance the due date)
+            #    without accruing interest or taking a deduction.
+            if self._date_in_suspension(sim_loan['next_due_date'], suspension_windows):
+                due_date = datetime.strptime(sim_loan['next_due_date'], "%Y-%m-%d")
+                sim_loan['next_due_date'] = (due_date + relativedelta(months=1)).strftime("%Y-%m-%d")
+                skipped_count += 1
+                continue
+
             # 1. Accrue Interest
             monthly_interest = sim_loan.get('monthly_interest', 0)
             unearned = sim_loan.get('unearned_interest', 0)
@@ -331,7 +430,15 @@ class LoanService:
             # Also update individual deduction if needed (done by recalculate_default_deduction)
             self.balance_recalculator.recalculate_balances(individual_id)
             self._recalculate_default_deduction(individual_id)
-            
+
+        elif skipped_count > 0:
+            # The catch-up window fell entirely inside a suspension: no
+            # deductions, but the term still advances — persist the new due date.
+            cursor = self.db.conn.cursor()
+            cursor.execute("UPDATE loans SET next_due_date=? WHERE id=? AND individual_id=?",
+                           (sim_loan['next_due_date'], loan['id'], individual_id))
+            self.db.conn.commit()
+
         return count
 
     def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None, target_date=None):
@@ -449,6 +556,22 @@ class LoanService:
         # --- Suspension Guard ---
         if loan.get('is_suspended', 0):
             raise LoanSuspendedError(loan_ref, loan.get('suspend_until'))
+
+        # Skip any recorded suspension months so the deduction lands on the first
+        # non-suspended due date (the term extends). Keeps single-deduct
+        # consistent with catch-up and prevents a deduction inside a suspension.
+        windows = self._suspension_windows(individual_id, loan['id'])
+        if windows and self._date_in_suspension(loan['next_due_date'], windows):
+            due = datetime.strptime(loan['next_due_date'], "%Y-%m-%d")
+            for _ in range(600):  # cap guards against an indefinite window
+                if not self._date_in_suspension(due.strftime("%Y-%m-%d"), windows):
+                    break
+                due = due + relativedelta(months=1)
+            loan['next_due_date'] = due.strftime("%Y-%m-%d")
+            cursor = self.db.conn.cursor()
+            cursor.execute("UPDATE loans SET next_due_date=? WHERE id=?",
+                           (loan['next_due_date'], loan['id']))
+            self.db.conn.commit()
 
         previous_state_json = json.dumps(self._capture_loan_state(loan))
         date_str = loan['next_due_date']

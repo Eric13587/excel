@@ -724,37 +724,99 @@ class LedgerView(QWidget):
                 QMessageBox.warning(self, "Error", "Could not process buyoff.")
 
     def suspend_loan_dialog(self, loan_id, loan_ref):
-        """Show dialog to suspend a loan for N months or until a specific date."""
+        """Suspend a loan for N months — ongoing, or backdated as a past event."""
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Suspend Loan {loan_ref}")
-        dialog.setMinimumWidth(320)
-        
+        dialog.setMinimumWidth(360)
+
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(f"Suspend deductions for loan <b>{loan_ref}</b>:"))
-        
+
         form = QFormLayout()
-        
+
+        start_input = QDateEdit()
+        start_input.setCalendarPopup(True)
+        # Default to where the loan actually is (its next due date), so
+        # "suspend for N months" means the loan's next N due months — even when
+        # back-filling a loan whose next due is in the past.
+        loan_info = self.engine.db.get_loan_by_ref(self.current_individual_id, loan_ref)
+        ndd = (loan_info or {}).get('next_due_date')
+        start_qdate = QDate.fromString(ndd, "yyyy-MM-dd") if ndd else QDate()
+        start_input.setDate(start_qdate if start_qdate.isValid() else QDate.currentDate())
+        form.addRow("Suspended from:", start_input)
+
         months_spin = QSpinBox()
-        months_spin.setRange(1, 24)
+        months_spin.setRange(1, 60)
         months_spin.setValue(3)
         form.addRow("Suspend for (months):", months_spin)
-        
+
         layout.addLayout(form)
-        
+
+        hint = QLabel("Tip: choose a past start date to record a suspension that already "
+                      "happened — it will show as a no-deductions period on statements.")
+        hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        
+
         if dialog.exec() == QDialog.DialogCode.Accepted:
             months = months_spin.value()
-            from dateutil.relativedelta import relativedelta
-            until_date = (datetime.now() + relativedelta(months=months)).strftime("%Y-%m-%d")
-            
-            self.engine.db.suspend_loan(loan_id, until_date)
-            QMessageBox.information(self, "Suspended", 
-                f"Loan {loan_ref} suspended until {until_date}.\n"
-                f"Deductions will be skipped for {months} month(s).")
+            start_str = start_input.date().toString("yyyy-MM-dd")
+            end_str = start_input.date().addMonths(months).toString("yyyy-MM-dd")
+            today_str = QDate.currentDate().toString("yyyy-MM-dd")
+
+            # If the window already has deductions, recording a suspension on its
+            # own would only annotate — the existing deductions would contradict
+            # it. Offer to rebuild the schedule so the suspension truly applies.
+            existing = self.engine.db.count_deductions_in_period(
+                self.current_individual_id, loan_ref, start_str, end_str)
+            apply_rebuild = False
+            if existing:
+                ind_id = self.current_individual_id
+                if self.engine.loan_service.has_loan_restructure_events(ind_id, loan_ref):
+                    proceed = QMessageBox.question(self, "Deductions Found in Period",
+                        f"{existing} deduction(s) exist for {loan_ref} between {start_str} and "
+                        f"{end_str}, and this loan has top-ups / buy-offs so it can't be "
+                        f"auto-rebuilt.\n\nRecord the suspension as a note only (it may "
+                        f"contradict those deductions)?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    if proceed != QMessageBox.StandardButton.Yes:
+                        return
+                else:
+                    choice = QMessageBox.question(self, "Apply Suspension to Schedule",
+                        f"There {'is' if existing == 1 else 'are'} {existing} deduction(s) recorded "
+                        f"for {loan_ref} between {start_str} and {end_str}.\n\n"
+                        f"Rebuild the loan's schedule to remove those deductions and apply the "
+                        f"suspension (the loan term extends accordingly)?\n\n"
+                        f"Yes = rebuild and apply    No = just record a note on statements",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        | QMessageBox.StandardButton.Cancel)
+                    if choice == QMessageBox.StandardButton.Cancel:
+                        return
+                    apply_rebuild = (choice == QMessageBox.StandardButton.Yes)
+
+            kind = self.engine.db.record_suspension(loan_id, start_str, end_str, today=today_str)
+
+            if apply_rebuild:
+                try:
+                    self.engine.loan_service.rebuild_loan_schedule(self.current_individual_id, loan_ref)
+                    QMessageBox.information(self, "Suspension Applied",
+                        f"Rebuilt {loan_ref}: deductions for the suspended months were removed "
+                        f"and the loan term extended accordingly.")
+                except ValueError as e:
+                    QMessageBox.warning(self, "Rebuild Skipped", str(e))
+            elif kind == 'historical':
+                QMessageBox.information(self, "Past Suspension Recorded",
+                    f"Recorded a past suspension for {loan_ref} from {start_str} to {end_str}.\n"
+                    f"It will appear as a no-deductions period on statements covering it.")
+            else:
+                QMessageBox.information(self, "Suspended",
+                    f"Loan {loan_ref} suspended from {start_str} until {end_str}.\n"
+                    f"Deductions will be skipped for {months} month(s).")
             self.refresh_table()
             self.refresh_loans_list()
 

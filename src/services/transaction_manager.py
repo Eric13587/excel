@@ -107,7 +107,7 @@ class TransactionManager:
 
         # --- 2c. Cascade Revert (Terms Reset) ---
         if event_type == "Repayment":
-            self.db.unlock_future_interest(loan_ref, trans['date'])
+            self.db.unlock_future_interest(individual_id, loan_ref, trans['date'])
 
         # --- 3. Execute Deletion ---
         self.db.delete_transaction(int(trans_id))
@@ -358,11 +358,13 @@ class TransactionManager:
                     # Update concurrent & future accruals to reflect new rate immediately.
                     try:
                         cursor = self.db.conn.cursor()
+                        # Scope to this member — loan refs (L-001) are not unique
+                        # across individuals.
                         cursor.execute("""
                             UPDATE ledger
                             SET added = ?, is_edited = 1
-                            WHERE loan_id = ? AND event_type = 'Interest Earned' AND date >= ?
-                        """, (new_monthly_interest, loan_ref, current_date))
+                            WHERE individual_id = ? AND loan_id = ? AND event_type = 'Interest Earned' AND date >= ?
+                        """, (new_monthly_interest, individual_id, loan_ref, current_date))
                         
                         # Also persist the New Rate in the Repayment Transaction itself
                         cursor.execute("""

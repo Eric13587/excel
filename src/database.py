@@ -727,14 +727,17 @@ class DatabaseManager:
         """, (monthly_interest, unearned_interest, loan_id))
         self.conn.commit()
 
-    def unlock_future_interest(self, loan_ref, date_str):
-        """Reset is_edited flag for future interest rows, allowing re-simulation."""
+    def unlock_future_interest(self, individual_id, loan_ref, date_str):
+        """Reset is_edited flag for future interest rows, allowing re-simulation.
+
+        Scoped to one member — loan refs (L-001) are not unique across individuals.
+        """
         cursor = self.conn.cursor()
         cursor.execute("""
-            UPDATE ledger 
-            SET is_edited = 0 
-            WHERE loan_id = ? AND event_type = 'Interest Earned' AND date > ?
-        """, (loan_ref, date_str))
+            UPDATE ledger
+            SET is_edited = 0
+            WHERE individual_id = ? AND loan_id = ? AND event_type = 'Interest Earned' AND date > ?
+        """, (individual_id, loan_ref, date_str))
         self.conn.commit()
 
     def update_loan_details(self, loan_id, total_amount, balance, installment, monthly_interest, next_due_date, unearned_interest=None, principal_update=None, interest_balance=None):
@@ -856,6 +859,55 @@ class DatabaseManager:
         )
         cols = [d[0] for d in cursor.description]
         return [dict(zip(cols, r)) for r in cursor.fetchall()]
+
+    def record_suspension(self, loan_id, start_date, end_date, today=None):
+        """Record a suspension span anywhere in time (past, present or future).
+
+        If the span has already ended (``end_date`` on or before today) it is
+        stored as a *closed historical* record only — the loan's live
+        ``is_suspended`` flag is left untouched, because the loan is not
+        suspended now. Otherwise the loan is suspended live until ``end_date``
+        (exactly like ``suspend_loan``), honouring the backdated ``start_date``.
+
+        Returns 'historical' or 'active' so callers can tailor their message.
+        """
+        if today is None:
+            today = datetime.now().strftime("%Y-%m-%d")
+
+        if end_date and end_date <= today:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
+            row = cursor.fetchone()
+            loan_ref = row[0] if row else None
+            individual_id = row[1] if row else None
+            cursor.execute(
+                """INSERT INTO loan_suspensions
+                       (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'resumed', ?)""",
+                (loan_id, individual_id, loan_ref, start_date, end_date, end_date,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            self.conn.commit()
+            return 'historical'
+
+        self.suspend_loan(loan_id, until_date=end_date, start_date=start_date)
+        return 'active'
+
+    def count_deductions_in_period(self, individual_id, loan_ref, start_date, end_date):
+        """Count repayment rows for one member's loan within [start_date, end_date].
+
+        Scoped to individual_id — loan refs (L-001) are not unique across members.
+        Used to warn before recording a 'no-deductions' suspension over a window
+        that already has deductions (which would contradict the statement).
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
+            "AND event_type IN ('Repayment', 'Loan Buyoff') "
+            "AND date >= ? AND date <= ?",
+            (individual_id, loan_ref, start_date, end_date),
+        )
+        return cursor.fetchone()[0]
 
     # ========== RETIREMENT OPERATIONS ==========
 

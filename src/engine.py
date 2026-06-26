@@ -192,8 +192,18 @@ class LoanEngine:
         # Initialize next_due with current value in case loop doesn't run
         next_due = loan['next_due_date']
 
+        # Recorded suspension spans (incl. backdated) so this path skips
+        # suspended months too — same behaviour as catch_up_loan / single deduct.
+        suspension_windows = self.loan_service._suspension_windows(individual_id, loan['id'])
+
         while current_date <= end_date and curr_loan_p_bal > 0:
             date_str = current_date.strftime("%Y-%m-%d")
+
+            # --- Step 0: Skip suspended months (extend term, no deduction) ---
+            if self.loan_service._date_in_suspension(date_str, suspension_windows):
+                current_date = current_date + relativedelta(months=1)
+                next_due = current_date.strftime("%Y-%m-%d")
+                continue
 
             # --- Step 1: Accrue Interest ---
             accrual_amount = min(monthly_interest_accrual, curr_unearned)
@@ -591,10 +601,11 @@ class LoanEngine:
                     
                     print(f"DEBUG: Refreshing Loan Terms -> Installment: {new_installment}, MonthlyInt: {new_monthly_interest}")
                     
-                    # Update Loan Record
+                    # Update Loan Record (scope to this member — loan refs like
+                    # L-001 are NOT unique across individuals).
                     cursor = self.db.conn.cursor()
-                    cursor.execute("UPDATE loans SET installment = ?, monthly_interest = ? WHERE ref = ?", 
-                                   (new_installment, new_monthly_interest, loan_ref))
+                    cursor.execute("UPDATE loans SET installment = ?, monthly_interest = ? WHERE ref = ? AND individual_id = ?",
+                                   (new_installment, new_monthly_interest, loan_ref, individual_id))
                     self.db.conn.commit()
                 else:
                     print(f"DEBUG: Transaction ID {trans_id} NOT FOUND in Ledger DF!")

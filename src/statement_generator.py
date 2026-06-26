@@ -146,6 +146,7 @@ class StatementGenerator:
         fail to parse is skipped rather than failing the whole statement.
         """
         annotations = []
+        seen_texts = set()  # collapse identical spans (e.g. recorded twice)
         for s in suspensions:
             if s.get('loan_ref') != loan_ref:
                 continue
@@ -193,6 +194,10 @@ class StatementGenerator:
                 # Malformed/legacy date on this span — skip it rather than
                 # aborting the entire statement.
                 continue
+
+            if text in seen_texts:
+                continue
+            seen_texts.add(text)
 
             placement = max(start, from_date)
             annotations.append(StatementRow(
