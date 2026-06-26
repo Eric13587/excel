@@ -1749,6 +1749,7 @@ class Dashboard(QWidget):
                 options = {
                     "import_loans": data["import_loans"],
                     "import_savings": data["import_savings"],
+                    "import_funds": data.get("import_funds", False),
                     "date_range": data["date_range"]
                 }
                 

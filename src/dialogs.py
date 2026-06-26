@@ -213,10 +213,14 @@ class ImportDialog(QDialog):
         
         self.chk_savings = QCheckBox("Import Savings History")
         self.chk_savings.setChecked(False)
-        
+
+        self.chk_funds = QCheckBox("Import Christmas & Benevolent Funds")
+        self.chk_funds.setChecked(False)
+
         opts_layout.addWidget(self.chk_individuals)
         opts_layout.addWidget(self.chk_loans)
         opts_layout.addWidget(self.chk_savings)
+        opts_layout.addWidget(self.chk_funds)
         
         # Date Filter
         self.chk_date_filter = QCheckBox("Filter Transactions by Date")
@@ -297,6 +301,7 @@ class ImportDialog(QDialog):
             "file_path": self.selected_file_path,
             "import_loans": self.chk_loans.isChecked(),
             "import_savings": self.chk_savings.isChecked(),
+            "import_funds": self.chk_funds.isChecked(),
             "date_range": date_range
         }
 

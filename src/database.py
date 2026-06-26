@@ -1598,6 +1598,89 @@ class DatabaseManager:
             
         return preview
 
+    def _import_aux_tables(self, src_cur, dest_cur, id_map, loan_id_map, import_id, options):
+        """Import Christmas/Benevolent funds and loan suspensions for the members
+        already mapped in id_map. Uses dest_cur only (no commit), so it composes
+        with the caller's manual import transaction. Returns a stats dict.
+        """
+        stats = {"christmas": 0, "benevolent": 0, "benevolent_accounts": 0, "suspensions": 0}
+        if not id_map:
+            return stats
+
+        def has(name):
+            src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+            return src_cur.fetchone() is not None
+
+        def recalc(table, ind):
+            running = 0.0
+            for rid, ttype, amount in dest_cur.execute(
+                    f"SELECT id, transaction_type, amount FROM {table} WHERE individual_id=? "
+                    f"ORDER BY date, id", (ind,)).fetchall():
+                running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
+                dest_cur.execute(f"UPDATE {table} SET balance=? WHERE id=?", (running, rid))
+
+        if options.get("import_funds", False):
+            for table, key in (("christmas_savings", "christmas"), ("benevolent_ledger", "benevolent")):
+                if not has(table):
+                    continue
+                src_cur.execute(f"SELECT * FROM {table}")
+                cols = [d[0] for d in src_cur.description]
+                affected = set()
+                for tup in src_cur.fetchall():
+                    row = dict(zip(cols, tup))
+                    new = id_map.get(row.get('individual_id'))
+                    if new is None:
+                        continue
+                    dest_cur.execute(
+                        f"INSERT INTO {table} (individual_id, date, transaction_type, amount, "
+                        f"balance, notes, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (new, row.get('date'), row.get('transaction_type'), row.get('amount'),
+                         row.get('balance'), row.get('notes'), row.get('batch_id')))
+                    affected.add(new)
+                    stats[key] += 1
+                for ind in affected:
+                    recalc(table, ind)
+
+            if has("benevolent_accounts"):
+                src_cur.execute("SELECT * FROM benevolent_accounts")
+                cols = [d[0] for d in src_cur.description]
+                for tup in src_cur.fetchall():
+                    row = dict(zip(cols, tup))
+                    new = id_map.get(row.get('individual_id'))
+                    if new is None:
+                        continue
+                    dest_cur.execute(
+                        "INSERT OR REPLACE INTO benevolent_accounts "
+                        "(individual_id, monthly_amount, start_date, next_due_date, active) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (new, row.get('monthly_amount', 0) or 0, row.get('start_date'),
+                         row.get('next_due_date'), row.get('active', 1)))
+                    stats["benevolent_accounts"] += 1
+
+        if options.get("import_loans", False) and has("loan_suspensions"):
+            src_cur.execute("SELECT * FROM loan_suspensions")
+            cols = [d[0] for d in src_cur.description]
+            for tup in src_cur.fetchall():
+                row = dict(zip(cols, tup))
+                new = id_map.get(row.get('individual_id'))
+                if new is None:
+                    continue
+                old_ref = row.get('loan_ref')
+                new_ref = (loan_id_map.get(old_ref, old_ref) if old_ref else old_ref)
+                new_loan_id = None
+                if new_ref:
+                    r = dest_cur.execute("SELECT id FROM loans WHERE individual_id=? AND ref=?",
+                                         (new, new_ref)).fetchone()
+                    new_loan_id = r[0] if r else None
+                dest_cur.execute(
+                    "INSERT INTO loan_suspensions (loan_id, individual_id, loan_ref, start_date, "
+                    "suspend_until, resumed_date, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (new_loan_id, new, new_ref, row.get('start_date'), row.get('suspend_until'),
+                     row.get('resumed_date'), row.get('status', 'active'), row.get('created_at')))
+                stats["suspensions"] += 1
+
+        return stats
+
     def import_selected_data(self, source_db_path, selected_ids, options, progress_callback=None, decision_map=None):
         """
         Import ONLY selected individuals from external database with granular checkpoints.
@@ -1663,11 +1746,20 @@ class DatabaseManager:
             import_id = dest_cur.lastrowid
             
             # Map Source ID -> Dest ID
-            id_map = {} 
+            id_map = {}
+            loan_id_map = {}  # Source Loan Ref -> Dest Loan Ref (set in the loans phase)
             
             # Get current individuals for fallback matching
             dest_cur.execute("SELECT name, id FROM individuals")
             existing_inds = {row[0]: row[1] for row in dest_cur.fetchall()}
+
+            # Track PF/ID numbers already in use so an imported member with a
+            # colliding number doesn't violate the unique indexes (we drop the
+            # clashing field for that member instead of failing the whole import).
+            dest_cur.execute("SELECT pf_no FROM individuals WHERE pf_no IS NOT NULL AND pf_no != ''")
+            existing_pf = {r[0] for r in dest_cur.fetchall()}
+            dest_cur.execute("SELECT id_no FROM individuals WHERE id_no IS NOT NULL AND id_no != ''")
+            existing_id = {r[0] for r in dest_cur.fetchall()}
             
             # Estimate Total Steps
             total_steps = len(src_inds) 
@@ -1723,15 +1815,38 @@ class DatabaseManager:
                         phone = src_ind['phone'] if src_ind['phone'] else ""
                         email = src_ind['email'] if src_ind['email'] else ""
                         keys = src_ind.keys()
+                        def sval(col, default=''):
+                            return src_ind[col] if col in keys and src_ind[col] is not None else default
                         def_ded = src_ind['default_deduction'] if 'default_deduction' in keys and src_ind['default_deduction'] else 0
                         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        
+
+                        # New individual fields (graceful if the source is an older schema)
+                        emp_status = (sval('employment_status', 'Active') or 'Active')
+                        pf_no = (sval('pf_no', '') or '').strip()
+                        id_no = (sval('id_no', '') or '').strip()
+                        is_retired = 1 if sval('is_retired', 0) else 0
+                        retired_date = sval('retired_date', None) or None
+
+                        # Drop a colliding PF/ID rather than fail the import.
+                        if pf_no and pf_no in existing_pf:
+                            errors.append(f"PF '{pf_no}' ({name}) already in use — imported without PF No.")
+                            pf_no = ''
+                        if id_no and id_no in existing_id:
+                            errors.append(f"ID '{id_no}' ({name}) already in use — imported without ID No.")
+                            id_no = ''
+
                         dest_cur.execute("""
-                            INSERT INTO individuals (name, phone, email, default_deduction, created_at, import_id)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (name, phone, email, def_ded, created_at, import_id))
+                            INSERT INTO individuals (name, phone, email, default_deduction, created_at,
+                                                     employment_status, pf_no, id_no, is_retired, retired_date, import_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (name, phone, email, def_ded, created_at,
+                              emp_status, pf_no, id_no, is_retired, retired_date, import_id))
                         new_id = dest_cur.lastrowid
                         id_map[src_id] = new_id
+                        if pf_no:
+                            existing_pf.add(pf_no)
+                        if id_no:
+                            existing_id.add(id_no)
                         stats["individuals"] += 1
                     
                     current_op += 1
@@ -1982,7 +2097,19 @@ class DatabaseManager:
                     stats["savings"] = 0
                     print(f"Import Error (Savings): {e}")
                     pass
-            
+
+            # --- PHASE 4: FUNDS & SUSPENSIONS (best-effort) ---
+            try:
+                if progress_callback:
+                    progress_callback(current_op, total_operations, "Importing funds & suspensions...")
+                aux = self._import_aux_tables(src_cur, dest_cur, id_map, loan_id_map, import_id, options)
+                stats.update(aux)
+                dest_cur.execute("SAVEPOINT aux_imported")
+            except Exception as e:
+                status = "partial"
+                errors.append(f"Failed to import funds/suspensions: {e}")
+                print(f"Import Error (Aux): {e}")
+
             # Update Import History with final stats
             import_details = json.dumps(stats)
             dest_cur.execute("UPDATE import_history SET details = ?, item_count = ? WHERE id = ?", 
