@@ -405,11 +405,22 @@ class Dashboard(QWidget):
         loan_report_action = QAction("Loan Report", self)
         loan_report_action.triggered.connect(self.generate_quarterly_report)
         reports_menu.addAction(loan_report_action)
-        
+
         savings_report_action = QAction("Savings / Shares Report", self)
-        savings_report_action.triggered.connect(self.generate_quarterly_savings_report)
+        savings_report_action.triggered.connect(
+            lambda: self._open_fund_report_dialog("savings", "Savings / Shares"))
         reports_menu.addAction(savings_report_action)
-        
+
+        christmas_report_action = QAction("Christmas Report", self)
+        christmas_report_action.triggered.connect(
+            lambda: self._open_fund_report_dialog("christmas", "Christmas"))
+        reports_menu.addAction(christmas_report_action)
+
+        benevolent_report_action = QAction("Benevolent Report", self)
+        benevolent_report_action.triggered.connect(
+            lambda: self._open_fund_report_dialog("benevolent", "Benevolent"))
+        reports_menu.addAction(benevolent_report_action)
+
         self.reports_btn.setMenu(reports_menu)
         
         self.settings_btn = QPushButton("Settings")
@@ -1303,6 +1314,108 @@ class Dashboard(QWidget):
             self.refresh_list()
         else:
              QMessageBox.warning(self, "Undo", "Failed to undo.")
+
+    def _open_fund_report_dialog(self, fund, label):
+        """Report dialog for a savings-style fund, supporting quarter OR custom period."""
+        from ..reports import ReportGenerator
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QDialogButtonBox,
+                                     QFileDialog, QComboBox, QPushButton, QRadioButton, QDateEdit)
+        from PyQt6.QtCore import QDate
+        from dateutil.relativedelta import relativedelta
+        import platform, subprocess, os
+
+        generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{label} Report")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+
+        rb_quarter = QRadioButton("Quarter")
+        rb_quarter.setChecked(True)
+        rb_custom = QRadioButton("Custom period")
+        form.addRow(rb_quarter)
+        form.addRow(rb_custom)
+
+        quarter_combo = QComboBox()
+        def_dt = generator.get_default_quarter_date()
+        default_idx = 0
+        for i, q_start in enumerate(generator.get_recent_quarters()):
+            m3_end = q_start + relativedelta(months=3, days=-1)
+            quarter_combo.addItem(f"{q_start.strftime('%b %Y')} - {m3_end.strftime('%b %Y')}",
+                                  q_start.strftime("%Y-%m-%d"))
+            if q_start.year == def_dt.year and q_start.month == def_dt.month:
+                default_idx = i
+        quarter_combo.setCurrentIndex(default_idx)
+        form.addRow("Quarter:", quarter_combo)
+
+        from_date = QDateEdit(); from_date.setCalendarPopup(True)
+        from_date.setDate(QDate.currentDate().addMonths(-3))
+        to_date = QDateEdit(); to_date.setCalendarPopup(True)
+        to_date.setDate(QDate.currentDate())
+        form.addRow("From:", from_date)
+        form.addRow("To:", to_date)
+
+        def update_mode():
+            q = rb_quarter.isChecked()
+            quarter_combo.setEnabled(q)
+            from_date.setEnabled(not q)
+            to_date.setEnabled(not q)
+        rb_quarter.toggled.connect(update_mode)
+        update_mode()
+
+        layout.addLayout(form)
+
+        fmt_btn = QPushButton("Format Settings...")
+
+        def open_fmt():
+            from ..dialogs import ExcelFormatDialog
+            ExcelFormatDialog(self.db, self).exec()
+        fmt_btn.clicked.connect(open_fmt)
+        layout.addWidget(fmt_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dialog.accept)
+        btns.rejected.connect(dialog.reject)
+        layout.addWidget(btns)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        custom = rb_custom.isChecked()
+        if custom:
+            start = from_date.date().toString("yyyy-MM-dd")
+            end = to_date.date().toString("yyyy-MM-dd")
+            suggested = f"{label.replace('/', '-')}_Report_{start}_to_{end}.xlsx"
+        else:
+            start = quarter_combo.currentData()
+            end = None
+            suggested = f"{label.replace('/', '-')}_Quarterly_{start}.xlsx"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Report", suggested,
+            "Excel Files (*.xlsx);;PDF Files (*.pdf);;CSV Files (*.csv)")
+        if not path:
+            return
+
+        if fund == "savings" and not custom:
+            success, msg = generator.generate_quarterly_savings_report(start, path)
+        else:
+            success, msg = generator.generate_fund_report(fund, path, start, end)
+
+        if success:
+            QMessageBox.information(self, "Success", f"Report saved to:\n{path}")
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(path)
+                elif platform.system() == 'Darwin':
+                    subprocess.Popen(['open', path])
+                else:
+                    subprocess.Popen(['xdg-open', path])
+            except Exception:
+                pass
+        else:
+            QMessageBox.critical(self, "Error", f"Failed to generate report:\n{msg}")
 
     def generate_quarterly_report(self):
         """Generate quarterly loan interest report."""
