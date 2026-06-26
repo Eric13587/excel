@@ -463,14 +463,16 @@ class StatementGenerator:
     td { padding: 3px 4px; border: 1px solid #ddd; }
     .loan-box { margin-bottom: 12px; }
     .summary-row { margin-top: 15px; padding: 10px; background: #f9f9f9; border-radius: 5px; }
-    .footer { margin-top: 15px; display: flex; align-items: center; justify-content: space-between; font-size: 8px; color: #999; border-top: 1px solid #e0e0e0; padding-top: 8px; }
+    .footer { margin-top: 15px; font-size: 8px; color: #999; border-top: 1px solid #e0e0e0; padding-top: 8px; }
     .footer-text { text-align: left; }
-    .footer-logo { height: 48px; opacity: 0.95; }
 </style>
 </head><body>"""
         
-        company_logo_url = self._get_base64_data_url(config.company_logo_path) if config.company_logo_path else ""
-        logo_html = f'<img src="{company_logo_url}" class="logo">' if company_logo_url else ''
+        # Header logo: a configured company logo, else the bundled SACCO logo,
+        # so the statement is always branded top-left like a letterhead.
+        header_logo_path = config.company_logo_path or self._logo_path
+        header_logo_url = self._get_base64_data_url(header_logo_path) if header_logo_path else ""
+        logo_html = f'<img src="{header_logo_url}" class="logo">' if header_logo_url else ''
         
         html += f"""<div class="header">
     {logo_html}
@@ -594,14 +596,9 @@ class StatementGenerator:
         
         html += "</div>"  # close summary-row
 
-        footer_logo_html = ''
-        footer_logo_url = self._get_base64_data_url(self._logo_path) if self._logo_path else ""
-        if footer_logo_url:
-            footer_logo_html = f'<img src="{footer_logo_url}" class="footer-logo">'
-        
+        # Logo now lives in the header (top-left); footer is text only.
         html += f"""<div class="footer">
     <div class="footer-text">{config.custom_footer} | Statement generated on {datetime.now().strftime('%Y-%m-%d at %H:%M')} | Period: {presentation.period_display}</div>
-    {footer_logo_html}
 </div>
 </body></html>"""
         
