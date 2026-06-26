@@ -141,6 +141,8 @@ Thumbs.db
 # Project Specific
 *.db
 *.db-journal
+*.db.bak
+*.pre-migration-*.bak
 .gemini/
 test_*
 updates.md
