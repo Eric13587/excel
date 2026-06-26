@@ -755,8 +755,75 @@ class LedgerView(QWidget):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item = QTableWidgetItem(str(raw) if raw is not None else "")
+                if c == 0:  # stash the row id for edit/delete
+                    item.setData(Qt.ItemDataRole.UserRole, int(row['id']))
                 table.setItem(r, c, item)
         table.resizeRowsToContents()
+
+    def _fund_selected_id(self, table):
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Selection", "Please select a row first.")
+            return None
+        item = table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _fund_edit_entry(self, table, fund_table):
+        """Edit the selected fund row (date/amount/notes), then recalc + refresh."""
+        trans_id = self._fund_selected_id(table)
+        if trans_id is None:
+            return
+        tx = self.db.fund_get_transaction(fund_table, trans_id)
+        if not tx:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Entry")
+        form = QFormLayout(dlg)
+        date = QDateEdit()
+        date.setCalendarPopup(True)
+        date.setDate(QDate.fromString(str(tx['date'])[:10], "yyyy-MM-dd"))
+        amt = QDoubleSpinBox()
+        amt.setRange(0.0, 1_000_000_000.0)
+        amt.setGroupSeparatorShown(True)
+        amt.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        amt.setValue(float(tx['amount'] or 0))
+        notes = QLineEdit(tx.get('notes') or "")
+        form.addRow("Date:", date)
+        form.addRow("Amount:", amt)
+        form.addRow("Notes:", notes)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.db.fund_update_transaction(fund_table, trans_id,
+                                        date.date().toString("yyyy-MM-dd"), amt.value(), notes.text())
+        self.db.fund_recalculate(fund_table, self.current_individual_id)
+        self.refresh_table()
+
+    def _fund_delete_entry(self, table, fund_table):
+        """Delete the selected fund row, then recalc + refresh."""
+        trans_id = self._fund_selected_id(table)
+        if trans_id is None:
+            return
+        if QMessageBox.question(self, "Confirm", "Delete this entry?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.db.fund_delete_transaction(fund_table, trans_id)
+        self.db.fund_recalculate(fund_table, self.current_individual_id)
+        self.refresh_table()
+
+    def _fund_context_menu(self, position, table, fund_table):
+        menu = QMenu()
+        edit = QAction("Edit Entry", self)
+        edit.triggered.connect(lambda: self._fund_edit_entry(table, fund_table))
+        delete = QAction("Delete Entry", self)
+        delete.triggered.connect(lambda: self._fund_delete_entry(table, fund_table))
+        menu.addAction(edit)
+        menu.addAction(delete)
+        menu.exec(table.viewport().mapToGlobal(position))
 
     # ==================================================================== #
     # Christmas fund tab
@@ -785,7 +852,12 @@ class LedgerView(QWidget):
         catchup_btn = QPushButton("Catch Up")
         catchup_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
         catchup_btn.clicked.connect(self.christmas_catch_up)
-        for b in (deposit_btn, withdraw_btn, catchup_btn):
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(lambda: self._fund_edit_entry(self.christmas_table, "christmas_savings"))
+        delete_btn = QPushButton("Delete")
+        delete_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('warning')}; color: black;")
+        delete_btn.clicked.connect(lambda: self._fund_delete_entry(self.christmas_table, "christmas_savings"))
+        for b in (deposit_btn, withdraw_btn, catchup_btn, edit_btn, delete_btn):
             header.addWidget(b)
         v.addLayout(header)
 
@@ -798,6 +870,10 @@ class LedgerView(QWidget):
         self.christmas_table.setHorizontalHeaderLabels(["Date", "Type", "Amount", "Balance", "Notes"])
         self.christmas_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.christmas_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.christmas_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.christmas_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.christmas_table.customContextMenuRequested.connect(
+            lambda pos: self._fund_context_menu(pos, self.christmas_table, "christmas_savings"))
         v.addWidget(self.christmas_table)
         return w
 
@@ -881,7 +957,12 @@ class LedgerView(QWidget):
         catchup_btn = QPushButton("Catch Up")
         catchup_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('info')}; color: white;")
         catchup_btn.clicked.connect(self.benevolent_catch_up)
-        for b in (enrol_btn, deduct_btn, catchup_btn):
+        edit_btn = QPushButton("Edit")
+        edit_btn.clicked.connect(lambda: self._fund_edit_entry(self.benevolent_table, "benevolent_ledger"))
+        delete_btn = QPushButton("Delete")
+        delete_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('warning')}; color: black;")
+        delete_btn.clicked.connect(lambda: self._fund_delete_entry(self.benevolent_table, "benevolent_ledger"))
+        for b in (enrol_btn, deduct_btn, catchup_btn, edit_btn, delete_btn):
             header.addWidget(b)
         v.addLayout(header)
 
@@ -894,6 +975,10 @@ class LedgerView(QWidget):
         self.benevolent_table.setHorizontalHeaderLabels(["Date", "Amount", "Total", "Notes"])
         self.benevolent_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.benevolent_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.benevolent_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.benevolent_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.benevolent_table.customContextMenuRequested.connect(
+            lambda pos: self._fund_context_menu(pos, self.benevolent_table, "benevolent_ledger"))
         v.addWidget(self.benevolent_table)
         return w
 

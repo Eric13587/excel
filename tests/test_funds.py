@@ -133,6 +133,62 @@ def test_benevolent_recalculate(env):
     assert svc.get_total(ind) == 450.0
 
 
+# --------------------------------------------------------------------------- #
+# Per-row edit / delete (generic fund DB layer)
+# --------------------------------------------------------------------------- #
+def test_fund_update_and_recalculate(env):
+    db, ind = env
+    svc = ChristmasService(db)
+    svc.add_deposit(ind, 1000, "2026-01-01")
+    svc.add_deposit(ind, 500, "2026-02-01")
+    tid = db.fund_transactions("christmas_savings", ind).iloc[0]['id']
+    db.fund_update_transaction("christmas_savings", int(tid), "2026-01-01", 1200, "edited")
+    db.fund_recalculate("christmas_savings", ind)
+    assert svc.get_balance(ind) == 1700.0  # 1200 + 500
+    assert db.fund_get_transaction("christmas_savings", int(tid))['notes'] == "edited"
+
+
+def test_fund_delete_and_recalculate(env):
+    db, ind = env
+    svc = BenevolentService(db)
+    svc.enroll(ind, 200, "2026-01-01")
+    svc.catch_up(ind, target_date="2026-03-01")  # 3 contributions -> 600
+    tid = db.fund_transactions("benevolent_ledger", ind).iloc[1]['id']
+    db.fund_delete_transaction("benevolent_ledger", int(tid))
+    db.fund_recalculate("benevolent_ledger", ind)
+    assert svc.get_total(ind) == 400.0  # one of three removed
+
+
+def test_fund_table_whitelist(env):
+    db, _ = env
+    with pytest.raises(ValueError):
+        db.fund_balance("savings; DROP TABLE loans", 1)
+
+
+# --------------------------------------------------------------------------- #
+# Mass catch-up
+# --------------------------------------------------------------------------- #
+def test_mass_catch_up_christmas(env):
+    db, ind1 = env
+    ind2 = db.add_individual("Bob", "0", "b@x")
+    c = ChristmasService(db)
+    c.add_deposit(ind1, 500, "2026-01-01")  # ind1 has a starting deposit
+    # ind2 has none -> should be skipped (no-op)
+    processed, total, _b, errors = c.mass_catch_up([ind1, ind2], target_date="2026-04-01")
+    assert processed == 1 and total == 3 and errors == []
+    assert c.get_balance(ind2) == 0.0
+
+
+def test_mass_catch_up_benevolent(env):
+    db, ind1 = env
+    ind2 = db.add_individual("Bob", "0", "b@x")
+    b = BenevolentService(db)
+    b.enroll(ind1, 100, "2026-01-01")  # only ind1 enrolled
+    processed, total, _b, errors = b.mass_catch_up([ind1, ind2], target_date="2026-03-01")
+    assert processed == 1 and total == 3
+    assert b.get_total(ind2) == 0.0
+
+
 def test_funds_are_independent_of_savings(env):
     """Christmas/Benevolent must not touch the regular savings pot."""
     db, ind = env

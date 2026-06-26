@@ -492,6 +492,18 @@ class LoanEngine:
         command = MassSavingsCatchUpCommand(self.savings_service, items, progress_callback, target_date=target_date)
         self.undo_manager.execute(command)
         return command.result
+
+    def mass_catch_up_christmas(self, ind_ids_or_objects, progress_callback=None, target_date=None):
+        """Catch up the Christmas fund across many members. Returns
+        (processed, total, batch_id, errors)."""
+        items = [i.property("ind_id") if hasattr(i, "property") else i for i in ind_ids_or_objects]
+        return self.christmas_service.mass_catch_up(items, progress_callback, target_date=target_date)
+
+    def mass_catch_up_benevolent(self, ind_ids_or_objects, progress_callback=None, target_date=None):
+        """Catch up the Benevolent fund across enrolled members. Returns
+        (processed, total, batch_id, errors)."""
+        items = [i.property("ind_id") if hasattr(i, "property") else i for i in ind_ids_or_objects]
+        return self.benevolent_service.mass_catch_up(items, progress_callback, target_date=target_date)
     
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual.

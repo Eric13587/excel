@@ -1170,6 +1170,23 @@ class DatabaseManager:
         self.conn.cursor().execute(f"DELETE FROM {t} WHERE batch_id=?", (batch_id,))
         self.conn.commit()
 
+    def fund_get_transaction(self, table, trans_id):
+        t = self._fund_table(table)
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT id, individual_id, date, transaction_type, amount, notes FROM {t} WHERE id=?",
+                    (trans_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip([d[0] for d in cur.description], row))
+
+    def fund_update_transaction(self, table, trans_id, date, amount, notes):
+        """Edit a fund transaction's date/amount/notes (caller should recalc after)."""
+        t = self._fund_table(table)
+        self.conn.cursor().execute(f"UPDATE {t} SET date=?, amount=?, notes=? WHERE id=?",
+                                   (date, amount, notes, trans_id))
+        self.conn.commit()
+
     # ========== BENEVOLENT ENROLMENT ==========
 
     def get_benevolent_account(self, individual_id):

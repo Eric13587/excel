@@ -427,7 +427,15 @@ class Dashboard(QWidget):
         savings_action = QAction("Mass Savings (Increments)", self)
         savings_action.triggered.connect(self.open_mass_savings_dialog)
         mass_menu.addAction(savings_action)
-        
+
+        christmas_action = QAction("Mass Christmas (Contributions)", self)
+        christmas_action.triggered.connect(self.open_mass_christmas_dialog)
+        mass_menu.addAction(christmas_action)
+
+        benevolent_action = QAction("Mass Benevolent (Deductions)", self)
+        benevolent_action.triggered.connect(self.open_mass_benevolent_dialog)
+        mass_menu.addAction(benevolent_action)
+
         mass_menu.addSeparator()
         
         self.undo_mass_action = QAction("Undo Last Mass Operation", self)
@@ -995,6 +1003,76 @@ class Dashboard(QWidget):
                 QMessageBox.information(self, "Settings Saved", "Settings have been updated successfully.")
             
 
+
+    def open_mass_christmas_dialog(self):
+        self._open_mass_fund_dialog("Mass Christmas Contribution (Catch Up)",
+                                    self.engine.mass_catch_up_christmas, "contributions")
+
+    def open_mass_benevolent_dialog(self):
+        self._open_mass_fund_dialog("Mass Benevolent Deduction (Catch Up)",
+                                    self.engine.mass_catch_up_benevolent, "deductions")
+
+    def _open_mass_fund_dialog(self, title, engine_method, noun):
+        """Catch up a fund across all members up to a chosen date, with progress.
+
+        Members the fund doesn't apply to (no initial deposit / not enrolled) are
+        skipped by the service, so passing every member id is safe.
+        """
+        from PyQt6.QtWidgets import QDateEdit
+        from PyQt6.QtCore import QDate
+        ids = [m[0] for m in self.db.get_individuals()]
+        if not ids:
+            QMessageBox.information(self, "No Members", "There are no members to process.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"Catch up {noun} for all {len(ids)} members, up to:"))
+        form = QFormLayout()
+        date_edit = QDateEdit()
+        date_edit.setCalendarPopup(True)
+        date_edit.setDate(QDate.currentDate())
+        form.addRow("Until (inclusive):", date_edit)
+        layout.addLayout(form)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        tq = date_edit.date()
+        target = datetime(tq.year(), tq.month(), tq.day())
+        progress = QProgressDialog(f"Processing {noun}...", "Cancel", 0, len(ids), self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        def cb(i, _item):
+            if progress.wasCanceled():
+                raise Exception("Operation Canceled by User")
+            progress.setValue(i + 1)
+            QApplication.processEvents()
+
+        try:
+            processed, total, _batch, errors = engine_method(ids, cb, target_date=target)
+        except Exception as e:
+            progress.close()
+            if "Canceled" in str(e):
+                QMessageBox.information(self, "Canceled",
+                                       "Operation canceled. No changes were made (rolled back).")
+            else:
+                QMessageBox.critical(self, "Error", f"An error occurred: {e}")
+            return
+
+        progress.close()
+        if total == 0:
+            QMessageBox.information(self, "Up to Date", "All members are already up to date.")
+        else:
+            QMessageBox.information(self, "Success",
+                                   f"Members updated: {processed}\nTotal {noun} created: {total}")
 
     def open_mass_deduction_dialog(self):
         """Open dialog for Mass Loan Deduction."""
