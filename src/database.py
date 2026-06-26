@@ -131,7 +131,14 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE individuals ADD COLUMN id_no TEXT")
         except sqlite3.OperationalError:
             pass
-            
+        # PF numbers must be unique, but only when set (NULL/'' are exempt so the
+        # many members without a PF number don't collide).
+        try:
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_individuals_pf_no "
+                           "ON individuals(pf_no) WHERE pf_no IS NOT NULL AND pf_no != ''")
+        except sqlite3.OperationalError:
+            pass
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ledger (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -453,6 +460,22 @@ class DatabaseManager:
         cursor = self.conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM individuals WHERE LOWER(name) = LOWER(?)", (name,))
         return cursor.fetchone()[0] > 0
+
+    def pf_no_owner(self, pf_no, exclude_id=None):
+        """Return the name of the individual already using this PF number, or None.
+
+        Empty/blank PF numbers are never considered duplicates.
+        """
+        if not pf_no or not str(pf_no).strip():
+            return None
+        cursor = self.conn.cursor()
+        if exclude_id is not None:
+            cursor.execute("SELECT name FROM individuals WHERE pf_no=? AND id<>?",
+                           (str(pf_no).strip(), exclude_id))
+        else:
+            cursor.execute("SELECT name FROM individuals WHERE pf_no=?", (str(pf_no).strip(),))
+        row = cursor.fetchone()
+        return row[0] if row else None
 
     def get_individuals(self):
         cursor = self.conn.cursor()
