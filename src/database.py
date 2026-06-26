@@ -1170,6 +1170,11 @@ class DatabaseManager:
         self.conn.cursor().execute(f"DELETE FROM {t} WHERE batch_id=?", (batch_id,))
         self.conn.commit()
 
+    def fund_delete_all(self, table, individual_id):
+        t = self._fund_table(table)
+        self.conn.cursor().execute(f"DELETE FROM {t} WHERE individual_id=?", (individual_id,))
+        self.conn.commit()
+
     def fund_get_transaction(self, table, trans_id):
         t = self._fund_table(table)
         cur = self.conn.cursor()

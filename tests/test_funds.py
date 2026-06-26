@@ -218,6 +218,28 @@ def test_undo_mass_benevolent_restores_next_due(env):
     assert eng.benevolent_service.get_account(ind)['next_due_date'] == "2026-01-01"
 
 
+def test_christmas_delete_all(env):
+    db, ind = env
+    svc = ChristmasService(db)
+    svc.add_deposit(ind, 1000, "2026-01-01")
+    svc.add_deposit(ind, 500, "2026-02-01")
+    svc.delete_all(ind)
+    assert svc.get_balance(ind) == 0.0
+    assert svc.get_transactions(ind).empty
+
+
+def test_benevolent_delete_all_resets_schedule(env):
+    db, ind = env
+    svc = BenevolentService(db)
+    svc.enroll(ind, 200, "2026-01-01")
+    svc.catch_up(ind, target_date="2026-04-01")
+    assert svc.get_total(ind) > 0
+    svc.delete_all(ind)
+    assert svc.get_total(ind) == 0.0
+    # schedule reset back to the start date, so catch-up rebuilds from scratch
+    assert svc.get_account(ind)['next_due_date'] == "2026-01-01"
+
+
 def test_funds_are_independent_of_savings(env):
     """Christmas/Benevolent must not touch the regular savings pot."""
     db, ind = env

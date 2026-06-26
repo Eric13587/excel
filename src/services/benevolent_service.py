@@ -44,6 +44,14 @@ class BenevolentService:
     def recalculate(self, individual_id):
         self.db.fund_recalculate(_TABLE, individual_id)
 
+    def delete_all(self, individual_id):
+        """Remove all contributions and reset the schedule back to the start date."""
+        self.db.fund_delete_all(_TABLE, individual_id)
+        acc = self.get_account(individual_id)
+        if acc and acc.get('start_date'):
+            self.db.set_benevolent_next_due(individual_id, acc['start_date'])
+        return True
+
     # ------------------------------------------------------------------ #
     # Deductions
     # ------------------------------------------------------------------ #

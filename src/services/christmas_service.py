@@ -78,6 +78,11 @@ class ChristmasService:
     def recalculate(self, individual_id):
         self.db.fund_recalculate(_TABLE, individual_id)
 
+    def delete_all(self, individual_id):
+        """Remove all Christmas entries for a member."""
+        self.db.fund_delete_all(_TABLE, individual_id)
+        return True
+
     # ------------------------------------------------------------------ #
     # Monthly auto-contribution catch-up (mirrors savings)
     # ------------------------------------------------------------------ #

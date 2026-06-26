@@ -694,6 +694,23 @@ class LedgerView(QWidget):
         menu.addAction(delete)
         menu.exec(table.viewport().mapToGlobal(position))
 
+    def _fund_delete_all(self, fund_table):
+        """Delete every entry for the current member in a fund."""
+        if self.current_individual_id is None:
+            return
+        name = "Christmas" if fund_table == "christmas_savings" else "Benevolent"
+        if QMessageBox.question(
+                self, "Delete All",
+                f"Delete ALL {name} entries for this member? This cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        if fund_table == "christmas_savings":
+            self.engine.christmas_service.delete_all(self.current_individual_id)
+        else:
+            self.engine.benevolent_service.delete_all(self.current_individual_id)
+        self.refresh_table()
+
     def _on_main_tab_changed(self, index):
         """Grey the sidebar loan controls when not on the Loans tab (index 0)."""
         on_loans = (index == 0)
@@ -838,7 +855,10 @@ class LedgerView(QWidget):
         delete_btn = QPushButton("Delete")
         delete_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('warning')}; color: black;")
         delete_btn.clicked.connect(lambda: self._fund_delete_entry(self.christmas_table, "christmas_savings"))
-        for b in (deposit_btn, withdraw_btn, catchup_btn, edit_btn, delete_btn):
+        deleteall_btn = QPushButton("Delete All")
+        deleteall_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
+        deleteall_btn.clicked.connect(lambda: self._fund_delete_all("christmas_savings"))
+        for b in (deposit_btn, withdraw_btn, catchup_btn, edit_btn, delete_btn, deleteall_btn):
             header.addWidget(b)
         v.addLayout(header)
 
@@ -943,7 +963,10 @@ class LedgerView(QWidget):
         delete_btn = QPushButton("Delete")
         delete_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('warning')}; color: black;")
         delete_btn.clicked.connect(lambda: self._fund_delete_entry(self.benevolent_table, "benevolent_ledger"))
-        for b in (enrol_btn, deduct_btn, catchup_btn, edit_btn, delete_btn):
+        deleteall_btn = QPushButton("Delete All")
+        deleteall_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('danger')}; color: white;")
+        deleteall_btn.clicked.connect(lambda: self._fund_delete_all("benevolent_ledger"))
+        for b in (enrol_btn, deduct_btn, catchup_btn, edit_btn, delete_btn, deleteall_btn):
             header.addWidget(b)
         v.addLayout(header)
 
