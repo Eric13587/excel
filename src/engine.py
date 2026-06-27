@@ -121,6 +121,119 @@ class LoanEngine:
     def recalculate_default_deduction(self, individual_id):
         return self.balance_recalculator.recalculate_default_deduction(individual_id)
 
+    # ------------------------------------------------------------------ #
+    # Loan healing — re-derive stored terms for loans created under older
+    # logic (the "delete + recreate to make it behave" problem), so their
+    # transactions compute with current logic. Only simple loans (no top-up /
+    # buy-off / edited repayments) are auto-healable.
+    # ------------------------------------------------------------------ #
+    def _loan_heal_plan(self, individual_id, loan_ref):
+        """Inspect one loan and return what healing it would change.
+
+        Returns a dict with keys: healable(bool), reason(str if not), changes
+        ({field:(old,new)}), contaminated_accruals(int). Pure inspection — no
+        writes. Healable = no top-up/buy-off and no manually-edited repayments,
+        with a parseable 'Loan Issued' note.
+        """
+        import re
+        import math
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT id, total_amount, installment, monthly_interest FROM loans "
+                    "WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
+        lr = cur.fetchone()
+        if not lr:
+            return {"healable": False, "reason": "loan not found"}
+        lid, cur_total, cur_inst, cur_mi = lr
+
+        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
+                    "AND event_type IN ('Loan Top-Up','Loan Buyoff')", (individual_id, loan_ref))
+        if cur.fetchone()[0] > 0:
+            return {"healable": False, "reason": "has top-up/buy-off", "loan_id": lid}
+        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
+                    "AND event_type='Repayment' AND is_edited=1", (individual_id, loan_ref))
+        if cur.fetchone()[0] > 0:
+            return {"healable": False, "reason": "has edited repayments", "loan_id": lid}
+
+        cur.execute("SELECT notes FROM ledger WHERE individual_id=? AND loan_id=? "
+                    "AND event_type='Loan Issued' ORDER BY date, id LIMIT 1", (individual_id, loan_ref))
+        row = cur.fetchone()
+        note = row[0] if row else ""
+        mp = re.search(r"Principal:\s*([\d.]+)", note or "")
+        mi = re.search(r"Total Interest:\s*([\d.]+)", note or "")
+        md = re.search(r"Duration:\s*(\d+)", note or "")
+        if not (mp and mi and md and int(md.group(1)) > 0):
+            return {"healable": False, "reason": "no parseable issue note", "loan_id": lid}
+
+        principal = float(mp.group(1))
+        interest = float(mi.group(1))
+        duration = int(md.group(1))
+        total_amount = principal + interest                      # current creation logic
+        installment = math.ceil(total_amount / duration)
+        monthly_interest = math.ceil(interest / duration)
+
+        changes = {}
+        if round(float(cur_total or 0)) != round(total_amount):
+            changes["total_amount"] = (cur_total, total_amount)
+        if int(cur_inst or 0) != installment:
+            changes["installment"] = (cur_inst, installment)
+        if int(cur_mi or 0) != monthly_interest:
+            changes["monthly_interest"] = (cur_mi, monthly_interest)
+
+        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
+                    "AND event_type='Interest Earned' AND is_edited=1", (individual_id, loan_ref))
+        contaminated = cur.fetchone()[0]
+
+        return {"healable": True, "loan_id": lid, "changes": changes,
+                "contaminated_accruals": contaminated,
+                "derived": {"total_amount": total_amount, "installment": installment,
+                            "monthly_interest": monthly_interest, "unearned_interest": interest}}
+
+    def scan_healable_loans(self):
+        """All active loans needing a heal (stale terms or contaminated accruals).
+
+        Returns a list of dicts: {individual_id, name, ref, changes, contaminated_accruals}.
+        Read-only.
+        """
+        out = []
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT individual_id, ref FROM loans WHERE status='Active' ORDER BY individual_id, ref")
+        for ind, ref in cur.fetchall():
+            plan = self._loan_heal_plan(ind, ref)
+            if plan.get("healable") and (plan["changes"] or plan["contaminated_accruals"]):
+                out.append({"individual_id": ind, "name": self.db.get_individual_name(ind),
+                            "ref": ref, "changes": plan["changes"],
+                            "contaminated_accruals": plan["contaminated_accruals"]})
+        return out
+
+    def heal_loan_terms(self, individual_id, loan_ref):
+        """Re-derive a simple loan's stored terms from its issue note (matching
+        current creation logic), clear contaminated accrual edit-locks, and
+        recompute its ledger. Returns the heal plan applied, or a dict with
+        healable=False. Caller should back up the DB first.
+        """
+        plan = self._loan_heal_plan(individual_id, loan_ref)
+        if not plan.get("healable"):
+            return plan
+        if not plan["changes"] and not plan["contaminated_accruals"]:
+            return {**plan, "applied": False}  # already healthy
+
+        d = plan["derived"]
+        cur = self.db.conn.cursor()
+        cur.execute("UPDATE loans SET total_amount=?, installment=?, monthly_interest=?, "
+                    "unearned_interest=? WHERE id=?",
+                    (d["total_amount"], d["installment"], d["monthly_interest"],
+                     d["unearned_interest"], plan["loan_id"]))
+        # Clear edit-locks the old cross-member bug set on accruals so recalc
+        # re-derives them (safe: simple loans have no legitimate interest edits).
+        cur.execute("UPDATE ledger SET is_edited=0 WHERE individual_id=? AND loan_id=? "
+                    "AND event_type='Interest Earned'", (individual_id, loan_ref))
+        self.db.conn.commit()
+
+        self.balance_recalculator.recalculate_loan_history(individual_id, loan_ref)
+        self.balance_recalculator.recalculate_balances(individual_id)
+        self.balance_recalculator.recalculate_default_deduction(individual_id)
+        return {**plan, "applied": True}
+
 
 
 
