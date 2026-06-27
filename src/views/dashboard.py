@@ -460,6 +460,10 @@ class Dashboard(QWidget):
         repair_action.triggered.connect(self.open_repair_loans_dialog)
         mass_menu.addAction(repair_action)
 
+        activity_action = QAction("Activity Log…", self)
+        activity_action.triggered.connect(self.show_activity_log)
+        mass_menu.addAction(activity_action)
+
         mass_menu.addSeparator()
         
         self.undo_mass_action = QAction("Undo Last Mass Operation", self)
@@ -1757,6 +1761,33 @@ class Dashboard(QWidget):
         dlg = ExcelImportDialog(self.db, self)
         if dlg.exec():
             self.load_individuals()
+
+    def show_activity_log(self):
+        """View the CRUD audit trail (member/loan create/update/delete with dates)."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
+                                     QTableWidgetItem, QHeaderView, QDialogButtonBox)
+        entries = self.db.get_audit_log(limit=1000)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Activity Log")
+        dlg.setMinimumSize(680, 500)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"Most recent {len(entries)} create/update/delete events:"))
+        table = QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["When", "Operation", "Type", "Who / What"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setRowCount(len(entries))
+        for i, e in enumerate(entries):
+            table.setItem(i, 0, QTableWidgetItem(str(e["ts"])))
+            table.setItem(i, 1, QTableWidgetItem(e["operation"]))
+            table.setItem(i, 2, QTableWidgetItem(e["entity"]))
+            table.setItem(i, 3, QTableWidgetItem(str(e["summary"] or "")))
+        layout.addWidget(table)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+        layout.addWidget(bb)
+        dlg.exec()
 
     def open_repair_loans_dialog(self):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""

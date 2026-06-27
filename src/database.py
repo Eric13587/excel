@@ -445,7 +445,110 @@ class DatabaseManager:
             DEFAULT_CHART_OF_ACCOUNTS,
         )
 
+        self._create_audit_infrastructure(cursor)
+
         self.conn.commit()
+
+    def _create_audit_infrastructure(self, cursor):
+        """created_at/updated_at timestamps + an audit_log trail, maintained by
+        triggers so every write is captured regardless of code path.
+
+        Timestamp triggers touch only their own row (cheap). The audit_log
+        records entity-lifecycle events for individuals (all CRUD) and loans
+        (create/delete) — deliberately NOT loan UPDATEs or ledger rows, which
+        churn on every recalculation and would flood the log; the ledger itself
+        already carries dated transaction history.
+        """
+        # 1. Timestamp columns (nullable; populated by triggers).
+        for table, cols in (
+            ("individuals", ["updated_at"]),          # created_at already exists
+            ("loans", ["created_at", "updated_at"]),
+            ("savings", ["created_at"]),
+            ("christmas_savings", ["created_at"]),
+            ("benevolent_ledger", ["created_at"]),
+        ):
+            for col in cols:
+                try:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                except sqlite3.OperationalError:
+                    pass
+
+        # 2. Audit log table.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT,
+                operation TEXT,        -- INSERT | UPDATE | DELETE
+                entity TEXT,           -- individual | loan
+                entity_id INTEGER,
+                summary TEXT
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity, entity_id)")
+
+        # 3. Triggers (recursive_triggers is OFF by default, so these never cascade).
+        trigger_sql = [
+            # created_at on insert (only if the caller didn't set one)
+            """CREATE TRIGGER IF NOT EXISTS trg_loans_created AFTER INSERT ON loans
+               WHEN NEW.created_at IS NULL BEGIN
+                 UPDATE loans SET created_at=datetime('now') WHERE id=NEW.id; END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_savings_created AFTER INSERT ON savings
+               WHEN NEW.created_at IS NULL BEGIN
+                 UPDATE savings SET created_at=datetime('now') WHERE id=NEW.id; END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_xmas_created AFTER INSERT ON christmas_savings
+               WHEN NEW.created_at IS NULL BEGIN
+                 UPDATE christmas_savings SET created_at=datetime('now') WHERE id=NEW.id; END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_benev_created AFTER INSERT ON benevolent_ledger
+               WHEN NEW.created_at IS NULL BEGIN
+                 UPDATE benevolent_ledger SET created_at=datetime('now') WHERE id=NEW.id; END""",
+            # updated_at on update
+            """CREATE TRIGGER IF NOT EXISTS trg_individuals_updated AFTER UPDATE ON individuals
+               BEGIN UPDATE individuals SET updated_at=datetime('now') WHERE id=NEW.id; END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_loans_updated AFTER UPDATE ON loans
+               BEGIN UPDATE loans SET updated_at=datetime('now') WHERE id=NEW.id; END""",
+            # audit_log: individuals (all CRUD)
+            """CREATE TRIGGER IF NOT EXISTS trg_audit_ind_ins AFTER INSERT ON individuals BEGIN
+                 INSERT INTO audit_log(ts,operation,entity,entity_id,summary)
+                 VALUES (datetime('now'),'INSERT','individual',NEW.id,NEW.name); END""",
+            # Only meaningful identity edits — not default_deduction/updated_at churn.
+            """CREATE TRIGGER IF NOT EXISTS trg_audit_ind_upd AFTER UPDATE ON individuals
+               WHEN NEW.name IS NOT OLD.name OR NEW.phone IS NOT OLD.phone
+                 OR NEW.email IS NOT OLD.email OR NEW.pf_no IS NOT OLD.pf_no
+                 OR NEW.id_no IS NOT OLD.id_no
+                 OR NEW.employment_status IS NOT OLD.employment_status
+                 OR NEW.is_retired IS NOT OLD.is_retired BEGIN
+                 INSERT INTO audit_log(ts,operation,entity,entity_id,summary)
+                 VALUES (datetime('now'),'UPDATE','individual',NEW.id,NEW.name); END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_audit_ind_del AFTER DELETE ON individuals BEGIN
+                 INSERT INTO audit_log(ts,operation,entity,entity_id,summary)
+                 VALUES (datetime('now'),'DELETE','individual',OLD.id,OLD.name); END""",
+            # audit_log: loans (create/delete only — UPDATEs churn on recalc)
+            """CREATE TRIGGER IF NOT EXISTS trg_audit_loan_ins AFTER INSERT ON loans BEGIN
+                 INSERT INTO audit_log(ts,operation,entity,entity_id,summary)
+                 VALUES (datetime('now'),'INSERT','loan',NEW.id,NEW.ref); END""",
+            """CREATE TRIGGER IF NOT EXISTS trg_audit_loan_del AFTER DELETE ON loans BEGIN
+                 INSERT INTO audit_log(ts,operation,entity,entity_id,summary)
+                 VALUES (datetime('now'),'DELETE','loan',OLD.id,OLD.ref); END""",
+        ]
+        for sql in trigger_sql:
+            try:
+                cursor.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+
+    def get_audit_log(self, limit=500, entity=None, entity_id=None):
+        """Recent audit entries (most recent first)."""
+        cur = self.conn.cursor()
+        q = "SELECT ts, operation, entity, entity_id, summary FROM audit_log"
+        params = []
+        if entity is not None and entity_id is not None:
+            q += " WHERE entity=? AND entity_id=?"
+            params = [entity, entity_id]
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        cur.execute(q, params)
+        return [dict(zip(["ts", "operation", "entity", "entity_id", "summary"], r))
+                for r in cur.fetchall()]
 
     # Individual operations
     def add_individual(self, name, phone, email, default_deduction=0,
