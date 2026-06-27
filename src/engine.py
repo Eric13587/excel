@@ -149,8 +149,10 @@ class LoanEngine:
                     "AND event_type IN ('Loan Top-Up','Loan Buyoff')", (individual_id, loan_ref))
         if cur.fetchone()[0] > 0:
             return {"healable": False, "reason": "has top-up/buy-off", "loan_id": lid}
+        # Any nonzero is_edited means the repayment was edited/restructured. Some
+        # legacy rows store the amount there instead of 1, so test != 0, not = 1.
         cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Repayment' AND is_edited=1", (individual_id, loan_ref))
+                    "AND event_type='Repayment' AND is_edited<>0", (individual_id, loan_ref))
         if cur.fetchone()[0] > 0:
             return {"healable": False, "reason": "has edited repayments", "loan_id": lid}
 

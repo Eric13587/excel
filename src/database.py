@@ -445,6 +445,15 @@ class DatabaseManager:
             DEFAULT_CHART_OF_ACCOUNTS,
         )
 
+        # Normalise a legacy corruption where an edited repayment stored the
+        # payment AMOUNT in is_edited (e.g. 5857) instead of the flag 1. The
+        # recalculator already treats any nonzero as "edited", so collapsing to 1
+        # changes no behaviour — it just restores the column to its 0/1 domain.
+        try:
+            cursor.execute("UPDATE ledger SET is_edited=1 WHERE is_edited NOT IN (0, 1)")
+        except sqlite3.OperationalError:
+            pass
+
         self._create_audit_infrastructure(cursor)
 
         self.conn.commit()

@@ -78,3 +78,17 @@ def test_edited_repayment_blocks_heal():
     db.conn.commit()
     plan = eng._loan_heal_plan(ind, "L-001")
     assert plan["healable"] is False and "edited repayment" in plan["reason"]
+
+
+def test_corrupt_is_edited_repayment_blocks_heal():
+    """Legacy rows store the amount in is_edited (e.g. 5857) instead of 1; the
+    guard must still treat them as edited and refuse to auto-heal."""
+    db, eng = _env()
+    ind = db.add_individual("Jane", "0", "j@x")
+    eng.add_loan_event(ind, 100000, 12, "2025-01-01")
+    db.conn.execute(
+        "INSERT INTO ledger (individual_id, date, event_type, loan_id, added, deducted, balance, notes, is_edited) "
+        "VALUES (?, '2025-02-01', 'Repayment', 'L-001', 0, 5857, 0, '', 5857)", (ind,))
+    db.conn.commit()
+    plan = eng._loan_heal_plan(ind, "L-001")
+    assert plan["healable"] is False and "edited repayment" in plan["reason"]
