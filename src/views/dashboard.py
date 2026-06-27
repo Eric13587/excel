@@ -684,13 +684,18 @@ class Dashboard(QWidget):
         self.delete_btn.setEnabled(enabled)
         self.retire_btn.setEnabled(enabled)
         
-        # Update retire button text based on selected card's state
+        # Update retire button text/colour; grey out when nothing is selected
+        # (a :disabled rule, since the solid red/green otherwise looks enabled).
+        disabled_css = ("QPushButton:disabled { background-color: "
+                        f"{self.theme_manager.get_color('border')}; "
+                        f"color: {self.theme_manager.get_color('text_secondary')}; }}")
         if self.selected_card and self.selected_card.is_retired:
             self.retire_btn.setText("Reinstate")
-            self.retire_btn.setStyleSheet("background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;")
+            base = "background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;"
         else:
             self.retire_btn.setText("Retire")
-            self.retire_btn.setStyleSheet("background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;")
+            base = "background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;"
+        self.retire_btn.setStyleSheet(f"QPushButton {{ {base} }} {disabled_css}")
 
     def add_individual(self):
         self.loan_controller.add_individual(IndividualDialog)

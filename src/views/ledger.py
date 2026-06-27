@@ -118,62 +118,59 @@ class LedgerView(QWidget):
         self.title_label = QLabel("<b>Ledger</b>")
         sidebar.addWidget(self.title_label)
         
-        sidebar.addWidget(QLabel("<b>Add New Loan</b>"))
+        # All loan controls live in a panel that greys out (whole-panel disabled)
+        # whenever the Loans tab is not the active main tab — see
+        # _on_main_tab_changed. Back/title stay outside it so navigation works.
+        self.loan_panel = QWidget()
+        loan_layout = QVBoxLayout(self.loan_panel)
+        loan_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar.addWidget(self.loan_panel)
+
+        loan_layout.addWidget(QLabel("<b>Add New Loan</b>"))
         self.amount_input = QLineEdit(placeholderText="Principal Amount")
         self.duration_input = QLineEdit(placeholderText="Duration (Months)")
-        
+
         # Principal input with calculator button
         principal_layout = QHBoxLayout()
-        sidebar.addWidget(QLabel("Principal:"))
+        loan_layout.addWidget(QLabel("Principal:"))
         principal_layout.addWidget(self.amount_input)
         calc_btn = QPushButton("?")
         calc_btn.setMaximumWidth(30)
         calc_btn.setToolTip("Calculate principal from deduction")
         calc_btn.clicked.connect(self.calculate_principal_dialog)
         principal_layout.addWidget(calc_btn)
-        sidebar.addLayout(principal_layout)
-        
-        sidebar.addWidget(QLabel("Duration (Months):"))
-        sidebar.addWidget(self.duration_input)
-        sidebar.addWidget(QLabel("Interest Rate (%):"))
+        loan_layout.addLayout(principal_layout)
+
+        loan_layout.addWidget(QLabel("Duration (Months):"))
+        loan_layout.addWidget(self.duration_input)
+        loan_layout.addWidget(QLabel("Interest Rate (%):"))
         self.interest_input = QLineEdit(placeholderText="Default: 15")
-        sidebar.addWidget(self.interest_input)
-        sidebar.addWidget(QLabel("Date:"))
+        loan_layout.addWidget(self.interest_input)
+        loan_layout.addWidget(QLabel("Date:"))
         self.date_input = QDateEdit()
         self.date_input.setCalendarPopup(True)
         self.date_input.setDate(self.main_window.last_operation_date)
-        sidebar.addWidget(self.date_input)
-        
+        loan_layout.addWidget(self.date_input)
+
         loan_btn = QPushButton("Issue Loan")
-        loan_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('success')}; color: white; font-weight: bold;")
+        # :disabled rule so the styled button greys with the rest of the panel.
+        loan_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {self.theme_manager.get_color('success')}; "
+            f"color: white; font-weight: bold; }}"
+            f"QPushButton:disabled {{ background-color: {self.theme_manager.get_color('border')}; "
+            f"color: {self.theme_manager.get_color('text_secondary')}; }}")
         loan_btn.clicked.connect(self.process_loan)
-        sidebar.addWidget(loan_btn)
+        loan_layout.addWidget(loan_btn)
 
-        # Loan controls live in the shared sidebar; greyed out when not on the
-        # Loans tab (see _on_main_tab_changed).
-        self._loan_controls = [self.amount_input, self.duration_input, self.interest_input,
-                               self.date_input, loan_btn, calc_btn]
-
-        
-        sidebar.addWidget(QLabel("<b>Active Loans</b>"))
+        loan_layout.addWidget(QLabel("<b>Active Loans</b>"))
         self.loans_list = QListWidget()
         # Set fixed height for list widget to avoid it taking all space in scroll area
         self.loans_list.setMinimumHeight(100)
         self.loans_list.setMaximumHeight(150)
-        sidebar.addWidget(self.loans_list)
-        
-        sidebar.addSpacing(20)
-        sidebar.addWidget(QLabel("<b>Actions</b>"))
-        
+        loan_layout.addWidget(self.loans_list)
 
-
-
-        
- 
-
-        
-
-        
+        loan_layout.addSpacing(20)
+        loan_layout.addWidget(QLabel("<b>Actions</b>"))
 
         # Savings/Shares controls now live in the Savings tab header
         # (see _build_savings_tab), keeping the sidebar loan-only.
@@ -712,10 +709,9 @@ class LedgerView(QWidget):
         self.refresh_table()
 
     def _on_main_tab_changed(self, index):
-        """Grey the sidebar loan controls when not on the Loans tab (index 0)."""
-        on_loans = (index == 0)
-        for ctrl in getattr(self, '_loan_controls', []):
-            ctrl.setEnabled(on_loans)
+        """Grey the whole loan sidebar panel when not on the Loans tab (index 0)."""
+        if hasattr(self, 'loan_panel'):
+            self.loan_panel.setEnabled(index == 0)
 
     # ==================================================================== #
     # Savings / Shares tab (controls moved here from the sidebar)
