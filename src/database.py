@@ -560,15 +560,30 @@ class DatabaseManager:
                 for r in cur.fetchall()]
 
     # Individual operations
+    @staticmethod
+    def _retirement_for_status(status, existing_retired_date=None):
+        """Derive (is_retired, retired_date) from an employment status.
+
+        Every status except 'Active' is treated as retired/inactive (mirrors the
+        retirement flag), keeping an existing retirement date if one is set,
+        otherwise stamping today. 'Active' clears the flag.
+        """
+        if (status or 'Active') == 'Active':
+            return 0, None
+        return 1, (existing_retired_date or datetime.now().strftime("%Y-%m-%d"))
+
     def add_individual(self, name, phone, email, default_deduction=0,
                        employment_status='Active', pf_no='', id_no=''):
         cursor = self.conn.cursor()
+        status = employment_status or 'Active'
+        is_retired, retired_date = self._retirement_for_status(status)
         cursor.execute(
             "INSERT INTO individuals (name, phone, email, default_deduction, created_at, "
-            "employment_status, pf_no, id_no) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "employment_status, pf_no, id_no, is_retired, retired_date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, phone, email, default_deduction,
              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             employment_status or 'Active', pf_no or '', id_no or ''))
+             status, pf_no or '', id_no or '', is_retired, retired_date))
         self.conn.commit()
         return cursor.lastrowid
 
@@ -638,8 +653,14 @@ class DatabaseManager:
         # Only touch the new fields when supplied, so callers that pass just the
         # core details don't clobber an existing status / PF / ID number.
         if employment_status is not None:
-            cursor.execute("UPDATE individuals SET employment_status=? WHERE id=?",
-                           (employment_status, id))
+            # Setting the status also drives the retirement flag: any non-Active
+            # status retires the member; 'Active' reinstates them.
+            row = cursor.execute("SELECT retired_date FROM individuals WHERE id=?", (id,)).fetchone()
+            is_retired, retired_date = self._retirement_for_status(
+                employment_status, row[0] if row else None)
+            cursor.execute(
+                "UPDATE individuals SET employment_status=?, is_retired=?, retired_date=? WHERE id=?",
+                (employment_status, is_retired, retired_date, id))
         if pf_no is not None:
             cursor.execute("UPDATE individuals SET pf_no=? WHERE id=?", (pf_no, id))
         if id_no is not None:

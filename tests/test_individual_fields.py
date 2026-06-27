@@ -53,6 +53,35 @@ def test_update_individual_without_fields_preserves_them():
     assert row["id_no"] == "ID-9"
 
 
+def test_status_drives_retire_flag_on_add():
+    db = _db()
+    resigned = db.add_individual("R", "0", "r@x", employment_status="Resigned")
+    active = db.add_individual("A", "0", "a@x", employment_status="Active")
+    r = db.get_individual(resigned)
+    assert r["is_retired"] == 1 and r["retired_date"]      # non-Active -> retired
+    assert db.get_individual(active)["is_retired"] == 0     # Active -> not retired
+
+
+def test_status_drives_retire_flag_on_update():
+    db = _db()
+    ind = db.add_individual("Jane", "0", "j@x")             # Active
+    assert db.get_individual(ind)["is_retired"] == 0
+
+    db.update_individual(ind, "Jane", "0", "j@x", employment_status="Terminated")
+    row = db.get_individual(ind)
+    assert row["is_retired"] == 1 and row["retired_date"]
+
+    # changing among non-Active statuses keeps the original retirement date
+    first_date = row["retired_date"]
+    db.update_individual(ind, "Jane", "0", "j@x", employment_status="Deceased")
+    assert db.get_individual(ind)["retired_date"] == first_date
+
+    # back to Active clears the flag + date
+    db.update_individual(ind, "Jane", "0", "j@x", employment_status="Active")
+    row = db.get_individual(ind)
+    assert row["is_retired"] == 0 and row["retired_date"] is None
+
+
 def test_retire_sets_status_and_reinstate_clears_it():
     db = _db()
     ind = db.add_individual("Jane", "0", "j@x")
