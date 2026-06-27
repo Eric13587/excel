@@ -183,8 +183,14 @@ class LoanEngine:
                     "AND event_type='Interest Earned' AND is_edited=1", (individual_id, loan_ref))
         contaminated = cur.fetchone()[0]
 
+        # monthly_interest is re-derived dynamically by recalc (and legitimately
+        # drifts from the static note formula), so it is NOT a heal trigger on its
+        # own — only the static terms and contaminated accruals are.
+        needs_heal = ("total_amount" in changes or "installment" in changes
+                      or contaminated > 0)
+
         return {"healable": True, "loan_id": lid, "changes": changes,
-                "contaminated_accruals": contaminated,
+                "needs_heal": needs_heal, "contaminated_accruals": contaminated,
                 "derived": {"total_amount": total_amount, "installment": installment,
                             "monthly_interest": monthly_interest, "unearned_interest": interest}}
 
@@ -199,7 +205,7 @@ class LoanEngine:
         cur.execute("SELECT individual_id, ref FROM loans WHERE status='Active' ORDER BY individual_id, ref")
         for ind, ref in cur.fetchall():
             plan = self._loan_heal_plan(ind, ref)
-            if plan.get("healable") and (plan["changes"] or plan["contaminated_accruals"]):
+            if plan.get("healable") and plan.get("needs_heal"):
                 out.append({"individual_id": ind, "name": self.db.get_individual_name(ind),
                             "ref": ref, "changes": plan["changes"],
                             "contaminated_accruals": plan["contaminated_accruals"]})
@@ -214,8 +220,8 @@ class LoanEngine:
         plan = self._loan_heal_plan(individual_id, loan_ref)
         if not plan.get("healable"):
             return plan
-        if not plan["changes"] and not plan["contaminated_accruals"]:
-            return {**plan, "applied": False}  # already healthy
+        if not plan.get("needs_heal"):
+            return {**plan, "applied": False}  # already healthy (static terms OK)
 
         d = plan["derived"]
         cur = self.db.conn.cursor()

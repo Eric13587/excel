@@ -455,6 +455,12 @@ class Dashboard(QWidget):
         mass_menu.addAction(benevolent_action)
 
         mass_menu.addSeparator()
+
+        repair_action = QAction("Repair Loans (legacy terms)…", self)
+        repair_action.triggered.connect(self.open_repair_loans_dialog)
+        mass_menu.addAction(repair_action)
+
+        mass_menu.addSeparator()
         
         self.undo_mass_action = QAction("Undo Last Mass Operation", self)
         self.undo_mass_action.triggered.connect(self.undo_mass_operation)
@@ -1751,6 +1757,88 @@ class Dashboard(QWidget):
         dlg = ExcelImportDialog(self.db, self)
         if dlg.exec():
             self.load_individuals()
+
+    def open_repair_loans_dialog(self):
+        """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
+                                     QTableWidgetItem, QHeaderView, QDialogButtonBox, QProgressDialog)
+        import shutil
+        from datetime import datetime
+
+        healable = self.engine.scan_healable_loans()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Repair Loans")
+        dlg.setMinimumSize(640, 460)
+        layout = QVBoxLayout(dlg)
+
+        if not healable:
+            layout.addWidget(QLabel("✓ No legacy loans need repair — all active loans "
+                                    "compute with the current logic."))
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+            layout.addWidget(bb)
+            dlg.exec()
+            return
+
+        layout.addWidget(QLabel(
+            f"<b>{len(healable)} simple loan(s)</b> were created under older logic and will be "
+            "repaired: stored terms are re-derived from each loan's issue note and contaminated "
+            "accruals are recomputed. Repayment history is preserved. (Loans with top-ups or "
+            "edited repayments are left untouched.)"))
+
+        table = QTableWidget()
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["Member", "Loan", "What gets fixed"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setRowCount(len(healable))
+        for i, h in enumerate(healable):
+            issues = []
+            if "total_amount" in h["changes"]:
+                issues.append("total amount")
+            if "installment" in h["changes"]:
+                issues.append("installment")
+            if h["contaminated_accruals"]:
+                issues.append(f"{h['contaminated_accruals']} accrual(s)")
+            table.setItem(i, 0, QTableWidgetItem(h["name"]))
+            table.setItem(i, 1, QTableWidgetItem(h["ref"]))
+            table.setItem(i, 2, QTableWidgetItem(", ".join(issues)))
+        layout.addWidget(table)
+
+        bb = QDialogButtonBox()
+        repair_btn = bb.addButton(f"Repair All ({len(healable)})", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton(QDialogButtonBox.StandardButton.Cancel)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        def do_repair():
+            if QMessageBox.question(
+                    dlg, "Confirm Repair",
+                    f"Repair {len(healable)} loan(s)? The database will be backed up first.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) \
+                    != QMessageBox.StandardButton.Yes:
+                return
+            src = getattr(self.db, "db_name", None)
+            if src:
+                try:
+                    shutil.copy(src, f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
+                    return
+            progress = QProgressDialog("Repairing loans…", None, 0, len(healable), dlg)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            done = 0
+            for i, h in enumerate(healable):
+                self.engine.heal_loan_terms(h["individual_id"], h["ref"])
+                done += 1
+                progress.setValue(i + 1)
+            progress.close()
+            QMessageBox.information(dlg, "Repair Complete", f"Repaired {done} loan(s).")
+            self.load_individuals()
+            dlg.accept()
+
+        repair_btn.clicked.connect(do_repair)
+        dlg.exec()
 
     def import_individuals(self):
         """Import individuals from another database with selection and progress."""
