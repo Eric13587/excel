@@ -765,11 +765,16 @@ class ReportGenerator:
         if output_path.endswith(".csv"):
             return self._export_to_csv(df, output_path)
         if output_path.endswith(".pdf"):
-            return self._export_to_pdf(df, output_path, None, None, title=title)
-        return self._export_to_excel(df, output_path, sheet_name=title)
+            return self._export_to_pdf(df, output_path, None, None, title=title, has_total_row=False)
+        return self._export_to_excel(df, output_path, sheet_name=title, has_total_row=False)
 
-    def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report'):
-        """Export DataFrame to Excel with formatting."""
+    def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report', has_total_row=True):
+        """Export DataFrame to Excel with formatting.
+
+        has_total_row: when True the last row is styled as a bold/shaded TOTAL
+        (the financial reports append one); set False for plain listings like the
+        members directory so the last member isn't darkened.
+        """
         try:
             # Get colors from settings
             header_bg = self.db.get_setting("excel_header_bg", "#D7E4BC")
@@ -801,8 +806,8 @@ class ReportGenerator:
                     else:
                         worksheet.set_column(col_num, col_num, 14, num_fmt)
                 
-                # Apply Totals Row Format
-                if not df.empty:
+                # Apply Totals Row Format (only when the df actually ends in one)
+                if has_total_row and not df.empty:
                     total_row_idx = len(df)
                     worksheet.set_row(total_row_idx, None, total_fmt)
                     for col_num, col_name in enumerate(df.columns):
@@ -821,7 +826,8 @@ class ReportGenerator:
         except Exception as e:
             return False, f"CSV Export Failed: {e}"
 
-    def _export_to_pdf(self, df, output_path, start_date, end_date, title="Quarterly Interest Report"):
+    def _export_to_pdf(self, df, output_path, start_date, end_date, title="Quarterly Interest Report",
+                       has_total_row=True):
         """Export DataFrame to PDF via HTML and QWebEngineView."""
         if not self.printer_view_getter:
             return False, "PDF printing not available (UI dependency missing)."
@@ -836,6 +842,10 @@ class ReportGenerator:
             if start_date is not None and end_date is not None:
                 period_str = f"{start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
                 period_html = f'<div class="period">Period: {period_str}</div>'
+            # Only emphasise the last row when it's actually a TOTAL row.
+            last_row_css = ("table.report-table tr:last-child "
+                            "{ font-weight: bold; background-color: #f0f0f0; }"
+                            if has_total_row else "")
 
             html_content = f"""
             <!DOCTYPE html>
@@ -851,13 +861,10 @@ class ReportGenerator:
                     table.report-table th {{ 
                         background-color: #D7E4BC; border: 1px solid #ccc; padding: 5px; text-align: left;
                     }}
-                    table.report-table td {{ 
-                        border: 1px solid #ddd; padding: 4px; 
+                    table.report-table td {{
+                        border: 1px solid #ddd; padding: 4px;
                     }}
-                    /* Last row bold (Total) */
-                    table.report-table tr:last-child {{ 
-                        font-weight: bold; background-color: #f0f0f0; 
-                    }}
+                    {last_row_css}
                 </style>
             </head>
             <body>

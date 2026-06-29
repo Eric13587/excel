@@ -1775,30 +1775,49 @@ class Dashboard(QWidget):
     def export_members_list(self):
         """Export a members directory to Excel/PDF/CSV with user-chosen columns."""
         from ..reports import ReportGenerator
-        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QCheckBox, QGroupBox,
-                                     QDialogButtonBox, QFileDialog, QProgressDialog, QGridLayout)
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
+                                     QListWidgetItem, QPushButton, QDialogButtonBox, QFileDialog,
+                                     QProgressDialog)
         import platform, subprocess, os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
         default_on = {"name", "pf_no", "id_no", "phone", "employment_status"}
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Members List — choose columns")
+        dlg.setWindowTitle("Members List — choose & order columns")
+        dlg.setMinimumWidth(420)
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Select the columns to include:"))
+        layout.addWidget(QLabel("Tick the columns to include. Drag, or use ▲ / ▼, to set their order:"))
 
-        box = QGroupBox()
-        grid = QGridLayout(box)
-        checks = {}
-        for i, (key, label) in enumerate(ReportGenerator.MEMBER_LIST_COLUMNS):
-            cb = QCheckBox(label)
-            cb.setChecked(key in default_on)
-            if key == "name":
-                cb.setChecked(True)
-                cb.setEnabled(False)  # Name is always included
-            checks[key] = cb
-            grid.addWidget(cb, i // 2, i % 2)
-        layout.addWidget(box)
+        col_list = QListWidget()
+        col_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        for key, label in ReportGenerator.MEMBER_LIST_COLUMNS:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if key in default_on else Qt.CheckState.Unchecked)
+            col_list.addItem(item)
+
+        row = QHBoxLayout()
+        row.addWidget(col_list)
+        side = QVBoxLayout()
+        up_btn = QPushButton("▲ Up")
+        down_btn = QPushButton("▼ Down")
+        side.addWidget(up_btn)
+        side.addWidget(down_btn)
+        side.addStretch()
+        row.addLayout(side)
+        layout.addLayout(row)
+
+        def move(delta):
+            r = col_list.currentRow()
+            nr = r + delta
+            if r < 0 or nr < 0 or nr >= col_list.count():
+                return
+            col_list.insertItem(nr, col_list.takeItem(r))  # preserves check state
+            col_list.setCurrentRow(nr)
+        up_btn.clicked.connect(lambda: move(-1))
+        down_btn.clicked.connect(lambda: move(1))
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.button(QDialogButtonBox.StandardButton.Ok).setText("Export…")
@@ -1809,7 +1828,10 @@ class Dashboard(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        columns = [key for key, _ in ReportGenerator.MEMBER_LIST_COLUMNS if checks[key].isChecked()]
+        # Columns in the user's chosen order (checked items only).
+        columns = [col_list.item(i).data(Qt.ItemDataRole.UserRole)
+                   for i in range(col_list.count())
+                   if col_list.item(i).checkState() == Qt.CheckState.Checked]
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Members List", "Members_List.xlsx",
             "Excel Files (*.xlsx);;PDF Files (*.pdf);;CSV Files (*.csv)")

@@ -48,6 +48,30 @@ def test_members_list_defaults_to_name_when_empty_selection():
     assert df.iloc[0]["Name"] == "Solo"
 
 
+def test_members_list_respects_column_order():
+    db, d = _env()
+    db.add_individual("Jane", "0712", "j@x", pf_no="PF-1", id_no="ID-1")
+    out = os.path.join(d, "ord.csv")
+    ok, _ = ReportGenerator(db).generate_members_list(out, ["pf_no", "name", "id_no"])
+    assert ok
+    df = pd.read_csv(out)
+    assert list(df.columns) == ["PF No", "Name", "ID No"]  # exact requested order
+
+
+def test_members_list_excel_last_row_not_shaded():
+    import openpyxl
+    db, d = _env()
+    db.add_individual("Alpha", "0", "a@x")
+    db.add_individual("Bravo", "0", "b@x")
+    out = os.path.join(d, "m.xlsx")
+    ok, _ = ReportGenerator(db).generate_members_list(out, ["name"])
+    assert ok
+    ws = openpyxl.load_workbook(out).active
+    last = ws.cell(row=ws.max_row, column=1)   # last member row
+    assert "F0F0F0" not in str(last.fill.fgColor.rgb or "")  # no total shading
+    assert last.font.bold is not True
+
+
 def test_members_list_loan_balance_column():
     db, d = _env()
     from src.engine import LoanEngine
