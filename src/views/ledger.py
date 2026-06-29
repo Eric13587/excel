@@ -201,11 +201,20 @@ class LedgerView(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(sidebar_scroll)
         splitter.addWidget(self.main_tabs)
-        
-        # Set Initial Sizes (approx 1:3 ratio)
+
+        # Make the divider freely draggable the whole way in and out: let either
+        # pane collapse fully, drop the panes' minimum widths to ~0, and give the
+        # handle some grab area. The main area absorbs extra space on resize.
+        sidebar_scroll.setMinimumWidth(0)
+        self.main_tabs.setMinimumWidth(0)
+        splitter.setChildrenCollapsible(True)
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, True)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setHandleWidth(8)
         splitter.setSizes([300, 900])
-        splitter.setCollapsible(0, False) # Don't collapse sidebar completely
-        
+
         self.layout.addWidget(splitter)
         
         self.tables = {}
