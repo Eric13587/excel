@@ -699,6 +699,75 @@ class ReportGenerator:
             return self._export_to_pdf(df, output_path, m1_start, m3_next, title=title)
         return self._export_to_excel(df, output_path, sheet_name=title[:31])
 
+    # ------------------------------------------------------------------ #
+    # Members list (directory) with user-selected columns
+    # ------------------------------------------------------------------ #
+    # (key, label) in display order. The dialog lets the user pick any subset.
+    MEMBER_LIST_COLUMNS = [
+        ("name", "Name"),
+        ("pf_no", "PF No"),
+        ("id_no", "ID No"),
+        ("phone", "Phone"),
+        ("email", "Email"),
+        ("employment_status", "Employment Status"),
+        ("is_retired", "Retired"),
+        ("retired_date", "Retired Date"),
+        ("default_deduction", "Monthly Deduction"),
+        ("savings", "Savings Balance"),
+        ("loan_balance", "Loan Balance"),
+        ("christmas", "Christmas Balance"),
+        ("benevolent", "Benevolent Total"),
+        ("created_at", "Created"),
+    ]
+
+    def _member_column_value(self, key, ind_id, d):
+        if key == "name":
+            return d.get("name", "")
+        if key in ("pf_no", "id_no", "phone", "email", "retired_date", "created_at"):
+            return d.get(key) or ""
+        if key == "employment_status":
+            return d.get("employment_status") or "Active"
+        if key == "is_retired":
+            return "Yes" if d.get("is_retired") else "No"
+        if key == "default_deduction":
+            return math.ceil(d.get("default_deduction") or 0)
+        if key == "savings":
+            return math.ceil(self.db.get_savings_balance(ind_id))
+        if key == "loan_balance":
+            return math.ceil(sum((l.get("balance") or 0) for l in self.db.get_active_loans(ind_id)))
+        if key == "christmas":
+            return math.ceil(self.db.fund_balance("christmas_savings", ind_id))
+        if key == "benevolent":
+            return math.ceil(self.db.fund_balance("benevolent_ledger", ind_id))
+        return ""
+
+    def generate_members_list(self, output_path, columns, progress_callback=None):
+        """Export a members directory with the chosen columns (keys from
+        MEMBER_LIST_COLUMNS, in the given order). CSV/PDF/Excel by extension."""
+        labels = dict(self.MEMBER_LIST_COLUMNS)
+        columns = [c for c in columns if c in labels] or ["name"]
+        headers = [labels[c] for c in columns]
+
+        individuals = self.db.get_individuals()
+        total = len(individuals)
+        rows = []
+        for i, ind in enumerate(individuals):
+            ind_id = ind[0]
+            if progress_callback:
+                progress_callback(i + 1, total, f"Processing {ind[1]}...")
+            d = self.db.get_individual(ind_id) or {}
+            rows.append({labels[c]: self._member_column_value(c, ind_id, d) for c in columns})
+
+        df = pd.DataFrame(rows, columns=headers)
+        df = df.sort_values(by="Name") if "Name" in df.columns and not df.empty else df
+
+        title = "Members List"
+        if output_path.endswith(".csv"):
+            return self._export_to_csv(df, output_path)
+        if output_path.endswith(".pdf"):
+            return self._export_to_pdf(df, output_path, None, None, title=title)
+        return self._export_to_excel(df, output_path, sheet_name=title)
+
     def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report'):
         """Export DataFrame to Excel with formatting."""
         try:
@@ -763,8 +832,11 @@ class ReportGenerator:
             html_table = df.to_html(index=False, classes='report-table', float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else str(x))
             
             # 2. Wrap in proper HTML with Styles
-            period_str = f"{start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
-            
+            period_html = ""
+            if start_date is not None and end_date is not None:
+                period_str = f"{start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
+                period_html = f'<div class="period">Period: {period_str}</div>'
+
             html_content = f"""
             <!DOCTYPE html>
             <html>
@@ -790,7 +862,7 @@ class ReportGenerator:
             </head>
             <body>
                 <h1>{title}</h1>
-                <div class="period">Period: {period_str}</div>
+                {period_html}
                 {html_table}
                 <div style="margin-top:20px; font-size: 9px; color: #999;">Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
             </body>

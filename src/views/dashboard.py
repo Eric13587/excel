@@ -428,6 +428,11 @@ class Dashboard(QWidget):
             lambda: self._open_fund_report_dialog("benevolent", "Benevolent"))
         reports_menu.addAction(benevolent_report_action)
 
+        reports_menu.addSeparator()
+        members_list_action = QAction("Members List (Excel / PDF)…", self)
+        members_list_action.triggered.connect(self.export_members_list)
+        reports_menu.addAction(members_list_action)
+
         self.reports_btn.setMenu(reports_menu)
         
         self.settings_btn = QPushButton("Settings")
@@ -1766,6 +1771,71 @@ class Dashboard(QWidget):
         dlg = ExcelImportDialog(self.db, self)
         if dlg.exec():
             self.load_individuals()
+
+    def export_members_list(self):
+        """Export a members directory to Excel/PDF/CSV with user-chosen columns."""
+        from ..reports import ReportGenerator
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QCheckBox, QGroupBox,
+                                     QDialogButtonBox, QFileDialog, QProgressDialog, QGridLayout)
+        import platform, subprocess, os
+
+        generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
+        default_on = {"name", "pf_no", "id_no", "phone", "employment_status"}
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Members List — choose columns")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Select the columns to include:"))
+
+        box = QGroupBox()
+        grid = QGridLayout(box)
+        checks = {}
+        for i, (key, label) in enumerate(ReportGenerator.MEMBER_LIST_COLUMNS):
+            cb = QCheckBox(label)
+            cb.setChecked(key in default_on)
+            if key == "name":
+                cb.setChecked(True)
+                cb.setEnabled(False)  # Name is always included
+            checks[key] = cb
+            grid.addWidget(cb, i // 2, i % 2)
+        layout.addWidget(box)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Export…")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        columns = [key for key, _ in ReportGenerator.MEMBER_LIST_COLUMNS if checks[key].isChecked()]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Members List", "Members_List.xlsx",
+            "Excel Files (*.xlsx);;PDF Files (*.pdf);;CSV Files (*.csv)")
+        if not path:
+            return
+
+        progress = QProgressDialog("Generating members list…", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        success, msg = generator.generate_members_list(path, columns)
+        progress.close()
+
+        if success:
+            QMessageBox.information(self, "Members List", f"Saved to:\n{path}")
+            try:
+                if platform.system() == 'Windows':
+                    os.startfile(path)
+                elif platform.system() == 'Darwin':
+                    subprocess.Popen(['open', path])
+                else:
+                    subprocess.Popen(['xdg-open', path])
+            except Exception:
+                pass
+        else:
+            QMessageBox.critical(self, "Members List", f"Export failed:\n{msg}")
 
     def show_activity_log(self):
         """View the CRUD audit trail (member/loan create/update/delete with dates)."""
