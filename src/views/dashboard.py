@@ -1808,13 +1808,13 @@ class Dashboard(QWidget):
         dlg = ImportHistoryDialog(self.db, self)
         dlg.exec()
         # Refresh UI after potential undo
-        self.load_individuals()
+        self.refresh_list()
 
     def import_from_excel(self):
         """Import members / fund contributions from an .xlsx file."""
         dlg = ExcelImportDialog(self.db, self)
         if dlg.exec():
-            self.load_individuals()
+            self.refresh_list()
 
     def export_members_list(self):
         """Export a members directory to Excel/PDF/CSV with user-chosen columns."""
@@ -2007,7 +2007,7 @@ class Dashboard(QWidget):
                 progress.setValue(i + 1)
             progress.close()
             QMessageBox.information(dlg, "Repair Complete", f"Repaired {done} loan(s).")
-            self.load_individuals()
+            self.refresh_list()
             dlg.accept()
 
         repair_btn.clicked.connect(do_repair)
@@ -2116,7 +2116,7 @@ class Dashboard(QWidget):
                       if fk_on else "")
             QMessageBox.information(dlg, "Repair Complete",
                                     f"Deleted rows:\n{detail}{fk_msg}")
-            self.load_individuals()
+            self.refresh_list()
             dlg.accept()
 
         export_btn.clicked.connect(do_export)
