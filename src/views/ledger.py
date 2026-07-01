@@ -367,13 +367,13 @@ class LedgerView(QWidget):
                 # Suspend / Resume button
                 if is_suspended:
                     resume_btn = QPushButton("\u25b6 Resume")
-                    resume_btn.setStyleSheet("background-color: #10B981; color: white; font-weight: bold;")
+                    resume_btn.setStyleSheet(self.theme_manager.button_css("success", padding="4px 10px", bold=True))
                     resume_btn.setToolTip(f"Suspended until {suspend_until}" if suspend_until else "Suspended indefinitely")
                     resume_btn.clicked.connect(lambda checked, lid=loan_info['id']: self.resume_loan_btn(lid))
                     header_layout.addWidget(resume_btn)
                 else:
                     suspend_btn = QPushButton("\u23f8 Suspend")
-                    suspend_btn.setStyleSheet("background-color: #F59E0B; color: black; font-weight: bold;")
+                    suspend_btn.setStyleSheet(self.theme_manager.button_css("warning", padding="4px 10px", bold=True))
                     suspend_btn.clicked.connect(lambda checked, lid=loan_info['id'], ref=loan_ref: self.suspend_loan_dialog(lid, ref))
                     header_layout.addWidget(suspend_btn)
 
@@ -851,7 +851,7 @@ class LedgerView(QWidget):
         v.addLayout(header)
 
         self.christmas_hint = QLabel("")
-        self.christmas_hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.christmas_hint.setStyleSheet(self.theme_manager.hint_css())
         v.addWidget(self.christmas_hint)
 
         self.christmas_table = QTableWidget()
@@ -962,7 +962,7 @@ class LedgerView(QWidget):
         v.addLayout(header)
 
         self.benevolent_info = QLabel("Not enrolled.")
-        self.benevolent_info.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.benevolent_info.setStyleSheet(self.theme_manager.hint_css())
         v.addWidget(self.benevolent_info)
 
         self.benevolent_table = QTableWidget()
@@ -1121,7 +1121,7 @@ class LedgerView(QWidget):
 
         hint = QLabel("Tip: choose a past start date to record a suspension that already "
                       "happened — it will show as a no-deductions period on statements.")
-        hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        hint.setStyleSheet(self.theme_manager.hint_css())
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -2005,7 +2005,7 @@ class LedgerView(QWidget):
         
         btn_box = QHBoxLayout()
         ok_btn = QPushButton("Deposit")
-        ok_btn.setStyleSheet("background-color: #28a745; color: white;")
+        ok_btn.setStyleSheet(self.theme_manager.button_css("success"))
         cancel_btn = QPushButton("Cancel")
         btn_box.addWidget(ok_btn)
         btn_box.addWidget(cancel_btn)
@@ -2066,7 +2066,7 @@ class LedgerView(QWidget):
         
         btn_box = QHBoxLayout()
         ok_btn = QPushButton("Withdraw")
-        ok_btn.setStyleSheet("background-color: #dc3545; color: white;")
+        ok_btn.setStyleSheet(self.theme_manager.button_css("danger"))
         cancel_btn = QPushButton("Cancel")
         btn_box.addWidget(ok_btn)
         btn_box.addWidget(cancel_btn)
@@ -2207,7 +2207,7 @@ class LedgerView(QWidget):
         
         btn_box = QHBoxLayout()
         ok_btn = QPushButton("Run Auto Increment")
-        ok_btn.setStyleSheet("background-color: #28a745; color: white;")
+        ok_btn.setStyleSheet(self.theme_manager.button_css("success"))
         cancel_btn = QPushButton("Cancel")
         btn_box.addWidget(ok_btn)
         btn_box.addWidget(cancel_btn)
@@ -2556,7 +2556,7 @@ class LedgerView(QWidget):
         form1.addRow("Interest Rate (%):", interest_input1)
         
         result_label1 = QLabel("<b>Principal: ---</b>")
-        result_label1.setStyleSheet("color: #2b5797; font-size: 14px;")
+        result_label1.setStyleSheet(f"color: {self.theme_manager.get_color('accent')}; font-size: 14px;")
         form1.addRow(result_label1)
         
         # State to store calc
@@ -2614,7 +2614,7 @@ class LedgerView(QWidget):
         layout.addSpacing(10)
         btn_box = QHBoxLayout()
         use_btn = QPushButton("Use Result")
-        use_btn.setStyleSheet("background-color: #28a745; color: white;")
+        use_btn.setStyleSheet(self.theme_manager.button_css("success"))
         # use_btn.setEnabled(False) # Removed: Allow clicking to auto-calc
         
         cancel_btn = QPushButton("Cancel")

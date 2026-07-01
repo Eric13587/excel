@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QDialog, QFormLayout, QLineEdit, QPushButton,
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 from .data_structures import StatementConfig
+from .theme import Theme
 import re
 
 
@@ -33,7 +34,7 @@ class IndividualDialog(QDialog):
         self.name_input.setPlaceholderText("Enter full name")
         self.name_input.setStyleSheet(self._normal_style)
         self.name_error = QLabel()
-        self.name_error.setStyleSheet("color: #dc3545; font-size: 11px;")
+        self.name_error.setStyleSheet(f"color: {Theme.LIGHT['danger']}; font-size: 11px;")
         self.name_error.setWordWrap(True)
         self.name_error.hide()
         
@@ -48,7 +49,7 @@ class IndividualDialog(QDialog):
         self.phone_input.setPlaceholderText("e.g., +254 712 345678")
         self.phone_input.setStyleSheet(self._normal_style)
         self.phone_error = QLabel()
-        self.phone_error.setStyleSheet("color: #dc3545; font-size: 11px;")
+        self.phone_error.setStyleSheet(f"color: {Theme.LIGHT['danger']}; font-size: 11px;")
         self.phone_error.setWordWrap(True)
         self.phone_error.hide()
         
@@ -63,7 +64,7 @@ class IndividualDialog(QDialog):
         self.email_input.setPlaceholderText("e.g., name@example.com")
         self.email_input.setStyleSheet(self._normal_style)
         self.email_error = QLabel()
-        self.email_error.setStyleSheet("color: #dc3545; font-size: 11px;")
+        self.email_error.setStyleSheet(f"color: {Theme.LIGHT['danger']}; font-size: 11px;")
         self.email_error.setWordWrap(True)
         self.email_error.hide()
         
@@ -549,7 +550,7 @@ class ImportHistoryDialog(QDialog):
         btn_layout = QHBoxLayout()
         self.undo_btn = QPushButton("Undo Selected Import")
         self.undo_btn.clicked.connect(self.undo_import)
-        self.undo_btn.setStyleSheet("background-color: #d9534f; color: white; padding: 5px;")
+        self.undo_btn.setStyleSheet(f"background-color: {Theme.LIGHT['danger']}; color: white; padding: 5px;")
         
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
@@ -669,7 +670,7 @@ class ImportPreviewDialog(QDialog):
         if s['conflicts'] > 0:
             self.res_btn = QPushButton(f"Resolve {s['conflicts']} Conflicts")
             self.res_btn.clicked.connect(self.resolve_conflicts)
-            self.res_btn.setStyleSheet("background-color: #f0ad4e; color: white; font-weight: bold;")
+            self.res_btn.setStyleSheet(f"background-color: {Theme.LIGHT['warning']}; color: white; font-weight: bold;")
             self.conflict_layout.addWidget(self.res_btn)
             
             self.conflict_lbl = QLabel("Conflicts must be resolved before importing.")
@@ -749,13 +750,14 @@ class ExcelFormatDialog(QDialog):
         form = QFormLayout()
         
         # Header Color
-        self.header_color = self.db.get_setting("excel_header_bg", "#D7E4BC")
+        from src import branding
+        self.header_color = self.db.get_setting("excel_header_bg", branding.EXCEL_HEADER_BG)
         self.btn_header = QPushButton(self.header_color)
         self.btn_header.setStyleSheet(f"background-color: {self.header_color};")
         self.btn_header.clicked.connect(lambda: self.pick_color("header"))
         
         # Total Row Color
-        self.total_color = self.db.get_setting("excel_total_bg", "#f0f0f0")
+        self.total_color = self.db.get_setting("excel_total_bg", branding.EXCEL_TOTAL_BG)
         self.btn_total = QPushButton(self.total_color)
         self.btn_total.setStyleSheet(f"background-color: {self.total_color};")
         self.btn_total.clicked.connect(lambda: self.pick_color("total"))

@@ -739,20 +739,20 @@ class StatementGenerator:
                 # Formats
                 header_fmt = workbook.add_format({
                     'bold': True, 'font_size': 14, 'align': 'center',
-                    'bg_color': '#2b5797', 'font_color': 'white'
+                    'bg_color': branding.EXCEL_ACCENT_BG, 'font_color': 'white'
                 })
                 status_fmt = workbook.add_format({
                     'bold': True, 'font_size': 12, 'align': 'center',
                     'font_color': presentation.status_color
                 })
                 sub_header_fmt = workbook.add_format({
-                    'bold': True, 'font_size': 12, 'bg_color': '#e0e0e0', 'border': 1
+                    'bold': True, 'font_size': 12, 'bg_color': branding.EXCEL_HEADER_BG, 'border': 1
                 })
                 col_header_fmt = workbook.add_format({
-                    'bold': True, 'bg_color': '#f0f0f0', 'border': 1
+                    'bold': True, 'bg_color': branding.EXCEL_TOTAL_BG, 'border': 1
                 })
                 savings_header_fmt = workbook.add_format({
-                    'bold': True, 'font_size': 12, 'bg_color': '#28a745',
+                    'bold': True, 'font_size': 12, 'bg_color': branding.EXCEL_ACCENT_BG,
                     'font_color': 'white', 'border': 1
                 })
                 cell_fmt = workbook.add_format({'border': 1})

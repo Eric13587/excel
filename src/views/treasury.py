@@ -100,7 +100,7 @@ class TreasuryDialog(QDialog):
 
         btn_layout = QHBoxLayout()
         self.btn_report = QPushButton("Generate Balance Sheet & P&L")
-        self.btn_report.setStyleSheet("background-color: #10b981; color: white;")
+        self.btn_report.setStyleSheet(self.theme_manager.button_css("success"))
         self.btn_report.clicked.connect(self.generate_reports)
         btn_layout.addWidget(self.btn_report)
         btn_layout.addStretch()
@@ -154,7 +154,7 @@ class TreasuryDialog(QDialog):
         post_row = QHBoxLayout()
         post_row.addStretch()
         self.btn_post = QPushButton("Post Entry")
-        self.btn_post.setStyleSheet("background-color: #2563EB; color: white; font-weight: bold;")
+        self.btn_post.setStyleSheet(self.theme_manager.button_css("accent", bold=True))
         self.btn_post.clicked.connect(self.post_journal_entry)
         self.btn_post.setEnabled(False)
         post_row.addWidget(self.btn_post)
@@ -289,10 +289,10 @@ class TreasuryDialog(QDialog):
 
         if balanced:
             self.balanced_label.setText("Books balanced ✓")
-            self.balanced_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #166534;")
+            self.balanced_label.setStyleSheet(self.theme_manager.status_label_css("success"))
         else:
             self.balanced_label.setText("OUT OF BALANCE ✗")
-            self.balanced_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #991b1b;")
+            self.balanced_label.setStyleSheet(self.theme_manager.status_label_css("danger"))
 
     def _money_cell(self, row, col, value, bold=False):
         item = QTableWidgetItem(f"{value:,.2f}")
@@ -362,7 +362,7 @@ class TreasuryDialog(QDialog):
         actions = QHBoxLayout()
         actions.addStretch()
         self.btn_reverse = QPushButton("Reverse Selected Entry")
-        self.btn_reverse.setStyleSheet("background-color: #F59E0B; color: black;")
+        self.btn_reverse.setStyleSheet(self.theme_manager.button_css("warning"))
         self.btn_reverse.clicked.connect(self.reverse_selected)
         actions.addWidget(self.btn_reverse)
         v.addLayout(actions)
@@ -444,7 +444,7 @@ class TreasuryDialog(QDialog):
         bottom.addWidget(self.pr_allowance)
         bottom.addStretch()
         self.btn_book = QPushButton("Book Provision to GL")
-        self.btn_book.setStyleSheet("background-color: #2563EB; color: white; font-weight: bold;")
+        self.btn_book.setStyleSheet(self.theme_manager.button_css("accent", bold=True))
         self.btn_book.clicked.connect(self.book_provision_action)
         bottom.addWidget(self.btn_book)
         v.addLayout(bottom)

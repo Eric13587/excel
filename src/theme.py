@@ -1,3 +1,5 @@
+from PyQt6.QtGui import QColor
+
 
 class Theme:
     LIGHT = {
@@ -21,6 +23,7 @@ class Theme:
         "warning": "#F59E0B", # Amber 500
         "info": "#0EA5E9",    # Sky 500
         "purple": "#8B5CF6",  # Violet 500
+        "neutral": "#6B7280", # Gray 500 — secondary action buttons
         "danger_bg": "#FEF2F2",
         "warning_bg": "#FFFBEB", # Amber 50
         "success_bg": "#ECFDF5", # Emerald 50
@@ -52,6 +55,7 @@ class Theme:
         "warning": "#FBBF24", # Amber 400
         "info": "#38BDF8",    # Sky 400
         "purple": "#A78BFA",  # Violet 400
+        "neutral": "#4B5563", # Gray 600 — secondary action buttons
         "danger_bg": "#3f1d1d",       # Dark Red bg
         "warning_bg": "#451a03",      # Amber 950
         "success_bg": "#022c22",      # Emerald 950
@@ -79,7 +83,55 @@ class ThemeManager:
 
     def get_color(self, key):
         return self.colors.get(key, "#ff0000") # Return red if key missing
-    
+
     @property
     def is_dark(self):
         return self.current_theme_name == "Dark"
+
+    # ------------------------------------------------------------------
+    # Widget stylesheet helpers — the one place button/label colors come
+    # from, so every widget tracks the active theme instead of hardcoding
+    # hex values at its call site.
+    # ------------------------------------------------------------------
+
+    def _hover(self, hex_color):
+        """Hover shade: lighten on dark themes, darken on light ones."""
+        c = QColor(hex_color)
+        return (c.lighter(115) if self.is_dark else c.darker(112)).name()
+
+    @staticmethod
+    def _text_on(hex_color):
+        """Black-or-white text picked by the background's luminance."""
+        c = QColor(hex_color)
+        luminance = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        return "#1F2937" if luminance > 160 else "white"
+
+    def button_css(self, role="accent", padding="8px 15px", bold=False):
+        """Solid action-button stylesheet for a semantic palette role
+        (accent/success/danger/warning/info/purple/neutral)."""
+        bg = self.get_color(role)
+        weight = "font-weight: bold; " if bold else ""
+        return (
+            f"QPushButton {{ background-color: {bg}; color: {self._text_on(bg)}; "
+            f"padding: {padding}; border-radius: 5px; border: none; {weight}}} "
+            f"QPushButton:hover {{ background-color: {self._hover(bg)}; }} "
+            f"QPushButton:disabled {{ background-color: {self.get_color('border')}; "
+            f"color: {self.get_color('text_secondary')}; }}"
+        )
+
+    def outline_button_css(self, role="accent", padding="4px"):
+        """Bordered, transparent-background button for low-emphasis actions."""
+        color = self.get_color(role)
+        return (
+            f"QPushButton {{ color: {color}; border: 1px solid {color}; "
+            f"padding: {padding}; border-radius: 4px; background: transparent; }} "
+            f"QPushButton:hover {{ background-color: {self.get_color('card_selected_bg')}; }}"
+        )
+
+    def hint_css(self, size=11):
+        """Muted helper-text style for hint/annotation labels."""
+        return f"color: {self.get_color('text_secondary')}; font-size: {size}px;"
+
+    def status_label_css(self, role, size=13):
+        """Bold status text colored by a semantic role (success/danger/…)."""
+        return f"font-size: {size}px; font-weight: bold; color: {self.get_color(role)};"

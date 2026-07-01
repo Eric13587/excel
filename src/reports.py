@@ -779,8 +779,8 @@ class ReportGenerator:
         """
         try:
             # Get colors from settings
-            header_bg = self.db.get_setting("excel_header_bg", "#D7E4BC")
-            total_bg = self.db.get_setting("excel_total_bg", "#F0F0F0")
+            header_bg = self.db.get_setting("excel_header_bg", branding.EXCEL_HEADER_BG)
+            total_bg = self.db.get_setting("excel_total_bg", branding.EXCEL_TOTAL_BG)
             
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False, sheet_name=sheet_name)

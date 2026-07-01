@@ -67,6 +67,15 @@ def image_data_url(path):
         return ""
 
 
+# Excel export palette — the spreadsheet counterpart of LETTERHEAD_CSS, so
+# workbooks and PDFs read as one product. The header/total backgrounds can
+# still be overridden per journal via the excel_header_bg / excel_total_bg
+# settings (Excel Format dialog); these are the defaults.
+EXCEL_ACCENT_BG = "#2563EB"   # blue-600 — title bands (white text)
+EXCEL_HEADER_BG = "#E2E8F0"   # slate-200 — column header rows
+EXCEL_TOTAL_BG = "#F1F5F9"    # slate-100 — total/summary rows
+EXCEL_MUTED_TEXT = "#64748B"  # slate-500 — annotations/footnotes
+
 # One CSS block shared by every exported document, so statements and reports
 # read as a single product. Palette matches the app theme (slate + blue).
 LETTERHEAD_CSS = """

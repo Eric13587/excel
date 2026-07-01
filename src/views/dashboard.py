@@ -390,7 +390,6 @@ class Dashboard(QWidget):
         self.retire_btn = QPushButton("Retire")
         self.retire_btn.clicked.connect(self.retire_individual_btn)
         self.retire_btn.setEnabled(False)
-        self.retire_btn.setStyleSheet("background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;")
         
         actions_layout.addWidget(self.open_btn)
         actions_layout.addWidget(self.edit_btn)
@@ -406,10 +405,8 @@ class Dashboard(QWidget):
         
         self.print_selected_btn = QPushButton("Print Statements")
         self.print_selected_btn.clicked.connect(self.batch_print_selected)
-        self.print_selected_btn.setStyleSheet("background-color: #3b82f6; color: white; padding: 8px 15px; border-radius: 5px;")
         
         self.reports_btn = QPushButton("Quarterly Reports")
-        self.reports_btn.setStyleSheet("background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;")
         reports_menu = QMenu(self)
         
         loan_report_action = QAction("Loan Report", self)
@@ -440,11 +437,9 @@ class Dashboard(QWidget):
         
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.open_settings)
-        self.settings_btn.setStyleSheet("background-color: #6B7280; color: white; padding: 8px 15px; border-radius: 5px;")
         
         self.mass_ops_btn = QPushButton("Mass Operations")
-        self.mass_ops_btn.setStyleSheet("background-color: #8B5CF6; color: white; padding: 8px 15px; border-radius: 5px;")
-        
+
         mass_menu = QMenu(self)
         deduct_action = QAction("Mass Deduct (Loans)", self)
         deduct_action.triggered.connect(self.open_mass_deduction_dialog)
@@ -489,7 +484,6 @@ class Dashboard(QWidget):
         
         self.treasury_btn = QPushButton("Treasury & GL")
         self.treasury_btn.clicked.connect(self.open_treasury)
-        self.treasury_btn.setStyleSheet("background-color: #2563EB; color: white; padding: 8px 15px; border-radius: 5px;")
         
         utility_layout.addWidget(self.print_selected_btn)
         utility_layout.addWidget(self.reports_btn)
@@ -629,13 +623,14 @@ class Dashboard(QWidget):
             QPushButton:hover:!disabled {{ background-color: {t.get_color('danger_border')}; border-color: {t.get_color('danger')}; }}
         """)
         
-        # Utility Buttons
-        # These are simple, maybe we keep them or theme them. Let's theme them slightly.
-        # print_selected_btn uses 'accent' usually
-        self.print_selected_btn.setStyleSheet(f"background-color: {t.get_color('accent')}; color: white; padding: 8px 15px; border-radius: 5px;")
-        self.reports_btn.setStyleSheet(f"background-color: {t.get_color('success')}; color: white; padding: 8px 15px; border-radius: 5px;")
-        self.settings_btn.setStyleSheet(f"background-color: {t.get_color('text_secondary')}; color: white; padding: 8px 15px; border-radius: 5px;")
-        self.mass_ops_btn.setStyleSheet("background-color: #8B5CF6; color: white; padding: 8px 15px; border-radius: 5px;") # Purple
+        # Action buttons — semantic roles from the theme palette, so they
+        # follow Light/Dark switches (incl. hover + disabled states).
+        self.retire_btn.setStyleSheet(t.button_css("danger"))
+        self.print_selected_btn.setStyleSheet(t.button_css("accent"))
+        self.reports_btn.setStyleSheet(t.button_css("success"))
+        self.settings_btn.setStyleSheet(t.button_css("neutral"))
+        self.mass_ops_btn.setStyleSheet(t.button_css("purple"))
+        self.treasury_btn.setStyleSheet(t.button_css("accent"))
 
         # Update all cards
         for card in self.card_widgets:
@@ -1079,6 +1074,11 @@ class Dashboard(QWidget):
             if selected_theme != self.theme_manager.current_theme_name:
                 self.theme_manager.set_theme(selected_theme)
                 self.apply_theme()
+                # The ledger view holds its own ThemeManager instance; hand it
+                # the updated one so it restyles without an app restart.
+                if hasattr(main_win, "ledger_view"):
+                    main_win.ledger_view.theme_manager = self.theme_manager
+                    main_win.ledger_view.apply_theme()
                 QMessageBox.information(self, "Settings Saved", f"Settings updated. Theme changed to {selected_theme}.")
             else:
                 QMessageBox.information(self, "Settings Saved", "Settings have been updated successfully.")
@@ -1263,7 +1263,7 @@ class Dashboard(QWidget):
         
         # Run Button
         run_btn = QPushButton("Run Mass Deduction")
-        run_btn.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; padding: 10px;")
+        run_btn.setStyleSheet(self.theme_manager.button_css("danger", padding="10px", bold=True))
         layout.addWidget(run_btn)
         
         engine = self.engine
@@ -1541,7 +1541,7 @@ class Dashboard(QWidget):
         
         # Format Settings Button
         fmt_btn = QPushButton("Format Settings...")
-        fmt_btn.setStyleSheet("color: #2b5797; border: 1px solid #2b5797; padding: 4px; border-radius: 4px;")
+        fmt_btn.setStyleSheet(self.theme_manager.outline_button_css("accent", padding="4px"))
         
         def open_fmt_dialog():
             from ..dialogs import ExcelFormatDialog
@@ -1701,7 +1701,7 @@ class Dashboard(QWidget):
         
         # Run Button
         run_btn = QPushButton("Run Mass Increment")
-        run_btn.setStyleSheet("background-color: #20c997; color: white; font-weight: bold; padding: 10px;")
+        run_btn.setStyleSheet(self.theme_manager.button_css("success", padding="10px", bold=True))
         layout.addWidget(run_btn)
         
         # engine already init above
