@@ -143,8 +143,7 @@ Thumbs.db
 *.db-journal
 *.db-wal
 *.db-shm
-*.db.bak
-*.pre-migration-*.bak
+*.bak
 .gemini/
 *.xlsx
 updates.md
