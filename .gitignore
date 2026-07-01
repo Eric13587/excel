@@ -141,10 +141,21 @@ Thumbs.db
 # Project Specific
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.db.bak
 *.pre-migration-*.bak
 .gemini/
-test_*
 *.xlsx
 updates.md
-scratch
+scratch/
+
+# Runtime artifacts (auto-backups live next to the journal; logs in the user
+# state dir, but ignore both in case a journal is opened inside the repo)
+backups/
+logs/
+
+# Exports that may contain member data — never commit these
+*.csv
+statement_*.html
+*_statement_*.html
