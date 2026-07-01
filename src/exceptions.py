@@ -36,7 +36,7 @@ class LoanNotFoundError(LoanMasterError):
         if individual_id:
             details['individual_id'] = individual_id
         
-        message = f"Loan not found"
+        message = "Loan not found"
         if loan_ref:
             message = f"Loan '{loan_ref}' not found"
         

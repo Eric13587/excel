@@ -1,13 +1,12 @@
 """LedgerView for managing individual loan ledgers."""
 import math
-import pandas as pd
 from datetime import datetime
 
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                              QPushButton, QLineEdit, QListWidget, QListWidgetItem,
                              QTableWidget, QTableWidgetItem, QScrollArea, QGroupBox,
-                             QMessageBox, QFileDialog, QMenu, QDialog,
-                             QFormLayout, QDateEdit, QCheckBox, QSpinBox, QDialogButtonBox,
+                             QMessageBox, QMenu, QDialog,
+                             QFormLayout, QDateEdit, QSpinBox, QDialogButtonBox,
                              QHeaderView, QSplitter, QProgressDialog, QApplication,
                              QTabWidget, QDoubleSpinBox)
 from PyQt6.QtGui import QAction, QColor, QShortcut, QKeySequence
@@ -230,22 +229,6 @@ class LedgerView(QWidget):
         # General Widget Style
         self.setStyleSheet(f"background-color: {t.get_color('bg_primary')}; color: {t.get_color('text_primary')};")
         
-        # Specific Styles for inputs handled globally by parent sheet often, but let's be specific
-        input_style = f"""
-            QLineEdit, QDateEdit, QSpinBox {{
-                background-color: {t.get_color('input_bg')};
-                color: {t.get_color('text_primary')};
-                border: 1px solid {t.get_color('border')};
-                border-radius: 4px;
-                padding: 4px;
-            }}
-            QListWidget {{
-                background-color: {t.get_color('input_bg')};
-                color: {t.get_color('text_primary')};
-                border: 1px solid {t.get_color('border')};
-            }}
-            QScrollArea {{ border: none; }}
-        """
         # We can't setStyleSheet recursively easily on self, better to set on specific children if needed, 
         # or use a global sheet on 'self' that targets children by type.
         self.setStyleSheet(f"""
@@ -1218,14 +1201,6 @@ class LedgerView(QWidget):
 
 
 
-    def deduct_single_loan_btn(self, loan_ref):
-        if self.engine.deduct_single_loan(self.current_individual_id, loan_ref):
-            self.refresh_table()
-            self.refresh_loans_list()
-            # Success popup removed for better workflow
-        else:
-            QMessageBox.warning(self, "Error", "Could not deduct (is loan active?)")
-
     def deduct_multiplier_btn(self, loan_ref, spin_box):
         """Deduct multiple times based on spinbox value."""
         count = spin_box.value()
@@ -1265,7 +1240,7 @@ class LedgerView(QWidget):
             progress.close()
             # Check for LoanInactiveError in string representation
             if "LoanInactiveError" in str(type(e)) or "not active" in str(e).lower():
-                QMessageBox.warning(self, "Loan is Paid", f"Cannot process deduction: Loan is already Paid.")
+                QMessageBox.warning(self, "Loan is Paid", "Cannot process deduction: Loan is already Paid.")
             else:
                  QMessageBox.critical(self, "Error", f"Failed to deduct: {str(e)}")
 
@@ -1722,7 +1697,7 @@ class LedgerView(QWidget):
                 date_input.setDate(default_qdate)
             else:
                 date_input.setDate(self.main_window.last_operation_date)
-        except Exception as e:
+        except Exception:
             # Fallback
             date_input.setDate(self.main_window.last_operation_date)
 
@@ -2144,7 +2119,7 @@ class LedgerView(QWidget):
                 next_date = last_date + relativedelta(months=1)
                 date = next_date.strftime("%Y-%m-%d")
             
-            new_balance = self.db.add_savings_transaction(
+            self.db.add_savings_transaction(
                 self.current_individual_id, date, "Deposit", amount, "Monthly Contribution"
             )
             self.refresh_savings_balance()
@@ -2589,7 +2564,6 @@ class LedgerView(QWidget):
         self.calculated_months = None
         
         def calculate1():
-            import math
             try:
                 deduction = float(deduction_input.text())
                 months = int(months_input.text())

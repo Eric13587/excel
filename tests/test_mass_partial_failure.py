@@ -1,7 +1,7 @@
 
 import sys
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, ".")
 

@@ -7,10 +7,13 @@ This service handles all loan-related operations including:
 - Loan restructuring
 - Loan buyoff (settlement)
 """
+import logging
 import math
 import json
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+
+logger = logging.getLogger(__name__)
 
 from src.exceptions import LoanNotFoundError, LoanInactiveError, LoanSuspendedError
 from src.config import DEFAULT_INTEREST_RATE
@@ -287,7 +290,7 @@ class LoanService:
         # Check for invalid next_due_date
         next_due = sim_loan.get('next_due_date')
         if not next_due or next_due.strip() == "":
-            print(f"Warning: Loan {loan_ref} has invalid next_due_date '{next_due}'. Skipping catch-up.")
+            logger.warning("Loan %s has invalid next_due_date %r. Skipping catch-up.", loan_ref, next_due)
             return 0
 
         # Recorded suspension spans (including backdated/past ones) so the loop
@@ -849,7 +852,7 @@ class LoanService:
         future_interest = loan.get('unearned_interest', 0.0)
         
         if future_interest > 0:
-            tr_note = f"Buyoff: Realizing unearned interest"
+            tr_note = "Buyoff: Realizing unearned interest"
             
             # We need to add this to the ledger so the balance exists to be paid
             new_tx_bal_1 = current_tx_bal + future_interest

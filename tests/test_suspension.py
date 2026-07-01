@@ -163,7 +163,6 @@ def test_loan_refs_are_isolated_per_member():
 
     # Count is scoped to one member, not both members' L-001 combined.
     a_count = db.count_deductions_in_period(a, "L-001", "2025-07-01", "2026-06-01")
-    both_if_buggy = db.count_deductions_in_period(a, "L-001", "2025-07-01", "2026-06-01")
     assert a_count == 11  # not 22
 
     # Rebuilding A's L-001 (after a suspension) must not change B's ledger.

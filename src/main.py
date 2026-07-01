@@ -1,4 +1,5 @@
 """Main application window for LoanMaster."""
+import logging
 import sys
 import os
 
@@ -9,18 +10,23 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-ras
 
 # Import QtWebEngineWidgets BEFORE QApplication is created (needed for PDF generation)
 try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineWidgets import QWebEngineView  # noqa: F401 — import for side effect
 except ImportError:
     pass  # Not installed, PDF generation will fall back to HTML
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QStackedWidget, QMessageBox, 
-                             QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog, QWidget)
+                             QDialog, QVBoxLayout, QPushButton, QLabel, QFileDialog)
 from PyQt6.QtGui import QIcon, QAction, QKeySequence
 from PyQt6.QtCore import Qt, QDate
 
+from . import __version__
 from .database import DatabaseManager
+from .logging_setup import (setup_logging, install_crash_handler,
+                            install_qt_message_handler)
 from .views.dashboard import Dashboard
 from .views.ledger import LedgerView
+
+logger = logging.getLogger(__name__)
 
 
 class StartupDialog(QDialog):
@@ -28,31 +34,41 @@ class StartupDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LoanMaster - Select Journal")
-        self.setFixedSize(400, 200)
+        self.setFixedSize(420, 240)
         self.selected_db = None
-        
+
         layout = QVBoxLayout(self)
-        layout.setSpacing(15)
+        layout.setSpacing(12)
+        layout.setContentsMargins(30, 25, 30, 25)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        title = QLabel("Welcome to LoanMaster")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #2b5797;")
+
+        title = QLabel("LoanMaster")
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #1F2937;")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
-        
-        subtitle = QLabel("Please select a journal to continue:")
+
+        subtitle = QLabel(f"Loan, savings & fund management — v{__version__}")
+        subtitle.setStyleSheet("font-size: 11px; color: #6B7280;")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(subtitle)
-        
+        layout.addSpacing(8)
+
+        btn_open = QPushButton("Open Existing Journal")
+        btn_open.setMinimumHeight(42)
+        btn_open.setStyleSheet(
+            "QPushButton { background-color: #2563EB; color: white; border-radius: 6px; "
+            "font-weight: bold; } QPushButton:hover { background-color: #1D4ED8; }")
+        btn_open.clicked.connect(self.open_existing)
+        btn_open.setDefault(True)
+        layout.addWidget(btn_open)
+
         btn_new = QPushButton("Create New Journal")
-        btn_new.setMinimumHeight(40)
+        btn_new.setMinimumHeight(42)
+        btn_new.setStyleSheet(
+            "QPushButton { background-color: #F3F4F6; color: #1F2937; border: 1px solid #E5E7EB; "
+            "border-radius: 6px; } QPushButton:hover { border-color: #2563EB; }")
         btn_new.clicked.connect(self.create_new)
         layout.addWidget(btn_new)
-        
-        btn_open = QPushButton("Open Existing Journal")
-        btn_open.setMinimumHeight(40)
-        btn_open.clicked.connect(self.open_existing)
-        layout.addWidget(btn_open)
 
     def create_new(self):
         path, _ = QFileDialog.getSaveFileName(self, "Create New Journal", "my_journal.db", "Database Files (*.db)")
@@ -74,10 +90,9 @@ class MainApp(QMainWindow):
     
     def __init__(self, db_path):
         super().__init__()
-        self.setWindowTitle(f"LoanMaster Multi-User - [{db_path}]")
+        self.db_path = db_path
         self.resize(1100, 700) # Slightly larger default size
-        
-        # Set Application Icon
+
         # Set Application Icon
         if getattr(sys, 'frozen', False):
              base_path = os.path.dirname(sys.executable)
@@ -88,7 +103,16 @@ class MainApp(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
         
-        self.db = DatabaseManager(db_path)
+        # auto_backup snapshots the journal into backups/ before any schema
+        # migration runs, keeping the last few copies.
+        self.db = DatabaseManager(db_path, auto_backup=True)
+        if not self.db.integrity_ok:
+            QMessageBox.warning(
+                self, "Database Warning",
+                "The integrity check on this journal reported problems.\n\n"
+                "The journal was still opened so you can export your data, "
+                "but you should restore a recent backup from the 'backups' "
+                "folder next to the journal file as soon as possible.")
 
         # Live general-ledger posting: member loan/savings activity posts to the
         # double-entry GL the moment it is written. Idempotent and defensive, so
@@ -112,12 +136,20 @@ class MainApp(QMainWindow):
         self.stack.addWidget(self.ledger_view)
         
         self.show_dashboard()
-        
+
         self.create_menus()
+        self.refresh_window_title()
+
+    def refresh_window_title(self):
+        """Title carries the configured organization name when one is set."""
+        from src import branding
+        org = branding.get_org_name(self.db)
+        prefix = f"{org} — LoanMaster {__version__}" if org else f"LoanMaster {__version__}"
+        self.setWindowTitle(f"{prefix} - [{self.db_path}]")
 
     def create_menus(self):
         """Create application menus."""
-        menubar = self.menuBar()
+        self.menuBar()
         
         # Global Undo/Redo Actions (No Edit Menu)
         
@@ -194,15 +226,24 @@ class MainApp(QMainWindow):
 
 def main():
     """Entry point for the application."""
+    log_path = setup_logging()
+    install_crash_handler()
+    install_qt_message_handler()
+    logger.info("LoanMaster %s starting (log file: %s)", __version__, log_path)
+
     app = QApplication(sys.argv)
-    
+
     # Show startup dialog first
     dialog = StartupDialog()
     if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_db:
+        logger.info("Opening journal: %s", dialog.selected_db)
         window = MainApp(dialog.selected_db)
         window.show()
-        sys.exit(app.exec())
+        exit_code = app.exec()
+        logger.info("LoanMaster exiting (code %s)", exit_code)
+        sys.exit(exit_code)
     else:
+        logger.info("No journal selected; exiting")
         sys.exit(0)
 
 

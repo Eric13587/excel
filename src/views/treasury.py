@@ -575,9 +575,12 @@ class TreasuryDialog(QDialog):
         import subprocess
         import os
 
+        from src import branding
+        org = branding.get_org_name(self.db)
+        prefix = "".join(c for c in org.title() if c.isalnum()) or "Financials"
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Institutional Reports",
-            f"SACCO_Financials_{datetime.now().strftime('%Y%m%d')}.pdf", "PDF Files (*.pdf)")
+            f"{prefix}_Financial_Statements_{datetime.now().strftime('%Y%m%d')}.pdf", "PDF Files (*.pdf)")
         if not path:
             return
 

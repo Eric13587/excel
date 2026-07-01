@@ -1,6 +1,5 @@
 """Tests for transaction safety and structured error handling."""
 import sys
-import os
 import unittest
 
 sys.path.insert(0, "/home/yhazadek/Desktop/excel")
@@ -10,7 +9,6 @@ from src.engine import LoanEngine
 from src.exceptions import (
     LoanNotFoundError,
     LoanInactiveError,
-    TransactionError,
 )
 
 

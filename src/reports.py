@@ -3,10 +3,16 @@
 Report generation module for LoanMaster.
 Handles calculation and export of Quarterly Interest Reports.
 """
+import logging
+import math
+
 import pandas as pd
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-import math
+
+from src import branding
+
+logger = logging.getLogger(__name__)
 
 class ReportGenerator:
     def __init__(self, db_manager, printer_view_getter=None):
@@ -247,7 +253,7 @@ class ReportGenerator:
             
             # 1. Prepare Dates
             q_dates = self._get_quarter_dates(start_date)
-            m1_start, m2_start, m3_start, _, _ = q_dates
+            m1_start, m2_start, m3_start, _, m3_next = q_dates
             
             # Format headers
             m1_name = m1_start.strftime("%b-%y")
@@ -355,9 +361,7 @@ class ReportGenerator:
             
         except Exception as e:
             error_msg = str(e)
-            print(f"Error generating report: {error_msg}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Error generating report")
             return False, error_msg
 
     def _calculate_savings_summary(self, ind_id, q_dates, report_start_date_str):
@@ -504,9 +508,7 @@ class ReportGenerator:
             
         except Exception as e:
             error_msg = str(e)
-            print(f"Error generating savings report: {error_msg}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Error generating savings report")
             return False, error_msg
 
     # ------------------------------------------------------------------ #
@@ -605,7 +607,7 @@ class ReportGenerator:
             if not is_participant:
                 continue
 
-            def month_sum(s, e):
+            def month_sum(s, e, df_tx=df_tx):
                 if df_tx.empty:
                     return 0.0
                 mask = (df_tx['date'] >= s) & (df_tx['date'] < e) & \
@@ -665,7 +667,7 @@ class ReportGenerator:
             if df_tx.empty:
                 continue
 
-            def period_sum(s, e, types):
+            def period_sum(s, e, types, df_tx=df_tx):
                 mask = (df_tx['date'] >= s) & (df_tx['date'] < e) & \
                        (df_tx['transaction_type'].isin(types))
                 return float(df_tx[mask]['amount'].sum()) if mask.any() else 0.0
@@ -795,7 +797,6 @@ class ReportGenerator:
                     worksheet.write(0, col_num, value, header_fmt)
 
                 # Set column widths (header-driven so dynamic month columns work)
-                text_cols = {"Name", "Employment Status", "PF No"}
                 for col_num, col_name in enumerate(df.columns):
                     if col_name == "Name":
                         worksheet.set_column(col_num, col_num, 26)
@@ -837,14 +838,14 @@ class ReportGenerator:
             # Pandas can do basic HTML table
             html_table = df.to_html(index=False, classes='report-table', float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else str(x))
             
-            # 2. Wrap in proper HTML with Styles
-            period_html = ""
+            # 2. Wrap in proper HTML with the shared letterhead + house style
+            period_str = ""
             if start_date is not None and end_date is not None:
-                period_str = f"{start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
-                period_html = f'<div class="period">Period: {period_str}</div>'
+                period_str = f"Period: {start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
             # Only emphasise the last row when it's actually a TOTAL row.
-            last_row_css = ("table.report-table tr:last-child "
-                            "{ font-weight: bold; background-color: #f0f0f0; }"
+            last_row_css = ("table.report-table tr:last-child td "
+                            "{ font-weight: bold; background-color: #f8fafc; "
+                            "border-top: 2px solid #334155; }"
                             if has_total_row else "")
 
             html_content = f"""
@@ -852,26 +853,25 @@ class ReportGenerator:
             <html>
             <head>
                 <style>
-                    body {{ font-family: Arial, sans-serif; padding: 20px; }}
-                    h1 {{ color: #2b5797; }}
-                    .period {{ color: #666; margin-bottom: 20px; }}
-                    table.report-table {{ 
-                        width: 100%; border-collapse: collapse; font-size: 10px; 
+                    body {{ font-family: Arial, sans-serif; padding: 20px; color: #1F2937; }}
+                    {branding.LETTERHEAD_CSS}
+                    table.report-table {{
+                        width: 100%; border-collapse: collapse; font-size: 10px;
                     }}
-                    table.report-table th {{ 
-                        background-color: #D7E4BC; border: 1px solid #ccc; padding: 5px; text-align: left;
+                    table.report-table th {{
+                        background-color: #f1f5f9; color: #0f172a; border: 1px solid #cbd5e1;
+                        border-bottom: 2px solid #2563EB; padding: 5px; text-align: left;
                     }}
                     table.report-table td {{
-                        border: 1px solid #ddd; padding: 4px;
+                        border: 1px solid #e2e8f0; padding: 4px;
                     }}
                     {last_row_css}
                 </style>
             </head>
             <body>
-                <h1>{title}</h1>
-                {period_html}
+                {branding.letterhead_html(self.db, title, period_str)}
                 {html_table}
-                <div style="margin-top:20px; font-size: 9px; color: #999;">Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
+                <div style="margin-top:20px; font-size: 9px; color: #94a3b8;">Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
             </body>
             </html>
             """
@@ -887,74 +887,56 @@ class ReportGenerator:
             web_view.setHtml(html_content)
             
             loop = QEventLoop()
-            
-            # Wait for load
-            def load_finished(ok):
-                loop.quit()
-            
-            try: web_view.loadFinished.disconnect()
-            except: pass
-            
-            web_view.loadFinished.connect(load_finished)
-            # No URL load triggered, setHtml is async? Usually instantaneous but triggers loadFinished.
-            # Wait, setHtml triggers loadFinished only if base url provided? 
-            # In StatementGenerator we used check:
-            # web_view.loadFinished.connect(loop.quit)
-            # loop.exec() 
-            # This seems correct.
-            
-            # However, setHtml might not fire loadFinished reliably in all Qt versions if already loaded?
-            # It should.
-            
-            # Let's trust StatementGenerator pattern
-            # But wait, QTimer based timeout for safety?
-            
-            # StatementGenerator implementation:
-            # web_view.loadFinished.connect(loop.quit)
-            # loop.exec() 
-            # ...
-            # web_view.page().printToPdf(...)
-            
-            # Replicate:
-            try: web_view.loadFinished.disconnect()
-            except: pass
-            web_view.loadFinished.connect(loop.quit)
-            
-            # Wait a bit just in case setHtml is fast/synchronous in some loop (unlikely)
-            # Actually running loop.exec() might hang if signal already fired?
-            # QWebEngineView setHtml is asynchronous.
-            
-            # Timeout safety
             from PyQt6.QtCore import QTimer
-            QTimer.singleShot(2000, loop.quit) # 2s max wait for load
-            
+
+            # Wait for the (asynchronous) setHtml load, with a timeout so a
+            # failed load can never hang the UI. The timer is stopped before
+            # the print wait below so it cannot cut that wait short.
+            try:
+                web_view.loadFinished.disconnect()
+            except Exception:
+                pass
+            web_view.loadFinished.connect(loop.quit)
+            load_timer = QTimer()
+            load_timer.setSingleShot(True)
+            load_timer.timeout.connect(loop.quit)
+            load_timer.start(5000)
             loop.exec()
-            
+            load_timer.stop()
+
             # Print
             page_layout = QPageLayout(
                 QPageSize(QPageSize.PageSizeId.A4),
                 QPageLayout.Orientation.Landscape,
                 QMarginsF(10, 10, 10, 10)
             )
-            
+
+            pdf_result = {"success": False}
+
             def print_finished(path, success):
+                pdf_result["success"] = bool(success)
                 loop.quit()
-                
-            try: web_view.page().pdfPrintingFinished.disconnect()
-            except: pass
-            
+
+            try:
+                web_view.page().pdfPrintingFinished.disconnect()
+            except Exception:
+                pass
+
             web_view.page().pdfPrintingFinished.connect(print_finished)
             web_view.page().printToPdf(output_path, page_layout)
-            
-            loop.exec() # Wait for print
-            
-            if pdf_print_success:
-                msg = "Report generated successfully."
-                if warnings:
-                    msg += "\n\nWarnings:\n" + "\n".join(sorted(list(warnings)))
-                return True, msg
-            else:
-                return False, f"Export Failed: {pdf_print_message}"
+
+            # PDF rendering of a large table can take a while; time out rather
+            # than hang forever if Qt never fires pdfPrintingFinished.
+            print_timer = QTimer()
+            print_timer.setSingleShot(True)
+            print_timer.timeout.connect(loop.quit)
+            print_timer.start(60000)
+            loop.exec()
+            print_timer.stop()
+
+            if pdf_result["success"]:
+                return True, "Report generated successfully."
+            return False, "Export Failed: PDF file could not be written (check the path is writable and not open elsewhere)."
                 
         except Exception as e:
             return False, f"Report Generation Failed: {e}"
@@ -1035,8 +1017,7 @@ class ReportGenerator:
                 <head>
                     <style>
                         body {{ font-family: 'Helvetica', Arial, sans-serif; padding: 30px; font-size: 14px; color: #333; }}
-                        h1 {{ text-align: center; color: #1e3a8a; font-size: 24px; text-transform: uppercase; margin-bottom: 5px; }}
-                        h2 {{ text-align: center; color: #64748b; font-size: 14px; font-weight: normal; margin-top: 0; }}
+                        {branding.LETTERHEAD_CSS}
                         h3 {{ color: #0f172a; border-bottom: 2px solid #cbd5e1; padding-bottom: 5px; font-size: 18px; margin-top: 30px; }}
                         table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
                         td {{ padding: 8px 5px; border-bottom: 1px dotted #e2e8f0; }}
@@ -1047,8 +1028,7 @@ class ReportGenerator:
                     </style>
                 </head>
                 <body>
-                    <h1>Institutional Financial Statements</h1>
-                    <h2>Report up to: {target_date_str}</h2>
+                    {branding.letterhead_html(self.db, "Institutional Financial Statements", f"Report up to: {target_date_str}")}
 
                     <h3>I. INCOME STATEMENT (P&amp;L)</h3>
                     <table>
@@ -1131,12 +1111,18 @@ class ReportGenerator:
             loop = QEventLoop()
             
             try: web_view.loadFinished.disconnect()
-            except: pass
+            except Exception: pass
             web_view.loadFinished.connect(loop.quit)
-            
-            QTimer.singleShot(2000, loop.quit)
+
+            # Timeout so a failed load can't hang the UI; stopped afterwards
+            # so it cannot fire into the print wait below and cut it short.
+            load_timer = QTimer()
+            load_timer.setSingleShot(True)
+            load_timer.timeout.connect(loop.quit)
+            load_timer.start(5000)
             loop.exec()
-            
+            load_timer.stop()
+
             pdf_print_success = [False]
             pdf_print_message = [""]
             
@@ -1147,7 +1133,7 @@ class ReportGenerator:
                 loop.quit()
                 
             try: web_view.page().pdfPrintingFinished.disconnect()
-            except: pass
+            except Exception: pass
             
             page_layout = QPageLayout(
                 QPageSize(QPageSize.PageSizeId.A4),

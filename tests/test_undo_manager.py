@@ -9,9 +9,7 @@ Tests cover:
 """
 import sys
 import unittest
-from datetime import datetime
-from unittest.mock import Mock, MagicMock, patch
-import pandas as pd
+from unittest.mock import Mock
 
 sys.path.insert(0, "/home/yhazadek/Desktop/excel")
 
@@ -21,7 +19,6 @@ from src.services.undo_manager import (
     UndoManager,
     UndoableCommand,
     UndoTransactionCommand,
-    DeleteTransactionCommand,
     TransactionSnapshot,
     LoanSnapshot,
 )

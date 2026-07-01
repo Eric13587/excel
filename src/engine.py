@@ -9,18 +9,13 @@ Service Classes:
     - SavingsService: Savings account operations  
     - BalanceRecalculator: Balance computation operations
 """
+import logging
 import math
-import json
-import uuid
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
-import pandas as pd
 
-from src.exceptions import (
-    LoanNotFoundError, 
-    LoanInactiveError, 
-    TransactionError
-)
+logger = logging.getLogger(__name__)
+from dateutil.relativedelta import relativedelta
+
 from src.config import DEFAULT_INTEREST_RATE
 
 from src.services import (LoanService, SavingsService, ChristmasService, BenevolentService,
@@ -136,7 +131,6 @@ class LoanEngine:
         with a parseable 'Loan Issued' note.
         """
         import re
-        import math
         cur = self.db.conn.cursor()
         cur.execute("SELECT id, total_amount, installment, monthly_interest FROM loans "
                     "WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
@@ -741,9 +735,8 @@ class LoanEngine:
                 
                 if current_tx_idx:
                     idx = current_tx_idx[0]
-                    print(f"DEBUG: Found transaction index {idx} for ID {trans_id}")
+                    logger.debug("Found transaction index %s for ID %s", idx, trans_id)
                     prev_bal = 0.0
-                    prev_unearned = 0.0 
                     
                     if idx > 0:
                         prev_bal = float(df.iloc[idx-1]['balance'])
@@ -754,7 +747,7 @@ class LoanEngine:
                     new_installment = math.ceil(total_debt / duration)
                     new_monthly_interest = math.ceil(new_interest_amt / duration)
                     
-                    print(f"DEBUG: Refreshing Loan Terms -> Installment: {new_installment}, MonthlyInt: {new_monthly_interest}")
+                    logger.debug("Refreshing loan terms -> installment: %s, monthly interest: %s", new_installment, new_monthly_interest)
                     
                     # Update Loan Record (scope to this member — loan refs like
                     # L-001 are NOT unique across individuals).
@@ -763,9 +756,9 @@ class LoanEngine:
                                    (new_installment, new_monthly_interest, loan_ref, individual_id))
                     self.db.conn.commit()
                 else:
-                    print(f"DEBUG: Transaction ID {trans_id} NOT FOUND in Ledger DF!")
-            except Exception as e:
-                print(f"Error refreshing loan terms: {e}")
+                    logger.warning("Transaction ID %s not found in ledger dataframe", trans_id)
+            except Exception:
+                logger.exception("Error refreshing loan terms")
 
             self.recalculate_smart_loan_ledger(individual_id, loan_ref)
             
@@ -776,7 +769,6 @@ class LoanEngine:
         else:
             # Generic Update
             deducted = tx['deducted']
-            added = tx['added']
             # If standard deposit/withdrawal?
             # Assuming just update values and recalc balances.
             self.db.update_transaction(trans_id, new_date, new_amount, deducted, new_notes)

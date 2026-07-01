@@ -1,8 +1,6 @@
 import sys
 import os
 import unittest
-import sqlite3
-from datetime import datetime
 
 # Add src to path for imports
 sys.path.insert(0, "/home/yhazadek/Desktop/excel")

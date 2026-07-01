@@ -1,0 +1,55 @@
+[project]
+name = "loanmaster"
+version = "1.0.13"
+description = "Desktop loan, savings and fund management for SACCOs (PyQt6 + SQLite)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.4.0",
+    "PyQt6-WebEngine>=6.4.0",
+    "pandas>=1.5.0",
+    "XlsxWriter>=3.0.0",
+    "python-dateutil>=2.8.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+build = [
+    "nuitka",
+    "pyinstaller>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Qt widgets are exercised headlessly; tests/conftest.py forces the
+# offscreen platform so the suite runs without a display server.
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["scratch", "build"]
+
+[tool.ruff.lint]
+# Correctness-focused: pyflakes (F), real pycodestyle errors (E4/E7/E9)
+# and flake8-bugbear (B). Style-only rules stay off to keep diffs honest.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = [
+    "E402",  # imports not at top — entry points rely on env-var/QApplication ordering
+    "E701",  # one-line `if x: return` — established idiom throughout this codebase
+    "E702",  # statements joined by semicolon — same idiom
+    "E731",  # lambda assignment — used deliberately for Qt signal glue
+    "E741",  # ambiguous variable names — 'l' for ledger rows is idiomatic here
+    "B007",  # unused loop variable — common with enumerate/dict iteration here
+    "B008",  # function call in default — Qt idiom (QDate.currentDate() etc.)
+    "B905",  # zip() without strict= — pre-3.10 code; revisit when adding typing
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-exports are part of these packages' public surface.
+"src/__init__.py" = ["F401"]
+"src/services/__init__.py" = ["F401"]
+"src/views/__init__.py" = ["F401"]
+"tests/__init__.py" = ["F401"]

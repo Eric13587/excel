@@ -2,8 +2,6 @@
 import unittest
 import os
 import sys
-import math
-from datetime import datetime
 
 # Add project root
 sys.path.insert(0, os.getcwd())

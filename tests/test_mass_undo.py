@@ -1,15 +1,13 @@
 
 import sys
 import unittest
-import uuid
-from datetime import datetime
 from unittest.mock import Mock
 
 sys.path.insert(0, ".") # Ensure src is in path
 
 from src.database import DatabaseManager
 from src.engine import LoanEngine
-from src.services.undo_manager import UndoManager, MassLoanCatchUpCommand, MassSavingsCatchUpCommand
+from src.services.undo_manager import MassLoanCatchUpCommand, MassSavingsCatchUpCommand
 
 class TestMassUndo(unittest.TestCase):
     """Test suite for Mass Operation Undo functionality."""

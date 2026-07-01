@@ -1,7 +1,5 @@
 import sys
 import unittest
-import os
-from datetime import datetime
 
 sys.path.insert(0, "/home/yhazadek/Desktop/excel")
 

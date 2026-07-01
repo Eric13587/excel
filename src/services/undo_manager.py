@@ -5,10 +5,8 @@ operations. Each undoable action is encapsulated as a command that can be
 executed, undone, and redone.
 """
 from abc import ABC, abstractmethod
-from typing import Optional, List, Any, Dict
+from typing import Optional, List
 from dataclasses import dataclass
-from datetime import datetime
-import json
 
 
 @dataclass

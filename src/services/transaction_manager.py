@@ -5,12 +5,13 @@ editing, deleting, undoing, and updating repayments, which often involve
 cascading effects and state restoration.
 """
 import json
+import logging
 import math
-from datetime import datetime
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 from src.config import DEFAULT_INTEREST_RATE
 
-from src.exceptions import TransactionError
 
 class TransactionManager:
     """Handles generic transaction operations."""
@@ -91,7 +92,7 @@ class TransactionManager:
         if prev_state_json:
              try:
                  prev_state = json.loads(prev_state_json)
-             except:
+             except Exception:
                  prev_state = None
 
         # --- 2b. Cascade Delete Trigger (User Request) ---
@@ -159,7 +160,6 @@ class TransactionManager:
                  )
         else:
             # --- 5. Legacy Fallback (No Snapshot) ---
-            deducted = trans['deducted']
             added = trans['added']
             
             if event_type == "Interest Earned":
@@ -167,7 +167,6 @@ class TransactionManager:
                  self.db.update_loan_details(loan['id'], 0, loan['balance'], loan['installment'], loan['monthly_interest'], loan['next_due_date'], unearned_interest=curr_u + added)
             
             elif event_type == "Loan Top-Up":
-                 new_bal = loan['balance'] - added 
                  interest_removed = added * DEFAULT_INTEREST_RATE
                  curr_u = loan.get('unearned_interest', 0)
                  new_u = curr_u - interest_removed
@@ -382,7 +381,7 @@ class TransactionManager:
                         # Calling again with skip_recursive_update=True forces re-evaluation of splits
                         self.update_repayment_amount(individual_id, trans_id, new_amount, notes, skip_recursive_update=True)
                         
-                    except Exception as e:
-                        print(f"Error updating future accruals: {e}")
+                    except Exception:
+                        logger.exception("Error updating future accruals")
 
         return True

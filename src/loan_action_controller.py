@@ -3,7 +3,6 @@
 This module provides a controller for loan-related actions in the Dashboard,
 extracted for better separation of concerns.
 """
-from datetime import datetime
 from typing import Callable, Optional, Tuple
 
 from PyQt6.QtWidgets import QMessageBox, QDialog, QFileDialog

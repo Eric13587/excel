@@ -96,7 +96,7 @@ def test_retire_sets_status_and_reinstate_clears_it():
 def test_pf_no_owner_detects_duplicates():
     db = _db()
     a = db.add_individual("Alice", "0", "a@x", pf_no="PF-100")
-    b = db.add_individual("Bob", "0", "b@x", pf_no="PF-200")
+    db.add_individual("Bob", "0", "b@x", pf_no="PF-200")
     assert db.pf_no_owner("PF-100") == "Alice"
     assert db.pf_no_owner("PF-999") is None          # unused
     assert db.pf_no_owner("") is None                # blank never a dup

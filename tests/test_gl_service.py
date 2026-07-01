@@ -272,7 +272,7 @@ def test_balance_sheet_with_capital_and_expense_balances(gl):
 # --------------------------------------------------------------------------- #
 def test_rebuild_reflects_ledger_deletion(gl):
     svc, db = gl
-    ind = _seed_subledgers(db)
+    _seed_subledgers(db)
     svc.backfill_from_subledgers()
     before = svc.get_account_balance(GL_LOANS_RECEIVABLE)
 

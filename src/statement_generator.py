@@ -3,12 +3,14 @@
 This module handles PDF and Excel statement generation, extracted from
 the Dashboard view for better separation of concerns.
 """
+import logging
 import os
 import re
-import sys
 import math
 import calendar
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # Optional dependencies
 try:
@@ -17,9 +19,9 @@ try:
 except ImportError:
     _PANDAS_AVAILABLE = False
 
-from src.config import DEFAULT_INTEREST_RATE
+from src import branding
 from src.data_structures import (
-    StatementData, StatementPresentation, StatementLoanSection, 
+    StatementData, StatementPresentation, StatementLoanSection,
     StatementRow, StatementSavingsRow, StatementConfig
 )
 
@@ -41,43 +43,12 @@ class StatementGenerator:
         """
         self.db = db_manager
         self._get_printer_view = printer_view_getter
-        self._logo_path = self._resolve_logo_path()
-    
-    @staticmethod
-    def _resolve_logo_path():
-        """Resolve absolute path to the SACCO logo for embedding in statements."""
-        if getattr(sys, 'frozen', False):
-            base_path = os.path.dirname(sys.executable)
-        else:
-            base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        
-        logo_path = os.path.join(base_path, "resources", "nairobi_water_sacco_logo.png")
-        if os.path.exists(logo_path):
-            return logo_path
-        return None
+        self._logo_path = branding.bundled_logo_path()
 
     @staticmethod
     def _get_base64_data_url(path):
         """Load image file and return its base64 data URL for inline HTML embedding."""
-        if not path or not os.path.exists(path):
-            return ""
-        try:
-            import base64
-            ext = os.path.splitext(path)[1].lower()
-            mime_type = "image/png"
-            if ext in ['.jpg', '.jpeg']:
-                mime_type = "image/jpeg"
-            elif ext == '.gif':
-                mime_type = "image/gif"
-            elif ext == '.svg':
-                mime_type = "image/svg+xml"
-                
-            with open(path, "rb") as image_file:
-                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-                return f"data:{mime_type};base64,{encoded_string}"
-        except Exception as e:
-            print(f"Failed to encode image {path} as base64: {e}")
-            return ""
+        return branding.image_data_url(path)
 
     @staticmethod
     def clean_notes(note):
@@ -228,8 +199,8 @@ class StatementGenerator:
         try:
             start = datetime.strptime(from_date, "%Y-%m-%d")
             end = datetime.strptime(to_date, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("Invalid date format. Expected YYYY-MM-DD.")
+        except ValueError as e:
+            raise ValueError("Invalid date format. Expected YYYY-MM-DD.") from e
 
         if start > end:
             raise ValueError("Start date cannot be after end date.")
@@ -434,7 +405,6 @@ class StatementGenerator:
             config = StatementConfig()
 
         savings_only = not config.show_loans and config.show_savings
-        loans_only = config.show_loans and not config.show_savings
 
         # Generate HTML with landscape layout
         html = """<!DOCTYPE html>
@@ -443,6 +413,7 @@ class StatementGenerator:
     @page { size: landscape; margin: 15mm; }
     body { font-family: Arial, sans-serif; margin: 0; padding: 10px; font-size: 9px; }
     .header { text-align: center; border-bottom: 3px solid #2b5797; padding-bottom: 10px; margin-bottom: 15px; display: flex; align_items: center; justify-content: center; position: relative;}
+    .header .org-name { color: #0f172a; font-size: 15px; font-weight: bold; letter-spacing: 0.5px; }
     .header h1 { color: #2b5797; margin: 0; font-size: 22px; }
     .header h2 { color: #333; margin: 5px 0 0 0; font-size: 16px; font-weight: normal; }
     .header .period { color: #666; font-size: 11px; margin-top: 5px; }
@@ -468,15 +439,18 @@ class StatementGenerator:
 </style>
 </head><body>"""
         
-        # Header logo: a configured company logo, else the bundled SACCO logo,
-        # so the statement is always branded top-left like a letterhead.
-        header_logo_path = config.company_logo_path or self._logo_path
+        # Header logo: per-statement override > journal's configured logo >
+        # bundled fallback, so the statement is always branded like a letterhead.
+        header_logo_path = branding.resolve_logo_path(self.db, config.company_logo_path)
         header_logo_url = self._get_base64_data_url(header_logo_path) if header_logo_path else ""
         logo_html = f'<img src="{header_logo_url}" class="logo">' if header_logo_url else ''
+        org_name = config.company_name or branding.get_org_name(self.db)
+        org_html = f'<div class="org-name">{org_name}</div>' if org_name else ''
         
         html += f"""<div class="header">
     {logo_html}
     <div>
+        {org_html}
         <h1>{config.custom_title}</h1>
         <h2>{presentation.customer_name}</h2>
         <div class="period">For the period: {presentation.period_display}</div>
@@ -629,7 +603,7 @@ class StatementGenerator:
         try:
             self._validate_inputs(ind_id, from_date, to_date)
         except ValueError as e:
-            print(f"Validation Error: {e}")
+            logger.error("Statement validation error: %s", e)
             return False, None, "error"
         
         # Consolidate DB calls
@@ -640,8 +614,8 @@ class StatementGenerator:
         # Prepare presentation
         try:
              presentation = self._prepare_presentation(data, from_date, to_date, config)
-        except Exception as e:
-            print(f"Presentation preparation failed: {e}")
+        except Exception:
+            logger.exception("Statement presentation preparation failed")
             return False, None, "error"
         
         # Guard: if completely empty?
@@ -669,7 +643,7 @@ class StatementGenerator:
             loop = QEventLoop()
             try:
                 web_view.loadFinished.disconnect()
-            except:
+            except Exception:
                 pass
             
             web_view.loadFinished.connect(loop.quit)
@@ -689,7 +663,7 @@ class StatementGenerator:
             
             try:
                 web_view.page().pdfPrintingFinished.disconnect()
-            except:
+            except Exception:
                 pass
             
             web_view.page().pdfPrintingFinished.connect(on_pdf_done)
@@ -698,10 +672,10 @@ class StatementGenerator:
             
         except Exception as e:
             if config and not config.allow_html_fallback:
-                 print(f"PDF generation failed: {e}. Fallback disabled.")
+                 logger.exception("PDF generation failed; HTML fallback disabled")
                  return False, None, "failed"
                  
-            print(f"PDF generation failed: {e}, falling back to HTML")
+            logger.warning("PDF generation failed (%s), falling back to HTML", e)
             filepath = filepath.replace('.pdf', '.html')
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(html)
@@ -727,13 +701,13 @@ class StatementGenerator:
             config = StatementConfig()
 
         if not _PANDAS_AVAILABLE:
-            print("pandas not available for Excel generation")
+            logger.error("pandas not available for Excel generation")
             return False
             
         try:
             self._validate_inputs(ind_id, from_date, to_date)
         except ValueError as e:
-            print(f"Validation Error: {e}")
+            logger.error("Statement validation error: %s", e)
             return False
             
         # Use sanitized name for filename
@@ -750,8 +724,8 @@ class StatementGenerator:
         # Prepare presentation
         try:
              presentation = self._prepare_presentation(data, from_date, to_date, config)
-        except Exception as e:
-            print(f"Presentation preparation failed: {e}")
+        except Exception:
+            logger.exception("Statement presentation preparation failed")
             return False
 
         if not presentation.loan_sections and not presentation.savings_rows:
@@ -877,6 +851,6 @@ class StatementGenerator:
             
             return True
             
-        except Exception as e:
-            print(f"Excel generation failed: {e}")
+        except Exception:
+            logger.exception("Excel statement generation failed")
             return False

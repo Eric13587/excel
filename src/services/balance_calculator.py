@@ -5,11 +5,14 @@ This service handles all balance recalculation operations including:
 - Loan history replay
 - Unearned interest calculations
 """
+import logging
 import math
 import re
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from src.config import DEFAULT_INTEREST_RATE
 
@@ -118,7 +121,7 @@ class BalanceRecalculator:
                                     
                             new_due_date = new_due_dt.strftime("%Y-%m-%d")
                     except Exception as e:
-                        print(f"Error calculating next_due_date: {e}")
+                        logger.warning("Error calculating next_due_date: %s", e)
                         
                     self.db.update_loan_status(loan['id'], running_p, new_due_date, status,
                                                interest_balance=running_i)
@@ -477,8 +480,6 @@ class BalanceRecalculator:
                 last_accrual_date = row['date']
                  
             elif event == "Repayment":
-                daily_interest = 0 # Simple model here?
-                
                 # 3. Determine Payment Amount (Physics Check)
                 # Calculate True Debt State Limit
                 curr_total_debt = running_principal + running_interest
@@ -596,9 +597,6 @@ class BalanceRecalculator:
         # Check if we are in the "Latest" regime (no future Top-Ups processed that we skipped?)
         # Since we processed the whole DF sorted by date, and running_principal/interest reflect the
         # state after the LAST transaction, this is the current state.
-        
-        # Total Balance (Principal + Interest)
-        final_balance = running_principal + running_interest
         
         # We need to update:
         # - installment (current_installment)

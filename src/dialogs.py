@@ -718,7 +718,6 @@ class ImportPreviewDialog(QDialog):
                     merged_add += 1
             
             # Update labels
-            total_resolved = len(self.decision_map)
             self.lbl_conflicts.setText("Resolved")
             self.lbl_conflicts.setStyleSheet("color: green; font-weight: bold;")
             

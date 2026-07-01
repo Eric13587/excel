@@ -7,11 +7,14 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtGui import QAction, QPixmap, QColor
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from datetime import datetime
+import logging
 import os
 import sys
 
+logger = logging.getLogger(__name__)
 
-from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, DuplicateResolutionDialog, ImportHistoryDialog, ImportPreviewDialog, ExcelImportDialog
+
+from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, ImportHistoryDialog, ImportPreviewDialog, ExcelImportDialog
 from src.reports import ReportGenerator
 from ..theme import ThemeManager
 from ..database import DatabaseManager
@@ -191,7 +194,7 @@ class ReportWorker(QThread):
             if db_manager and hasattr(db_manager, 'conn'):
                 try:
                     db_manager.conn.close()
-                except:
+                except Exception:
                     pass
 
 
@@ -465,6 +468,10 @@ class Dashboard(QWidget):
         repair_action.triggered.connect(self.open_repair_loans_dialog)
         mass_menu.addAction(repair_action)
 
+        orphan_action = QAction("Repair Orphaned Records…", self)
+        orphan_action.triggered.connect(self.open_orphan_repair_dialog)
+        mass_menu.addAction(orphan_action)
+
         activity_action = QAction("Activity Log…", self)
         activity_action.triggered.connect(self.show_activity_log)
         mass_menu.addAction(activity_action)
@@ -569,7 +576,7 @@ class Dashboard(QWidget):
              c = QColor(t.get_color("shadow"))
              self.search_shadow.setColor(c)
              self.actions_shadow.setColor(c)
-        except:
+        except Exception:
              pass
 
         # Results Label
@@ -628,7 +635,7 @@ class Dashboard(QWidget):
         self.print_selected_btn.setStyleSheet(f"background-color: {t.get_color('accent')}; color: white; padding: 8px 15px; border-radius: 5px;")
         self.reports_btn.setStyleSheet(f"background-color: {t.get_color('success')}; color: white; padding: 8px 15px; border-radius: 5px;")
         self.settings_btn.setStyleSheet(f"background-color: {t.get_color('text_secondary')}; color: white; padding: 8px 15px; border-radius: 5px;")
-        self.mass_ops_btn.setStyleSheet(f"background-color: #8B5CF6; color: white; padding: 8px 15px; border-radius: 5px;") # Purple
+        self.mass_ops_btn.setStyleSheet("background-color: #8B5CF6; color: white; padding: 8px 15px; border-radius: 5px;") # Purple
 
         # Update all cards
         for card in self.card_widgets:
@@ -753,10 +760,10 @@ class Dashboard(QWidget):
             if savings_bal > 0:
                 msg += f"\u2022 Savings balance of {savings_bal:,.0f} will be auto-withdrawn\n"
             if has_loans:
-                msg += f"\u2022 Outstanding loans will remain active until cleared\n"
-                msg += f"\u2022 They will still appear in Loan Reports\n"
-            msg += f"\n\u2022 They will be excluded from Savings/Shares Reports\n"
-            msg += f"\u2022 They will be excluded from Mass Savings operations"
+                msg += "\u2022 Outstanding loans will remain active until cleared\n"
+                msg += "\u2022 They will still appear in Loan Reports\n"
+            msg += "\n\u2022 They will be excluded from Savings/Shares Reports\n"
+            msg += "\u2022 They will be excluded from Mass Savings operations"
             
             confirm = QMessageBox.question(
                 self, "Retire Individual", msg,
@@ -982,56 +989,92 @@ class Dashboard(QWidget):
                 self.printer_view = QWebEngineView()
                 self.printer_view.hide()
             except ImportError:
-                print("QtWebEngineWidgets not found. PDF printing not available.")
+                logger.warning("QtWebEngineWidgets not found. PDF printing not available.")
                 return None
         return self.printer_view
 
     def open_settings(self):
-        """Open settings dialog."""
-        from PyQt6.QtWidgets import QComboBox, QDialogButtonBox
+        """Open settings dialog (Organization / Financial / Appearance)."""
+        from PyQt6.QtWidgets import QComboBox, QDialogButtonBox, QGroupBox
+        from src import branding
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
-        layout = QFormLayout(dialog)
-        
-        # FY Start
+        dialog.setMinimumWidth(480)
+        outer = QVBoxLayout(dialog)
+
+        # --- Organization (branding used on every statement and report) ---
+        org_box = QGroupBox("Organization")
+        org_form = QFormLayout(org_box)
+        org_name_edit = QLineEdit(self.db.get_setting(branding.ORG_NAME_KEY, "") or "")
+        org_name_edit.setPlaceholderText("e.g. Umoja Staff Co-operative")
+        org_form.addRow("Organization Name:", org_name_edit)
+
+        logo_row = QHBoxLayout()
+        logo_edit = QLineEdit(self.db.get_setting(branding.ORG_LOGO_KEY, "") or "")
+        logo_edit.setPlaceholderText("Bundled default logo")
+        logo_edit.setReadOnly(True)
+        browse_btn = QPushButton("Browse…")
+        clear_btn = QPushButton("Clear")
+
+        def pick_logo():
+            path, _ = QFileDialog.getOpenFileName(
+                dialog, "Choose Logo", "",
+                "Images (*.png *.jpg *.jpeg *.gif *.svg)")
+            if path:
+                logo_edit.setText(path)
+
+        browse_btn.clicked.connect(pick_logo)
+        clear_btn.clicked.connect(lambda: logo_edit.setText(""))
+        logo_row.addWidget(logo_edit); logo_row.addWidget(browse_btn); logo_row.addWidget(clear_btn)
+        org_form.addRow("Logo:", logo_row)
+        org_form.addRow(QLabel("<small>Shown on statements, reports and exports. "
+                               "Leave blank to use the bundled logo.</small>"))
+        outer.addWidget(org_box)
+
+        # --- Financial ---
+        fin_box = QGroupBox("Financial")
+        fin_form = QFormLayout(fin_box)
         fy_combo = QComboBox()
-        months = ["January", "February", "March", "April", "May", "June", 
+        months = ["January", "February", "March", "April", "May", "June",
                   "July", "August", "September", "October", "November", "December"]
         fy_combo.addItems(months)
-        
-        # Load current
         current_fy_str = self.db.get_setting("fy_start_month", "November")
         if current_fy_str in months:
             fy_combo.setCurrentText(current_fy_str)
-        
-        layout.addRow("Financial Year Start:", fy_combo)
-        
-        # Theme Selection
-        theme_combo = QComboBox()
-        theme_combo.addItems(["Light", "Dark"])
-        current_theme = self.theme_manager.current_theme_name
-        theme_combo.setCurrentText(current_theme)
-        layout.addRow("Application Theme:", theme_combo)
-        
-        # Deduction Same Month
+        fin_form.addRow("Financial Year Start:", fy_combo)
+
         deduct_cb = QCheckBox("Allow Deduction in Same Month of Issue")
         deduct_val = self.db.get_setting("deduct_same_month", "false")
         deduct_cb.setChecked(deduct_val.lower() == "true")
-        layout.addRow(deduct_cb)
-        
+        fin_form.addRow(deduct_cb)
+        outer.addWidget(fin_box)
+
+        # --- Appearance ---
+        app_box = QGroupBox("Appearance")
+        app_form = QFormLayout(app_box)
+        theme_combo = QComboBox()
+        theme_combo.addItems(["Light", "Dark"])
+        theme_combo.setCurrentText(self.theme_manager.current_theme_name)
+        app_form.addRow("Application Theme:", theme_combo)
+        outer.addWidget(app_box)
+
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dialog.accept)
         btns.rejected.connect(dialog.reject)
-        layout.addRow(btns)
-        
+        outer.addWidget(btns)
+
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            new_fy = fy_combo.currentText()
-            self.db.set_setting("fy_start_month", new_fy)
-            
-            new_deduct = "true" if deduct_cb.isChecked() else "false"
-            self.db.set_setting("deduct_same_month", new_deduct)
-            
-            # Save Theme
+            self.db.set_setting(branding.ORG_NAME_KEY, org_name_edit.text().strip())
+            self.db.set_setting(branding.ORG_LOGO_KEY, logo_edit.text().strip())
+            self.db.set_setting("fy_start_month", fy_combo.currentText())
+            self.db.set_setting("deduct_same_month",
+                                "true" if deduct_cb.isChecked() else "false")
+
+            # Reflect the organization name in the window title immediately.
+            main_win = self.window()
+            if hasattr(main_win, "refresh_window_title"):
+                main_win.refresh_window_title()
+
             selected_theme = theme_combo.currentText()
             if selected_theme != self.theme_manager.current_theme_name:
                 self.theme_manager.set_theme(selected_theme)
@@ -1354,7 +1397,9 @@ class Dashboard(QWidget):
         from PyQt6.QtCore import QDate
         from dateutil.relativedelta import relativedelta
         from datetime import datetime
-        import platform, subprocess, os
+        import platform
+        import subprocess
+        import os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
 
@@ -1461,7 +1506,6 @@ class Dashboard(QWidget):
         """Generate quarterly loan interest report."""
         from ..reports import ReportGenerator
         from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox, QComboBox, QPushButton
-        from PyQt6.QtCore import QDate
         from dateutil.relativedelta import relativedelta
         
         # Determine Default Date based on FY Setting
@@ -1775,10 +1819,11 @@ class Dashboard(QWidget):
     def export_members_list(self):
         """Export a members directory to Excel/PDF/CSV with user-chosen columns."""
         from ..reports import ReportGenerator
-        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
-                                     QListWidgetItem, QPushButton, QDialogButtonBox, QFileDialog,
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialogButtonBox, QFileDialog,
                                      QProgressDialog)
-        import platform, subprocess, os
+        import platform
+        import subprocess
+        import os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
         default_on = {"name", "pf_no", "id_no", "phone", "employment_status"}
@@ -1862,7 +1907,7 @@ class Dashboard(QWidget):
     def show_activity_log(self):
         """View the CRUD audit trail (member/loan create/update/delete with dates)."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
-                                     QTableWidgetItem, QHeaderView, QDialogButtonBox)
+                                     QHeaderView, QDialogButtonBox)
         entries = self.db.get_audit_log(limit=1000)
         dlg = QDialog(self)
         dlg.setWindowTitle("Activity Log")
@@ -1889,7 +1934,7 @@ class Dashboard(QWidget):
     def open_repair_loans_dialog(self):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
-                                     QTableWidgetItem, QHeaderView, QDialogButtonBox, QProgressDialog)
+                                     QHeaderView, QDialogButtonBox, QProgressDialog)
         import shutil
         from datetime import datetime
 
@@ -1966,6 +2011,116 @@ class Dashboard(QWidget):
             dlg.accept()
 
         repair_btn.clicked.connect(do_repair)
+        dlg.exec()
+
+    def open_orphan_repair_dialog(self):
+        """Review and clean up records left behind by deleted members.
+
+        Legacy journals (written before foreign keys were enforced) can hold
+        ledger/savings/loan rows whose member no longer exists. They skew
+        report totals and keep foreign-key protection disabled. The dialog
+        shows every orphan group, offers an Excel audit export, and deletes
+        them only after an explicit confirmation and a fresh backup.
+        """
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
+                                     QHeaderView, QDialogButtonBox)
+        import shutil
+        from datetime import datetime
+
+        orphans = self.db.find_orphaned_rows()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Repair Orphaned Records")
+        dlg.setMinimumSize(640, 460)
+        layout = QVBoxLayout(dlg)
+
+        if not orphans:
+            layout.addWidget(QLabel(
+                "✓ No orphaned records — every transaction belongs to an "
+                "existing member.\n\nForeign-key protection is active, so new "
+                "orphans cannot be created."))
+            bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+            bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
+            layout.addWidget(bb)
+            dlg.exec()
+            return
+
+        total_rows = sum(o["rows"] for o in orphans)
+        layout.addWidget(QLabel(
+            f"<b>{total_rows} record(s)</b> reference members that were deleted "
+            "before database protection was enabled. They can distort report "
+            "totals and keep foreign-key protection switched off.<br><br>"
+            "Recommended: <b>export an audit copy first</b>, then delete them. "
+            "A backup of the journal is taken automatically before deleting."))
+
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["Table", "Deleted Member ID", "Rows",
+                                         "First Date", "Last Date"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setRowCount(len(orphans))
+        for i, o in enumerate(orphans):
+            table.setItem(i, 0, QTableWidgetItem(o["table"]))
+            table.setItem(i, 1, QTableWidgetItem(str(o["individual_id"])))
+            table.setItem(i, 2, QTableWidgetItem(str(o["rows"])))
+            table.setItem(i, 3, QTableWidgetItem(str(o["first_date"] or "—")))
+            table.setItem(i, 4, QTableWidgetItem(str(o["last_date"] or "—")))
+        layout.addWidget(table)
+
+        bb = QDialogButtonBox()
+        export_btn = bb.addButton("Export Audit Copy…", QDialogButtonBox.ButtonRole.ActionRole)
+        delete_btn = bb.addButton(f"Delete All ({total_rows})", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton(QDialogButtonBox.StandardButton.Cancel)
+        bb.rejected.connect(dlg.reject)
+        layout.addWidget(bb)
+
+        def do_export():
+            default = f"orphaned_records_{datetime.now().strftime('%Y%m%d')}.xlsx"
+            path, _ = QFileDialog.getSaveFileName(dlg, "Export Audit Copy",
+                                                  default, "Excel Files (*.xlsx)")
+            if not path:
+                return
+            try:
+                n = self.db.export_orphaned_rows(path)
+                QMessageBox.information(dlg, "Export Complete",
+                                        f"Exported {n} record(s) to:\n{path}")
+            except Exception as e:
+                QMessageBox.critical(dlg, "Export Failed", f"Could not export: {e}")
+
+        def do_delete():
+            if QMessageBox.question(
+                    dlg, "Confirm Delete",
+                    f"Permanently delete {total_rows} orphaned record(s)?\n\n"
+                    "The journal will be backed up first. This cannot be "
+                    "undone from within the app.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            src = getattr(self.db, "db_name", None)
+            if src:
+                try:
+                    shutil.copy(src, f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
+                    return
+            try:
+                counts = self.db.delete_orphaned_rows()
+            except Exception as e:
+                QMessageBox.critical(dlg, "Delete Failed",
+                                     f"Nothing was deleted (transaction rolled back): {e}")
+                return
+            detail = "\n".join(f"  {t}: {n}" for t, n in counts.items())
+            fk_on = self.db.conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            fk_msg = ("\n\nForeign-key protection is now ACTIVE — future "
+                      "member deletions cannot leave orphans behind."
+                      if fk_on else "")
+            QMessageBox.information(dlg, "Repair Complete",
+                                    f"Deleted rows:\n{detail}{fk_msg}")
+            self.load_individuals()
+            dlg.accept()
+
+        export_btn.clicked.connect(do_export)
+        delete_btn.clicked.connect(do_delete)
         dlg.exec()
 
     def import_individuals(self):

@@ -1,10 +1,8 @@
 
 import sys
 import unittest
-import uuid
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from unittest.mock import Mock
 
 sys.path.insert(0, ".") 
 
@@ -86,7 +84,6 @@ class TestSavingsEnhancements(unittest.TestCase):
         # Reset
         self.db.delete_savings_batch("non-existent") # Just clear logic if needed, but easier to make new user
         u2 = self.db.add_individual("User 2", "222", "u2@test.com")
-        start_date = datetime(2025, 1, 1)
         self.service.add_deposit(u2, 1000, "2025-01-01", "Start")
         
         # Target: March 2025

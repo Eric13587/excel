@@ -18,8 +18,8 @@ def _env():
 
 def test_members_list_selected_columns_and_sorting():
     db, d = _env()
-    bravo = db.add_individual("Bravo", "0712", "b@x", pf_no="PF-2", id_no="ID-2",
-                              employment_status="Resigned")
+    db.add_individual("Bravo", "0712", "b@x", pf_no="PF-2", id_no="ID-2",
+                      employment_status="Resigned")
     alpha = db.add_individual("Alpha", "0711", "a@x", pf_no="PF-1", id_no="ID-1")
     db.add_savings_transaction(alpha, "2026-01-01", "Deposit", 5000, "")
 

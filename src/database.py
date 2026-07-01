@@ -1,21 +1,38 @@
 """Database management module for LoanMaster."""
+import glob
+import logging
+import os
 import sqlite3
 import pandas as pd
 import json
 from datetime import datetime
 from contextlib import contextmanager
 
-from src.exceptions import DatabaseError, TransactionError
+logger = logging.getLogger(__name__)
+
+from src.exceptions import TransactionError
 from src.data_structures import StatementData
+
+# How many timestamped on-open backups to keep per journal.
+BACKUP_KEEP_COUNT = 10
 
 
 class DatabaseManager:
     """Handles all SQLite database operations."""
-    
-    def __init__(self, db_name="loan_master.db"):
+
+    def __init__(self, db_name="loan_master.db", auto_backup=False):
         self.db_name = db_name
+        pre_existing = db_name != ":memory:" and os.path.exists(db_name)
         self.conn = sqlite3.connect(db_name)
         self._closed = False
+        self.integrity_ok = True
+        # Snapshot the journal before create_tables() runs schema migrations,
+        # so a bad migration can always be rolled back from the backup.
+        if auto_backup and pre_existing:
+            self._backup_on_open()
+        if pre_existing:
+            self._check_integrity()
+        self._configure_connection()
         # Optional write-path hooks: called with a list of just-inserted row ids
         # after a ledger/savings insert, so the general ledger can post the
         # matching journals live (see GLService.post_ledger_rows). Left as None
@@ -24,13 +41,183 @@ class DatabaseManager:
         self.savings_post_hook = None
         self.create_tables()
 
+    def _configure_connection(self):
+        """Apply per-connection safety settings.
+
+        - busy_timeout: wait instead of failing immediately when another
+          process (this is a multi-user app) briefly locks the journal.
+        - foreign_keys: enforce the FKs the schema already declares, but only
+          when the existing data passes a consistency check — enabling
+          enforcement on top of legacy orphan rows would make unrelated
+          writes start failing at runtime.
+
+        journal_mode is deliberately left at the SQLite default (DELETE):
+        WAL persists inside the database file and is unsafe on network
+        shares, which is how multi-user journals are commonly hosted.
+        """
+        cur = self.conn.cursor()
+        cur.execute("PRAGMA busy_timeout = 5000")
+        try:
+            violations = cur.execute("PRAGMA foreign_key_check").fetchall()
+        except sqlite3.DatabaseError:
+            violations = None
+        if violations:
+            tables = sorted({v[0] for v in violations})
+            logger.warning(
+                "Foreign-key enforcement left OFF: %d orphaned row(s) in %s. "
+                "Run the Repair tools to fix legacy data.",
+                len(violations), ", ".join(tables),
+            )
+        elif violations is not None:
+            cur.execute("PRAGMA foreign_keys = ON")
+
+    def _check_integrity(self):
+        """Run SQLite's quick_check and record the result.
+
+        Does not raise: even a damaged journal should still open so data can
+        be exported, but the UI is expected to warn when integrity_ok is
+        False.
+        """
+        try:
+            row = self.conn.execute("PRAGMA quick_check").fetchone()
+        except sqlite3.DatabaseError as e:
+            logger.critical("Integrity check could not run on %s: %s", self.db_name, e)
+            self.integrity_ok = False
+            return
+        if row and row[0] == "ok":
+            logger.info("Integrity check passed for %s", self.db_name)
+        else:
+            logger.critical("Integrity check FAILED for %s: %s", self.db_name, row)
+            self.integrity_ok = False
+
+    def _backup_on_open(self, keep=BACKUP_KEEP_COUNT):
+        """Copy the journal into <journal dir>/backups/, keeping the last N.
+
+        Uses the SQLite online-backup API (safe against a live database).
+        Backup failure is logged but never blocks opening the journal.
+        """
+        try:
+            db_path = os.path.abspath(self.db_name)
+            backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            stem = os.path.splitext(os.path.basename(db_path))[0]
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            dest_path = os.path.join(backup_dir, f"{stem}.{stamp}.db")
+            if not os.path.exists(dest_path):
+                dest = sqlite3.connect(dest_path)
+                try:
+                    self.conn.backup(dest)
+                finally:
+                    dest.close()
+                logger.info("Journal backed up to %s", dest_path)
+            old_backups = sorted(glob.glob(os.path.join(backup_dir, f"{stem}.*.db")))
+            for stale in old_backups[:-keep]:
+                os.remove(stale)
+        except Exception:
+            logger.exception("Automatic backup failed (continuing without it)")
+
+    # ------------------------------------------------------------------
+    # Orphaned-record repair
+    #
+    # Legacy journals were written without foreign-key enforcement, so a
+    # deleted member could leave transactions behind in the child tables.
+    # Those orphans silently skew any aggregate that sums a child table
+    # directly, and they keep FK enforcement disabled (see
+    # _configure_connection). These methods power the guided repair tool.
+    # ------------------------------------------------------------------
+
+    def _tables_with_individual_id(self):
+        """All tables (except individuals) that carry an individual_id column."""
+        cur = self.conn.cursor()
+        tables = [r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()]
+        out = []
+        for t in tables:
+            if t == "individuals":
+                continue
+            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t})").fetchall()]
+            if "individual_id" in cols:
+                out.append(t)
+        return out
+
+    def find_orphaned_rows(self):
+        """Group child rows whose individual_id no longer exists.
+
+        A NULL individual_id also counts as orphaned — no row in a child
+        table is meaningful without a member.
+
+        Returns a list of dicts:
+            {table, individual_id, rows, first_date, last_date}
+        (dates are None for tables without a date column).
+        """
+        summary = []
+        cur = self.conn.cursor()
+        for t in self._tables_with_individual_id():
+            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t})").fetchall()]
+            date_expr = "MIN(o.date), MAX(o.date)" if "date" in cols else "NULL, NULL"
+            rows = cur.execute(
+                f"SELECT o.individual_id, COUNT(*), {date_expr} FROM {t} o "
+                f"LEFT JOIN individuals i ON i.id = o.individual_id "
+                f"WHERE i.id IS NULL GROUP BY o.individual_id "
+                f"ORDER BY o.individual_id").fetchall()
+            for ind_id, n, dmin, dmax in rows:
+                summary.append({"table": t, "individual_id": ind_id, "rows": n,
+                                "first_date": dmin, "last_date": dmax})
+        return summary
+
+    def export_orphaned_rows(self, path):
+        """Write an Excel audit workbook of every orphaned row.
+
+        Sheet 'Summary' lists the per-table/per-member groups; every table
+        with orphans gets its own sheet holding the complete rows. Returns
+        the number of data rows exported (excluding the summary).
+        """
+        summary = self.find_orphaned_rows()
+        total = 0
+        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+            pd.DataFrame(summary, columns=["table", "individual_id", "rows",
+                                           "first_date", "last_date"]) \
+                .to_excel(writer, sheet_name="Summary", index=False)
+            for t in self._tables_with_individual_id():
+                df = pd.read_sql_query(
+                    f"SELECT o.* FROM {t} o "
+                    f"LEFT JOIN individuals i ON i.id = o.individual_id "
+                    f"WHERE i.id IS NULL", self.conn)
+                if not df.empty:
+                    df.to_excel(writer, sheet_name=t[:31], index=False)
+                    total += len(df)
+        logger.info("Exported %d orphaned row(s) to %s", total, path)
+        return total
+
+    def delete_orphaned_rows(self):
+        """Delete every orphaned row in a single transaction.
+
+        Matches find_orphaned_rows() exactly (NULL individual_id included).
+        Afterwards the connection is re-configured, so FK enforcement
+        switches on immediately if the journal is now consistent.
+        Returns {table: rows_deleted} for tables that had orphans.
+        """
+        counts = {}
+        with self.transaction():
+            cur = self.conn.cursor()
+            for t in self._tables_with_individual_id():
+                cur.execute(
+                    f"DELETE FROM {t} WHERE individual_id IS NULL "
+                    f"OR individual_id NOT IN (SELECT id FROM individuals)")
+                if cur.rowcount:
+                    counts[t] = cur.rowcount
+        logger.info("Deleted orphaned rows: %s", counts or "none")
+        self._configure_connection()
+        return counts
+
     def _fire_post_hook(self, hook, ids):
         """Invoke a write-path hook defensively — never break the core write."""
         if hook and ids:
             try:
                 hook(ids)
             except Exception as e:
-                print(f"GL post hook failed (will reconcile on next sync): {e}")
+                logger.warning("GL post hook failed (will reconcile on next sync): %s", e)
     
     def close(self):
         """Close the database connection."""
@@ -82,8 +269,8 @@ class DatabaseManager:
             self.conn.commit()
         except sqlite3.Error as e:
             self.conn.rollback()
-            raise TransactionError(f"Transaction failed: {str(e)}")
-        except Exception as e:
+            raise TransactionError(f"Transaction failed: {str(e)}") from e
+        except Exception:
             self.conn.rollback()
             raise
 
@@ -882,11 +1069,6 @@ class DatabaseManager:
         cursor.execute("DELETE FROM ledger WHERE id=?", (id,))
         self.conn.commit()
 
-    def delete_batch(self, batch_id):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
-
     # Loan operations
     def add_loan_record(self, individual_id, ref, principal, total, balance, installment, monthly_interest, start_date, next_due_date, unearned_interest=0):
         cursor = self.conn.cursor()
@@ -1493,8 +1675,8 @@ class DatabaseManager:
             return imported_count
             
 
-        except Exception as e:
-            print(f"Import Error: {e}")
+        except Exception:
+            logger.exception("Import error")
             return 0
 
 
@@ -1618,8 +1800,8 @@ class DatabaseManager:
             finally:
                 dest_conn.close()
                     
-        except Exception as e:
-            print(f"Error checking conflicts: {e}")
+        except Exception:
+            logger.exception("Error checking import conflicts")
             return []
             
         return conflicts
@@ -1725,8 +1907,8 @@ class DatabaseManager:
             src_conn.close()
             # Dest conn closed above
             
-        except Exception as e:
-            print(f"Preview Error: {e}")
+        except Exception:
+            logger.exception("Import preview error")
             return None
             
         return preview
@@ -1895,7 +2077,6 @@ class DatabaseManager:
             existing_id = {r[0] for r in dest_cur.fetchall()}
             
             # Estimate Total Steps
-            total_steps = len(src_inds) 
             
             # Let's query counts first for better progress bar
             loan_count = 0
@@ -1908,13 +2089,13 @@ class DatabaseManager:
                     loan_count = src_cur.fetchone()[0]
                     src_cur.execute("SELECT COUNT(*) FROM ledger")
                     ledger_count = src_cur.fetchone()[0]
-                except: pass
+                except Exception: pass
             
             if options.get("import_savings", False):
                  try:
                     src_cur.execute("SELECT COUNT(*) FROM savings")
                     savings_count = src_cur.fetchone()[0]
-                 except: pass
+                 except Exception: pass
 
             total_operations = len(src_inds) + loan_count + ledger_count + savings_count
             current_op = 0
@@ -1948,7 +2129,7 @@ class DatabaseManager:
                         phone = src_ind['phone'] if src_ind['phone'] else ""
                         email = src_ind['email'] if src_ind['email'] else ""
                         keys = src_ind.keys()
-                        def sval(col, default=''):
+                        def sval(col, default='', src_ind=src_ind, keys=keys):
                             return src_ind[col] if col in keys and src_ind[col] is not None else default
                         def_ded = src_ind['default_deduction'] if 'default_deduction' in keys and src_ind['default_deduction'] else 0
                         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1987,7 +2168,7 @@ class DatabaseManager:
                 # Checkpoint: Individuals Imported Successfully
                 dest_cur.execute("SAVEPOINT individuals_imported")
                 
-            except Exception as e:
+            except Exception:
                 dest_cur.execute("ROLLBACK TO import_start")
                 self.conn.commit() # Nothing happened effectively
             # --- PHASE 2: LOANS & LEDGER ---
@@ -2139,7 +2320,7 @@ class DatabaseManager:
                     errors.append(f"Failed to import loans/ledger: {e}")
                     stats["loans"] = 0
                     stats["ledger"] = 0
-                    print(f"Import Error (Loans): {e}")
+                    logger.exception("Import error (loans)")
 
             # --- PHASE 3: SAVINGS ---
             if options.get("import_savings", False):
@@ -2228,7 +2409,7 @@ class DatabaseManager:
                     status = "partial"
                     errors.append(f"Failed to import savings: {e}")
                     stats["savings"] = 0
-                    print(f"Import Error (Savings): {e}")
+                    logger.exception("Import error (savings)")
                     pass
 
             # --- PHASE 4: FUNDS & SUSPENSIONS (best-effort) ---
@@ -2241,7 +2422,7 @@ class DatabaseManager:
             except Exception as e:
                 status = "partial"
                 errors.append(f"Failed to import funds/suspensions: {e}")
-                print(f"Import Error (Aux): {e}")
+                logger.exception("Import error (aux tables)")
 
             # Update Import History with final stats
             import_details = json.dumps(stats)
@@ -2262,7 +2443,7 @@ class DatabaseManager:
                 src_conn.close()
             self.conn.rollback() # Rollback everything if critical error
             self.conn.isolation_level = original_isolation
-            print(f"Critical Import Error: {e}")
+            logger.exception("Critical import error")
             return {"status": "failed", "stats": stats, "errors": [str(e)]}
 
         return {
@@ -2318,9 +2499,9 @@ class DatabaseManager:
             self.conn.commit()
             return True
             
-        except Exception as e:
+        except Exception:
             self.conn.rollback()
-            print(f"Undo Import Error: {e}")
+            logger.exception("Undo import error")
             return False
 
     def validate_source_schema(self, source_path):

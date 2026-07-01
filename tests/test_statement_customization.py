@@ -1,14 +1,11 @@
 import sys
 import unittest
-import os
-from datetime import datetime
-import pandas as pd
 
 sys.path.insert(0, "/home/yhazadek/Desktop/excel")
 
 from src.database import DatabaseManager
 from src.statement_generator import StatementGenerator
-from src.data_structures import StatementData, StatementConfig
+from src.data_structures import StatementConfig
 
 class TestStatementCustomization(unittest.TestCase):
     def setUp(self):
