@@ -369,14 +369,38 @@ class StatementConfigDialog(QDialog):
         # Loans List
         loan_col_layout = QVBoxLayout()
         loan_col_layout.addWidget(QLabel("<b>Loans</b>"))
+        
+        loan_list_row = QHBoxLayout()
         self.loan_col_list = QListWidget()
+        self.loan_col_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.loan_col_list.setFixedHeight(120)
         all_cols = ["Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"]
         for col in all_cols:
             item = QListWidgetItem(col)
             item.setCheckState(Qt.CheckState.Checked)
             self.loan_col_list.addItem(item)
-        loan_col_layout.addWidget(self.loan_col_list)
+        loan_list_row.addWidget(self.loan_col_list)
+        
+        loan_btns_layout = QVBoxLayout()
+        loan_up = QPushButton("▲")
+        loan_down = QPushButton("▼")
+        loan_up.setFixedWidth(30)
+        loan_down.setFixedWidth(30)
+        loan_btns_layout.addWidget(loan_up)
+        loan_btns_layout.addWidget(loan_down)
+        loan_btns_layout.addStretch()
+        loan_list_row.addLayout(loan_btns_layout)
+        loan_col_layout.addLayout(loan_list_row)
+        
+        def move_loan(delta):
+            r = self.loan_col_list.currentRow()
+            nr = r + delta
+            if r < 0 or nr < 0 or nr >= self.loan_col_list.count():
+                return
+            self.loan_col_list.insertItem(nr, self.loan_col_list.takeItem(r))
+            self.loan_col_list.setCurrentRow(nr)
+        loan_up.clicked.connect(lambda: move_loan(-1))
+        loan_down.clicked.connect(lambda: move_loan(1))
         
         # Divider
         divider = QFrame()
@@ -386,14 +410,38 @@ class StatementConfigDialog(QDialog):
         # Savings List
         sav_col_layout = QVBoxLayout()
         sav_col_layout.addWidget(QLabel("<b>Savings / Shares</b>"))
+        
+        sav_list_row = QHBoxLayout()
         self.sav_col_list = QListWidget()
+        self.sav_col_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.sav_col_list.setFixedHeight(120)
         sav_cols = ["Date", "Type", "Amount", "Balance", "Notes"]
         for col in sav_cols:
             item = QListWidgetItem(col)
             item.setCheckState(Qt.CheckState.Checked)
             self.sav_col_list.addItem(item)
-        sav_col_layout.addWidget(self.sav_col_list)
+        sav_list_row.addWidget(self.sav_col_list)
+        
+        sav_btns_layout = QVBoxLayout()
+        sav_up = QPushButton("▲")
+        sav_down = QPushButton("▼")
+        sav_up.setFixedWidth(30)
+        sav_down.setFixedWidth(30)
+        sav_btns_layout.addWidget(sav_up)
+        sav_btns_layout.addWidget(sav_down)
+        sav_btns_layout.addStretch()
+        sav_list_row.addLayout(sav_btns_layout)
+        sav_col_layout.addLayout(sav_list_row)
+        
+        def move_sav(delta):
+            r = self.sav_col_list.currentRow()
+            nr = r + delta
+            if r < 0 or nr < 0 or nr >= self.sav_col_list.count():
+                return
+            self.sav_col_list.insertItem(nr, self.sav_col_list.takeItem(r))
+            self.sav_col_list.setCurrentRow(nr)
+        sav_up.clicked.connect(lambda: move_sav(-1))
+        sav_down.clicked.connect(lambda: move_sav(1))
         
         col_layout.addLayout(loan_col_layout)
         col_layout.addWidget(divider)
@@ -401,8 +449,19 @@ class StatementConfigDialog(QDialog):
         col_group.setLayout(col_layout)
         
         # Logic to enable/disable column lists based on section toggles
-        self.chk_loans.stateChanged.connect(lambda state: self.loan_col_list.setEnabled(state == 2))
-        self.chk_savings.stateChanged.connect(lambda state: self.sav_col_list.setEnabled(state == 2))
+        def toggle_loans(state):
+            enabled = (state == 2)
+            self.loan_col_list.setEnabled(enabled)
+            loan_up.setEnabled(enabled)
+            loan_down.setEnabled(enabled)
+        self.chk_loans.stateChanged.connect(toggle_loans)
+        
+        def toggle_savings(state):
+            enabled = (state == 2)
+            self.sav_col_list.setEnabled(enabled)
+            sav_up.setEnabled(enabled)
+            sav_down.setEnabled(enabled)
+        self.chk_savings.stateChanged.connect(toggle_savings)
         
         self.layout.addWidget(col_group)
         

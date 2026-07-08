@@ -111,9 +111,9 @@ class ChristmasService:
         if target_date:
             if isinstance(target_date, str):
                 target_date = datetime.strptime(target_date, "%Y-%m-%d")
-            limit = (target_date + relativedelta(months=1)).replace(day=1)
+            limit = (target_date + relativedelta(months=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         else:
-            limit = (datetime.now() + relativedelta(months=1)).replace(day=1)
+            limit = (datetime.now() + relativedelta(months=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
         nxt = (last_date + relativedelta(months=1)).replace(day=1)
         count = 0

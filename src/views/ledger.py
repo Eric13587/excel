@@ -201,18 +201,18 @@ class LedgerView(QWidget):
         splitter.addWidget(sidebar_scroll)
         splitter.addWidget(self.main_tabs)
 
-        # Make the divider freely draggable the whole way in and out: let either
-        # pane collapse fully, drop the panes' minimum widths to ~0, and give the
-        # handle some grab area. The main area absorbs extra space on resize.
-        sidebar_scroll.setMinimumWidth(0)
-        self.main_tabs.setMinimumWidth(0)
+        # Make the divider freely draggable and stretchable. Setting the sidebar's
+        # stretch factor to 1 and main content's to 3 allows them to resize proportionally
+        # on window resize. Minimum widths ensure a clean presentation on smaller screens.
+        sidebar_scroll.setMinimumWidth(250)
+        self.main_tabs.setMinimumWidth(450)
         splitter.setChildrenCollapsible(True)
         splitter.setCollapsible(0, True)
         splitter.setCollapsible(1, True)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
         splitter.setHandleWidth(8)
-        splitter.setSizes([300, 900])
+        splitter.setSizes([350, 850])
 
         self.layout.addWidget(splitter)
         
@@ -576,7 +576,7 @@ class LedgerView(QWidget):
     # ==================================================================== #
     # Shared helpers for the fund tabs
     # ==================================================================== #
-    def _amount_date_dialog(self, title, amount_label="Amount:"):
+    def _amount_date_dialog(self, title, amount_label="Amount:", default_date=None):
         """Small modal: amount + date. Returns (amount, 'YYYY-MM-DD') or None."""
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
@@ -587,7 +587,17 @@ class LedgerView(QWidget):
         amt.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         date = QDateEdit()
         date.setCalendarPopup(True)
-        date.setDate(self.main_window.last_operation_date)
+        
+        if default_date:
+            if isinstance(default_date, str):
+                date.setDate(QDate.fromString(default_date, "yyyy-MM-dd"))
+            elif isinstance(default_date, QDate):
+                date.setDate(default_date)
+            else: # assume datetime or date-like object
+                date.setDate(QDate(default_date.year, default_date.month, default_date.day))
+        else:
+            date.setDate(self.main_window.last_operation_date)
+            
         form.addRow(amount_label, amt)
         form.addRow("Date:", date)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -893,7 +903,16 @@ class LedgerView(QWidget):
     def christmas_withdraw_dialog(self):
         if self.current_individual_id is None:
             return
-        res = self._amount_date_dialog("Christmas Withdrawal", "Withdraw:")
+        
+        # Get the most current/recent date present in the Christmas table
+        df = self.engine.christmas_service.get_transactions(self.current_individual_id)
+        default_date = None
+        if df is not None and not df.empty:
+            dates = df['date'].dropna().tolist()
+            if dates:
+                default_date = max(dates)
+
+        res = self._amount_date_dialog("Christmas Withdrawal", "Withdraw:", default_date=default_date)
         if not res:
             return
         amount, date_str = res

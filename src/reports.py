@@ -231,7 +231,7 @@ class ReportGenerator:
             
         return raw_bal
 
-    def generate_quarterly_report(self, start_date_str, output_path, progress_callback=None):
+    def generate_quarterly_report(self, start_date_str, output_path, columns=None, progress_callback=None):
         """
         Generate a quarterly interest report starting from the given date.
         
@@ -330,15 +330,20 @@ class ReportGenerator:
                     })
             
             # 3. Build DataFrame
-            df = pd.DataFrame(report_data)
+            if columns:
+                df = pd.DataFrame(report_data, columns=columns)
+            else:
+                default_cols = ["Name", "Loan Amount", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Grand Total"]
+                df = pd.DataFrame(report_data, columns=default_cols)
             
             if df.empty:
-                df = pd.DataFrame(columns=["Name", "Loan Amount", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Grand Total"])
+                df = pd.DataFrame(columns=columns or ["Name", "Loan Amount", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Grand Total"])
             else:
                 # Calculate Totals
                 sums = df.select_dtypes(include=['number']).sum()
                 total_row = {col: sums[col] if col in sums else '' for col in df.columns}
-                total_row['Name'] = 'TOTAL'
+                if 'Name' in df.columns:
+                    total_row['Name'] = 'TOTAL'
                 df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
             # 4. Export
@@ -406,7 +411,7 @@ class ReportGenerator:
             "cashout": cashout
         }
 
-    def generate_quarterly_savings_report(self, start_date_str, output_path, progress_callback=None):
+    def generate_quarterly_savings_report(self, start_date_str, output_path, columns=None, progress_callback=None):
         """
         Generate a quarterly shares/savings report starting from the given date.
         """
@@ -477,15 +482,20 @@ class ReportGenerator:
                 })
             
             # 3. Build DataFrame
-            df = pd.DataFrame(report_data)
+            if columns:
+                df = pd.DataFrame(report_data, columns=columns)
+            else:
+                default_cols = ["Name", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"]
+                df = pd.DataFrame(report_data, columns=default_cols)
             
             if df.empty:
-                df = pd.DataFrame(columns=["Name", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"])
+                df = pd.DataFrame(columns=columns or ["Name", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"])
             else:
                 # Calculate Totals
                 sums = df.select_dtypes(include=['number']).sum()
                 total_row = {col: sums[col] if col in sums else '' for col in df.columns}
-                total_row['Name'] = 'TOTAL'
+                if 'Name' in df.columns:
+                    total_row['Name'] = 'TOTAL'
                 df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
             # 4. Export
@@ -556,7 +566,7 @@ class ReportGenerator:
         return period_start_str > fy_end.strftime("%Y-%m-%d")
 
     def generate_fund_report(self, fund, output_path, start_date_str, end_date_str=None,
-                             progress_callback=None):
+                             columns=None, progress_callback=None):
         """Report for a fund (savings / christmas / benevolent).
 
         Custom mode (end_date_str given): one column per calendar month in
@@ -572,22 +582,23 @@ class ReportGenerator:
             if end_date_str is not None:
                 return self._fund_report_custom(
                     fund, output_path, start_date, start_date_str, end_date_str,
-                    deposit_types, label, progress_callback)
+                    deposit_types, label, chosen_columns=columns, progress_callback=progress_callback)
             return self._fund_report_quarter(
                 fund, output_path, start_date, start_date_str,
-                deposit_types, label, progress_callback)
+                deposit_types, label, chosen_columns=columns, progress_callback=progress_callback)
         except Exception as e:
             import traceback
             traceback.print_exc()
             return False, str(e)
 
     def _fund_report_custom(self, fund, output_path, start_date, start_date_str,
-                            end_date_str, deposit_types, label, progress_callback):
+                            end_date_str, deposit_types, label, chosen_columns=None, progress_callback=None):
         end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
         if end_date < start_date:
             return False, "End date is before start date."
         months = self._months_in_range(start_date, end_date)
-        columns = ["PF No", "Name", "Employment Status"] + [m[0] for m in months] + ["Total"]
+        default_cols = ["PF No", "Name", "Employment Status"] + [m[0] for m in months] + ["Total"]
+        cols_to_use = chosen_columns if chosen_columns is not None else default_cols
 
         individuals = self.db.get_individuals()
         total = len(individuals)
@@ -624,11 +635,12 @@ class ReportGenerator:
             row["Total"] = rtotal
             report_data.append(row)
 
-        df = pd.DataFrame(report_data, columns=columns)
+        df = pd.DataFrame(report_data, columns=cols_to_use)
         if not df.empty:
             sums = df.select_dtypes(include=['number']).sum()
             total_row = {col: (sums[col] if col in sums else '') for col in df.columns}
-            total_row["Name"] = "TOTAL"
+            if 'Name' in df.columns:
+                total_row["Name"] = "TOTAL"
             df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
         title = f"{label} Report"
@@ -639,7 +651,7 @@ class ReportGenerator:
         return self._export_to_excel(df, output_path, sheet_name=title[:31])
 
     def _fund_report_quarter(self, fund, output_path, start_date, start_date_str,
-                             deposit_types, label, progress_callback):
+                             deposit_types, label, chosen_columns=None, progress_callback=None):
         bf_obj = start_date + relativedelta(days=-1)
         bf_label = f"B/F {bf_obj.strftime('%d %b %Y')}".upper()
         q_dates = self._get_quarter_dates(start_date)
@@ -687,11 +699,12 @@ class ReportGenerator:
                                 m2_name: months[1], m3_name: months[2], "Sub Total": sub,
                                 "Cash Out": cashout, "Grand Total": bf + sub - cashout})
 
-        df = pd.DataFrame(report_data, columns=columns)
+        df = pd.DataFrame(report_data, columns=chosen_columns if chosen_columns is not None else columns)
         if not df.empty:
             sums = df.select_dtypes(include=['number']).sum()
             total_row = {col: (sums[col] if col in sums else '') for col in df.columns}
-            total_row["Name"] = "TOTAL"
+            if 'Name' in df.columns:
+                total_row["Name"] = "TOTAL"
             df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
 
         title = f"{label} Report"

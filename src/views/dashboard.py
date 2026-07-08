@@ -151,13 +151,14 @@ class ReportWorker(QThread):
     
     finished = pyqtSignal(bool, str)     # success, message
     
-    def __init__(self, db_name, printer_view_getter, start_date, output_path, report_type='loan'):
+    def __init__(self, db_name, printer_view_getter, start_date, output_path, report_type='loan', columns=None):
         super().__init__()
         self.db_name = db_name
         self.printer_view_getter = printer_view_getter
         self.start_date = start_date
         self.output_path = output_path
         self.report_type = report_type
+        self.columns = columns
         
     def run(self):
         db_manager = None
@@ -178,12 +179,14 @@ class ReportWorker(QThread):
                 success, msg = generator.generate_quarterly_savings_report(
                     self.start_date, 
                     self.output_path, 
+                    columns=self.columns,
                     progress_callback=callback
                 )
             else:
                 success, msg = generator.generate_quarterly_report(
                     self.start_date, 
                     self.output_path, 
+                    columns=self.columns,
                     progress_callback=callback
                 )
             self.finished.emit(success, msg)
@@ -1393,8 +1396,9 @@ class Dashboard(QWidget):
         """
         from ..reports import ReportGenerator
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QDialogButtonBox,
-                                     QFileDialog, QComboBox, QPushButton, QRadioButton, QDateEdit)
-        from PyQt6.QtCore import QDate
+                                     QFileDialog, QComboBox, QPushButton, QRadioButton, QDateEdit,
+                                     QListWidget, QListWidgetItem, QGroupBox, QHBoxLayout)
+        from PyQt6.QtCore import QDate, Qt
         from dateutil.relativedelta import relativedelta
         from datetime import datetime
         import platform
@@ -1405,6 +1409,8 @@ class Dashboard(QWidget):
 
         dialog = QDialog(self)
         dialog.setWindowTitle(f"{label} Report")
+        dialog.setMinimumWidth(420)
+        dialog.setMinimumHeight(450)
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
 
@@ -1451,6 +1457,101 @@ class Dashboard(QWidget):
 
         layout.addLayout(form)
 
+        # Columns selection
+        col_list = QListWidget()
+        col_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        col_list.setFixedHeight(150)
+        
+        user_states = {}
+        
+        def get_expected_columns():
+            custom = rb_custom.isChecked()
+            if fund == "savings" and not custom:
+                start_str = quarter_combo.currentData()
+                if not start_str:
+                    return []
+                start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+                m1_start = start_dt
+                m2_start = start_dt + relativedelta(months=1)
+                m3_start = start_dt + relativedelta(months=2)
+                
+                bf_date_obj = m1_start + relativedelta(days=-1)
+                day = bf_date_obj.day
+                suffix = "TH" if 11 <= day <= 13 else {1:"ST",2:"ND",3:"RD"}.get(day%10, "TH")
+                bf_label = f"B/F {day}{suffix} {bf_date_obj.strftime('%b %Y')}".upper()
+                
+                return ["Name", bf_label, m1_start.strftime("%b-%y"), m2_start.strftime("%b-%y"), m3_start.strftime("%b-%y"), "Sub Total", "Cash Out", "Grand Total"]
+            else:
+                start = from_date.date()
+                end = to_date.date()
+                start_dt = datetime(start.year(), start.month(), start.day())
+                end_dt = datetime(end.year(), end.month(), end.day())
+                if end_dt < start_dt:
+                    return ["PF No", "Name", "Employment Status", "Total"]
+                
+                cur = start_dt.replace(day=1)
+                last = end_dt.replace(day=1)
+                months = []
+                while cur <= last:
+                    months.append(cur.strftime("%b-%y"))
+                    cur = cur + relativedelta(months=1)
+                return ["PF No", "Name", "Employment Status"] + months + ["Total"]
+
+        def update_columns_list():
+            current_cols = []
+            for i in range(col_list.count()):
+                item = col_list.item(i)
+                current_cols.append(item.text())
+                user_states[item.text()] = (item.checkState() == Qt.CheckState.Checked)
+            
+            col_list.clear()
+            expected = get_expected_columns()
+            
+            existing_expected = [c for c in current_cols if c in expected]
+            new_expected = [c for c in expected if c not in current_cols]
+            sorted_expected = existing_expected + new_expected
+            
+            for col in sorted_expected:
+                item = QListWidgetItem(col)
+                checked = user_states.get(col, True)
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                col_list.addItem(item)
+
+        rb_quarter.toggled.connect(update_columns_list)
+        rb_custom.toggled.connect(update_columns_list)
+        quarter_combo.currentIndexChanged.connect(update_columns_list)
+        from_date.dateChanged.connect(update_columns_list)
+        to_date.dateChanged.connect(update_columns_list)
+        
+        update_columns_list()
+
+        col_group = QGroupBox("Columns to Include & Order")
+        col_layout = QHBoxLayout()
+        col_layout.addWidget(col_list)
+        
+        btns_layout = QVBoxLayout()
+        up_btn = QPushButton("▲ Up")
+        down_btn = QPushButton("▼ Down")
+        up_btn.setFixedWidth(60)
+        down_btn.setFixedWidth(60)
+        btns_layout.addWidget(up_btn)
+        btns_layout.addWidget(down_btn)
+        btns_layout.addStretch()
+        col_layout.addLayout(btns_layout)
+        col_group.setLayout(col_layout)
+        
+        layout.addWidget(col_group)
+        
+        def move(delta):
+            r = col_list.currentRow()
+            nr = r + delta
+            if r < 0 or nr < 0 or nr >= col_list.count():
+                return
+            col_list.insertItem(nr, col_list.takeItem(r))
+            col_list.setCurrentRow(nr)
+        up_btn.clicked.connect(lambda: move(-1))
+        down_btn.clicked.connect(lambda: move(1))
+
         fmt_btn = QPushButton("Format Settings...")
 
         def open_fmt():
@@ -1483,10 +1584,14 @@ class Dashboard(QWidget):
         if not path:
             return
 
+        chosen_columns = [col_list.item(i).text()
+                          for i in range(col_list.count())
+                          if col_list.item(i).checkState() == Qt.CheckState.Checked]
+
         if fund == "savings" and not custom:
-            success, msg = generator.generate_quarterly_savings_report(start, path)
+            success, msg = generator.generate_quarterly_savings_report(start, path, columns=chosen_columns)
         else:
-            success, msg = generator.generate_fund_report(fund, path, start, end)
+            success, msg = generator.generate_fund_report(fund, path, start, end, columns=chosen_columns)
 
         if success:
             QMessageBox.information(self, "Success", f"Report saved to:\n{path}")
@@ -1505,8 +1610,12 @@ class Dashboard(QWidget):
     def generate_quarterly_report(self):
         """Generate quarterly loan interest report."""
         from ..reports import ReportGenerator
-        from PyQt6.QtWidgets import QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox, QComboBox, QPushButton
+        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox,
+                                     QComboBox, QPushButton, QListWidget, QListWidgetItem, QGroupBox,
+                                     QHBoxLayout, QVBoxLayout)
+        from PyQt6.QtCore import Qt
         from dateutil.relativedelta import relativedelta
+        from datetime import datetime
         
         # Determine Default Date based on FY Setting
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
@@ -1515,6 +1624,8 @@ class Dashboard(QWidget):
         # Dialog to select start date
         dialog = QDialog(self)
         dialog.setWindowTitle("Quarterly Loan Report Period")
+        dialog.setMinimumWidth(420)
+        dialog.setMinimumHeight(420)
         layout = QFormLayout(dialog)
         
         # Quarter Selector (Dropdown)
@@ -1538,6 +1649,79 @@ class Dashboard(QWidget):
                 
         quarter_combo.setCurrentIndex(default_idx)
         layout.addRow("Select Quarter:", quarter_combo)
+
+        # Columns selection
+        col_list = QListWidget()
+        col_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        col_list.setFixedHeight(150)
+        
+        user_states = {}
+        
+        def get_expected_columns():
+            start_str = quarter_combo.currentData()
+            if not start_str:
+                return []
+            start_dt = datetime.strptime(start_str, "%Y-%m-%d")
+            m1_start = start_dt
+            m2_start = start_dt + relativedelta(months=1)
+            m3_start = start_dt + relativedelta(months=2)
+            
+            bf_date_label = f"B/F at {m1_start.strftime('%b %Y')}"
+            m1_name = m1_start.strftime("%b-%y")
+            m2_name = m2_start.strftime("%b-%y")
+            m3_name = m3_start.strftime("%b-%y")
+            
+            return ["Name", "Loan Amount", bf_date_label, m1_name, m2_name, m3_name, "Sub Total", "Grand Total"]
+
+        def update_columns_list():
+            current_cols = []
+            for i in range(col_list.count()):
+                item = col_list.item(i)
+                current_cols.append(item.text())
+                user_states[item.text()] = (item.checkState() == Qt.CheckState.Checked)
+            
+            col_list.clear()
+            expected = get_expected_columns()
+            
+            existing_expected = [c for c in current_cols if c in expected]
+            new_expected = [c for c in expected if c not in current_cols]
+            sorted_expected = existing_expected + new_expected
+            
+            for col in sorted_expected:
+                item = QListWidgetItem(col)
+                checked = user_states.get(col, True)
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                col_list.addItem(item)
+                
+        quarter_combo.currentIndexChanged.connect(update_columns_list)
+        update_columns_list()
+
+        col_group = QGroupBox("Columns to Include & Order")
+        col_layout = QHBoxLayout()
+        col_layout.addWidget(col_list)
+        
+        btns_layout = QVBoxLayout()
+        up_btn = QPushButton("▲ Up")
+        down_btn = QPushButton("▼ Down")
+        up_btn.setFixedWidth(60)
+        down_btn.setFixedWidth(60)
+        btns_layout.addWidget(up_btn)
+        btns_layout.addWidget(down_btn)
+        btns_layout.addStretch()
+        col_layout.addLayout(btns_layout)
+        col_group.setLayout(col_layout)
+        
+        layout.addRow(col_group)
+        
+        def move(delta):
+            r = col_list.currentRow()
+            nr = r + delta
+            if r < 0 or nr < 0 or nr >= col_list.count():
+                return
+            col_list.insertItem(nr, col_list.takeItem(r))
+            col_list.setCurrentRow(nr)
+        up_btn.clicked.connect(lambda: move(-1))
+        down_btn.clicked.connect(lambda: move(1))
         
         # Format Settings Button
         fmt_btn = QPushButton("Format Settings...")
@@ -1559,6 +1743,10 @@ class Dashboard(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             start_date = quarter_combo.currentData()
             
+            chosen_columns = [col_list.item(i).text()
+                              for i in range(col_list.count())
+                              if col_list.item(i).checkState() == Qt.CheckState.Checked]
+            
             # File save dialog
             file_path, _ = QFileDialog.getSaveFileName(
                 self, "Save Report", 
@@ -1578,7 +1766,7 @@ class Dashboard(QWidget):
                 
                 # Setup Thread
                 db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
-                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path, report_type='loan')
+                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path, report_type='loan', columns=chosen_columns)
                 
                 def on_progress(curr, total, msg):
                     progress.setMaximum(total)

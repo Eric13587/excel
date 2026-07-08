@@ -129,3 +129,55 @@ def test_custom_end_before_start_errors(env):
     ok, msg = ReportGenerator(db).generate_fund_report(
         "christmas", os.path.join(d, "e.csv"), "2026-03-01", "2026-01-01")
     assert not ok and "before" in msg.lower()
+
+
+def test_custom_column_ordering_fund_report(env):
+    db, d = env
+    ind = db.add_individual("Jane", "0", "j@x", pf_no="PF-1")
+    c = ChristmasService(db)
+    c.add_deposit(ind, 500, "2026-01-15")
+    c.add_deposit(ind, 500, "2026-02-15")
+
+    # Custom columns for Christmas custom mode
+    out = os.path.join(d, "x_custom_cols.csv")
+    chosen_cols = ["Name", "Jan-26", "Total"]
+    ok, msg = ReportGenerator(db).generate_fund_report("christmas", out, "2026-01-01", "2026-02-28", columns=chosen_cols)
+    assert ok, msg
+    df = pd.read_csv(out)
+    assert list(df.columns) == chosen_cols
+    row = df[df["Name"] == "Jane"].iloc[0]
+    assert row["Jan-26"] == 500
+    assert row["Total"] == 1000
+
+    # Custom columns for Christmas quarter mode
+    out_q = os.path.join(d, "x_quarter_cols.csv")
+    # For quarter mode, default is: ["Name", bf_label, m1_name, m2_name, m3_name, "Sub Total", "Cash Out", "Grand Total"]
+    # Let's specify a subset and a different order
+    chosen_cols_q = ["Grand Total", "Name", "Sub Total"]
+    ok, msg = ReportGenerator(db).generate_fund_report("christmas", out_q, "2026-01-01", columns=chosen_cols_q)
+    assert ok, msg
+    df_q = pd.read_csv(out_q)
+    assert list(df_q.columns) == chosen_cols_q
+
+
+def test_custom_column_ordering_quarterly_savings_report(env):
+    db, d = env
+    db.add_individual("Jane", "0", "j@x")
+    out = os.path.join(d, "savings_custom_cols.csv")
+    chosen_cols = ["Grand Total", "Name", "Cash Out"]
+    ok, msg = ReportGenerator(db).generate_quarterly_savings_report("2026-01-01", out, columns=chosen_cols)
+    assert ok, msg
+    df = pd.read_csv(out)
+    assert list(df.columns) == chosen_cols
+
+
+def test_custom_column_ordering_quarterly_loan_report(env):
+    db, d = env
+    db.add_individual("Jane", "0", "j@x")
+    out = os.path.join(d, "loan_custom_cols.csv")
+    chosen_cols = ["Grand Total", "Name", "Loan Amount", "Sub Total"]
+    ok, msg = ReportGenerator(db).generate_quarterly_report("2026-01-01", out, columns=chosen_cols)
+    assert ok, msg
+    df = pd.read_csv(out)
+    assert list(df.columns) == chosen_cols
+

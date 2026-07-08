@@ -281,3 +281,23 @@ def test_funds_are_independent_of_savings(env):
     assert db.get_savings_balance(ind) == 5000.0  # unchanged
     assert ChristmasService(db).get_balance(ind) == 1000.0
     assert BenevolentService(db).get_total(ind) == 200.0
+
+
+def test_christmas_catch_up_default_limit(env):
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+    db, ind = env
+    svc = ChristmasService(db)
+    
+    current_date = datetime.now()
+    last_month_date = (current_date - relativedelta(months=1)).replace(day=1)
+    last_month_str = last_month_date.strftime("%Y-%m-%d")
+    
+    svc.add_deposit(ind, 500, last_month_str)
+    # Catch up without target date should catch up exactly to current month
+    n = svc.catch_up(ind, 500)
+    assert n == 1
+    
+    txns = svc.get_transactions(ind)
+    current_month_str = current_date.replace(day=1).strftime("%Y-%m-%d")
+    assert current_month_str in txns['date'].values
