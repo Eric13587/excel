@@ -294,3 +294,80 @@ together with 1a, or not at all.
 | `tests/test_orphan_repair.py` | 1b | Fixture drops cascade triggers to model a pre-001 journal; new no-orphans regression test |
 | `docs/db/proposed/004_strict_schema.sql` | 1b | Moved from `migrations/`, annotated as a Phase 4 proposal |
 | `docs/db/phase-1-migration.md` | — | **new** — this document |
+
+---
+
+## 7. Phase 1c — integrity verification
+
+`src/integrity.py` answers one question: *can this journal be trusted right
+now?* Run it against any journal, live or archived:
+
+```bash
+python -m src.integrity loan_master.db            # full report
+python -m src.integrity loan_master.db --strict   # warnings fail too (for cron)
+python -m src.integrity loan_master.db --quiet    # one summary line
+```
+
+31 checks in five categories — structural (`integrity_check`,
+`foreign_key_check`), schema (migration version, expected triggers and
+indexes), referential (orphans, loan resolution, ref uniqueness), accounting
+(entry balance, trial balance, idempotency, control accounts, cached-balance
+drift) and Phase 4 readiness.
+
+**Design principle: assert, don't enforce.** Several of these cannot be
+database constraints yet — either they need the Phase 4 table rebuild, or a
+break is a business decision rather than a schema problem. Reporting them makes
+the gap measurable instead of silent, and produces the evidence needed before
+the constraints go in. Failures exit non-zero; warnings do not unless
+`--strict`.
+
+### What it found on the production journal
+
+Three real problems, none of which the application surfaces today:
+
+**1. KES 47,500 of Christmas savings missing from the general ledger.**
+
+```
+[ warn ] control 2010 Christmas Savings   GL 984,000.00 vs christmas_savings 1,031,500.00 — delta -47,500.00
+```
+
+12 deposits (ids 365–376, the most recent) had never been posted.
+`DatabaseManager._fire_post_hook` is wired for exactly three write paths —
+`add_transaction`, `bulk_insert_transactions` and `add_savings_transaction`.
+`fund_add_transaction`, which every Christmas and Benevolent write goes
+through, fires **no hook at all**, so fund activity only reaches the GL when
+someone runs a full sync. Benevolent happened to reconcile because a sync had
+run since its last write.
+
+*Remedy today:* Treasury → Sync (verified to clear the break exactly).
+*Root cause:* fixed in Phase 5, which replaces rebuild-on-read with
+incremental posting on every write path.
+
+**2. One loan's cached balance has drifted 115,000 from its own ledger.**
+
+```
+[ warn ] loans.balance matches its ledger   1 loan(s) drifted, total 115,000.00;
+                                            worst member 23 L-001 cached 115,000.00 vs ledger 0.00
+[ warn ] control 1100 Loans Receivable      GL 8,513,734.18 vs loans.balance 8,628,734.18 — delta -115,000.00
+```
+
+Note which side is wrong: **GL 1100 agrees with the ledger to the cent**
+(8,513,734.18 both ways). It is `loans.balance` — a cached aggregate with no
+maintenance contract — that is stale. Member 23's loan L-001 shows 115,000
+outstanding while its own transaction history says it is settled.
+
+*Remedy today:* Mass Operations → Repair Loans.
+*Root cause:* addressed in Phase 3 (one authoritative balance implementation).
+
+**3. Two settled loans carry a non-zero balance.** A `Paid` loan should be
+flat; these sum to −113,778.
+
+None of these were introduced by Phase 1 — they are pre-existing conditions
+that nothing was measuring. That is the point of the tool.
+
+### Startup integration
+
+`src/main.py` already warned on a failed integrity check. It now also warns
+when a migration could not be applied, names the shortfall, and points at
+`python -m src.integrity`. A journal that cannot be migrated still opens and
+is still usable — it simply must not degrade *silently*.
