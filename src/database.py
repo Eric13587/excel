@@ -10,6 +10,7 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
+from src import migrations
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -70,6 +71,16 @@ class DatabaseManager:
         self.ledger_post_hook = None
         self.savings_post_hook = None
         self.create_tables()
+        # Versioned migrations run after the legacy bootstrap, so a brand-new
+        # journal and an existing one converge on the same schema. Failure is
+        # reported, never fatal: a journal that cannot be migrated must still
+        # open so its data can be exported or repaired.
+        self.migration_report = migrations.apply_pending(self.conn)
+        if not self.migration_report.ok:
+            logger.error("Schema migration incomplete — %s", self.migration_report.summary())
+        # Cascading deletes may have just become available, and a repaired
+        # journal may now qualify for enforcement.
+        self._evaluate_foreign_keys()
 
     def _storage_kind(self):
         """Classify where the journal lives: 'memory', 'local', 'network' or
@@ -186,6 +197,21 @@ class DatabaseManager:
         if self.journal_mode == "wal":
             cur.execute(f"PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}")
 
+        self._evaluate_foreign_keys()
+
+    def _evaluate_foreign_keys(self):
+        """Turn foreign-key enforcement on unless the data would break instantly.
+
+        Split out from _configure_connection so it can be re-run cheaply after a
+        repair or a migration without redoing the whole pragma set (the
+        foreign_key_check itself is a full scan and should not be paid twice on
+        open). PRAGMA foreign_keys is a no-op inside a transaction, so this
+        refuses to guess when one is in flight.
+        """
+        if self.conn.in_transaction:
+            logger.debug("Skipping foreign-key evaluation: transaction in flight")
+            return self.fk_enforced
+        cur = self.conn.cursor()
         try:
             violations = cur.execute("PRAGMA foreign_key_check").fetchall()
         except sqlite3.DatabaseError:
@@ -193,6 +219,7 @@ class DatabaseManager:
         self.fk_violations = len(violations) if violations else 0
         if violations:
             tables = sorted({v[0] for v in violations})
+            cur.execute("PRAGMA foreign_keys = OFF")
             self.fk_enforced = False
             logger.warning(
                 "Foreign-key enforcement left OFF: %d orphaned row(s) in %s. "
@@ -204,6 +231,7 @@ class DatabaseManager:
             self.fk_enforced = bool(cur.execute("PRAGMA foreign_keys").fetchone()[0])
         else:
             self.fk_enforced = False
+        return self.fk_enforced
 
     def _check_integrity(self):
         """Run SQLite's quick_check and record the result.
@@ -357,7 +385,7 @@ class DatabaseManager:
                 if cur.rowcount:
                     counts[t] = cur.rowcount
         logger.info("Deleted orphaned rows: %s", counts or "none")
-        self._configure_connection()
+        self._evaluate_foreign_keys()
         return counts
 
     def _fire_post_hook(self, hook, ids):
@@ -657,6 +685,15 @@ class DatabaseManager:
         # Migration for existing table
         try:
             cursor.execute("ALTER TABLE savings ADD COLUMN import_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        # batch_id was only ever added by create_savings_table(), which runs
+        # lazily from the savings read/write helpers — so a freshly created
+        # journal had a `savings` table without it until the first savings
+        # operation. The two definitions of this table disagreed; this makes the
+        # canonical one authoritative.
+        try:
+            cursor.execute("ALTER TABLE savings ADD COLUMN batch_id TEXT")
         except sqlite3.OperationalError:
             pass
 
