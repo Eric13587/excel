@@ -2123,7 +2123,6 @@ class Dashboard(QWidget):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
                                      QHeaderView, QDialogButtonBox, QProgressDialog)
-        import shutil
         from datetime import datetime
 
         healable = self.engine.scan_healable_loans()
@@ -2182,7 +2181,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    shutil.copy(src, f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.backup_to(f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return
@@ -2212,7 +2211,6 @@ class Dashboard(QWidget):
         """
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
                                      QHeaderView, QDialogButtonBox)
-        import shutil
         from datetime import datetime
 
         orphans = self.db.find_orphaned_rows()
@@ -2287,7 +2285,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    shutil.copy(src, f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.backup_to(f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return

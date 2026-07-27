@@ -16,6 +16,31 @@ from src.data_structures import StatementData
 # How many timestamped on-open backups to keep per journal.
 BACKUP_KEEP_COUNT = 10
 
+# How long a writer waits for a competing writer before giving up. Mass
+# operations (catch-up over thousands of loans) and the report thread's second
+# connection routinely hold locks for seconds, and the previous 5s ceiling
+# surfaced as a hard failure mid-operation rather than as latency.
+BUSY_TIMEOUT_MS = 30000
+
+# Page cache (negative == KiB rather than pages). 64 MiB keeps the hot ledger
+# and journal pages resident during recalculation loops.
+CACHE_SIZE_KIB = -65536
+
+# Cap the WAL file after a checkpoint so a large batch cannot leave a
+# permanently inflated sidecar next to the journal.
+WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
+# Filesystems where SQLite's locking is unreliable. WAL additionally needs a
+# shared-memory (-shm) mapping that these do not provide, so a journal hosted
+# on one stays in rollback-journal mode.
+NETWORK_FILESYSTEMS = frozenset({
+    "nfs", "nfs4", "cifs", "smbfs", "smb2", "smb3", "afs", "ncpfs",
+    "9p", "davfs", "fuse.davfs", "fuse.sshfs", "glusterfs", "ceph", "lustre",
+})
+
+# Override the journal-mode decision: "wal", "delete", or "auto" (default).
+JOURNAL_MODE_ENV = "LOANMASTER_JOURNAL_MODE"
+
 
 class DatabaseManager:
     """Handles all SQLite database operations."""
@@ -26,6 +51,11 @@ class DatabaseManager:
         self.conn = sqlite3.connect(db_name)
         self._closed = False
         self.integrity_ok = True
+        # Set by _configure_connection; declared here so callers can read them
+        # even if configuration failed.
+        self.journal_mode = "delete"
+        self.fk_enforced = False
+        self.fk_violations = 0
         # Snapshot the journal before create_tables() runs schema migrations,
         # so a bad migration can always be rolled back from the backup.
         if auto_backup and pre_existing:
@@ -41,28 +71,129 @@ class DatabaseManager:
         self.savings_post_hook = None
         self.create_tables()
 
+    def _storage_kind(self):
+        """Classify where the journal lives: 'memory', 'local', 'network' or
+        'unknown'.
+
+        Only a *positively identified* local filesystem is allowed to run in
+        WAL mode. Anything unrecognised is treated as unsafe, so the fallback
+        is always the mode this application already shipped with.
+        """
+        if self.db_name == ":memory:" or not self.db_name:
+            return "memory"
+        try:
+            path = os.path.abspath(self.db_name)
+        except Exception:
+            return "unknown"
+
+        # Windows: UNC paths and mapped network drives.
+        if os.name == "nt":
+            if path.startswith("\\\\"):
+                return "network"
+            try:
+                import ctypes
+                drive = os.path.splitdrive(path)[0]
+                if drive:
+                    # 3 == DRIVE_FIXED, 4 == DRIVE_REMOTE
+                    kind = ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\")
+                    if kind == 4:
+                        return "network"
+                    if kind == 3:
+                        return "local"
+            except Exception:
+                logger.debug("Could not classify drive for %s", path, exc_info=True)
+            return "unknown"
+
+        # Linux: resolve the path to its mount point via /proc/mounts.
+        try:
+            with open("/proc/mounts", encoding="utf-8", errors="replace") as fh:
+                mounts = []
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mounts.append((parts[1], parts[2]))
+        except OSError:
+            return "unknown"
+
+        best_point, best_type = "", None
+        for point, fstype in mounts:
+            if (path == point or path.startswith(point.rstrip("/") + "/")) \
+                    and len(point) >= len(best_point):
+                best_point, best_type = point, fstype
+        if best_type is None:
+            return "unknown"
+        return "network" if best_type.lower() in NETWORK_FILESYSTEMS else "local"
+
+    def _select_journal_mode(self):
+        """Decide the journal mode, honouring an explicit operator override.
+
+        WAL lets the report thread's second connection read while a mass
+        operation writes; in rollback-journal mode those block each other.
+        It is only safe on local storage, so 'auto' enables it exclusively
+        there.
+        """
+        override = (os.environ.get(JOURNAL_MODE_ENV) or "auto").strip().lower()
+        if override in ("wal", "delete"):
+            return override, f"explicit {JOURNAL_MODE_ENV}={override}"
+        if override != "auto":
+            logger.warning("Ignoring unrecognised %s=%r", JOURNAL_MODE_ENV, override)
+
+        kind = self._storage_kind()
+        if kind == "local":
+            return "wal", "local storage"
+        if kind == "memory":
+            return "delete", "in-memory journal"
+        return "delete", f"{kind} storage (WAL unsafe)"
+
     def _configure_connection(self):
-        """Apply per-connection safety settings.
+        """Apply per-connection safety and durability settings.
 
         - busy_timeout: wait instead of failing immediately when another
-          process (this is a multi-user app) briefly locks the journal.
-        - foreign_keys: enforce the FKs the schema already declares, but only
-          when the existing data passes a consistency check — enabling
-          enforcement on top of legacy orphan rows would make unrelated
-          writes start failing at runtime.
-
-        journal_mode is deliberately left at the SQLite default (DELETE):
-        WAL persists inside the database file and is unsafe on network
-        shares, which is how multi-user journals are commonly hosted.
+          process (this is a multi-user app) locks the journal.
+        - foreign_keys: enforce the FKs the schema already declares. Left OFF
+          only when the existing data would immediately violate them —
+          enabling enforcement on top of legacy orphan rows makes unrelated
+          writes start failing at runtime. That fallback is now reported
+          through ``fk_enforced``/``fk_violations`` so the UI can surface it
+          rather than only logging.
+        - journal_mode: WAL on local storage (concurrent reader + writer,
+          cheaper commits, faster crash recovery); rollback journal anywhere
+          it is not provably safe. See _select_journal_mode.
+        - synchronous FULL: a financial journal must not lose committed
+          transactions on power loss.
         """
         cur = self.conn.cursor()
-        cur.execute("PRAGMA busy_timeout = 5000")
+        cur.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+
+        desired, reason = self._select_journal_mode()
+        try:
+            actual = cur.execute(f"PRAGMA journal_mode = {desired}").fetchone()[0]
+        except sqlite3.DatabaseError as e:
+            actual, = ("unknown",)
+            logger.warning("Could not set journal_mode=%s: %s", desired, e)
+        self.journal_mode = (actual or "").lower()
+        if desired == "wal" and self.journal_mode != "wal":
+            # SQLite refused (typically a filesystem without shared memory).
+            # It has already fallen back on its own; record what we ended up with.
+            logger.warning("WAL requested (%s) but journal is in %r mode",
+                           reason, self.journal_mode)
+        else:
+            logger.info("journal_mode=%s (%s)", self.journal_mode, reason)
+
+        cur.execute("PRAGMA synchronous = FULL")
+        cur.execute(f"PRAGMA cache_size = {CACHE_SIZE_KIB}")
+        cur.execute("PRAGMA temp_store = MEMORY")
+        if self.journal_mode == "wal":
+            cur.execute(f"PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}")
+
         try:
             violations = cur.execute("PRAGMA foreign_key_check").fetchall()
         except sqlite3.DatabaseError:
             violations = None
+        self.fk_violations = len(violations) if violations else 0
         if violations:
             tables = sorted({v[0] for v in violations})
+            self.fk_enforced = False
             logger.warning(
                 "Foreign-key enforcement left OFF: %d orphaned row(s) in %s. "
                 "Run the Repair tools to fix legacy data.",
@@ -70,6 +201,9 @@ class DatabaseManager:
             )
         elif violations is not None:
             cur.execute("PRAGMA foreign_keys = ON")
+            self.fk_enforced = bool(cur.execute("PRAGMA foreign_keys").fetchone()[0])
+        else:
+            self.fk_enforced = False
 
     def _check_integrity(self):
         """Run SQLite's quick_check and record the result.
@@ -104,17 +238,32 @@ class DatabaseManager:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             dest_path = os.path.join(backup_dir, f"{stem}.{stamp}.db")
             if not os.path.exists(dest_path):
-                dest = sqlite3.connect(dest_path)
-                try:
-                    self.conn.backup(dest)
-                finally:
-                    dest.close()
-                logger.info("Journal backed up to %s", dest_path)
+                self.backup_to(dest_path)
             old_backups = sorted(glob.glob(os.path.join(backup_dir, f"{stem}.*.db")))
             for stale in old_backups[:-keep]:
                 os.remove(stale)
         except Exception:
             logger.exception("Automatic backup failed (continuing without it)")
+
+    def backup_to(self, dest_path):
+        """Write a consistent copy of the journal to dest_path.
+
+        Uses SQLite's online-backup API rather than a file copy. Under WAL the
+        committed state is split between the database file and its -wal
+        sidecar, so copying only the .db silently loses every transaction that
+        has not been checkpointed yet — a backup that looks fine and is
+        missing the most recent work. The backup API always produces a single
+        fully-checkpointed file, and is safe against concurrent writers.
+
+        Returns the destination path.
+        """
+        dest = sqlite3.connect(dest_path)
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
+        logger.info("Journal backed up to %s", dest_path)
+        return dest_path
 
     # ------------------------------------------------------------------
     # Orphaned-record repair
@@ -220,8 +369,19 @@ class DatabaseManager:
                 logger.warning("GL post hook failed (will reconcile on next sync): %s", e)
     
     def close(self):
-        """Close the database connection."""
+        """Close the database connection.
+
+        PRAGMA optimize refreshes the query planner's statistics for indexes
+        whose selectivity has shifted during the session. Without it SQLite
+        plans against stale (or absent) sqlite_stat1 data, which is how a
+        journal that was fast at 2,000 ledger rows starts full-scanning at
+        200,000. Best effort — never let it block a clean shutdown.
+        """
         if self.conn and not self._closed:
+            try:
+                self.conn.execute("PRAGMA optimize")
+            except sqlite3.DatabaseError:
+                logger.debug("PRAGMA optimize failed on close", exc_info=True)
             self.conn.close()
             self._closed = True
     
@@ -256,15 +416,32 @@ class DatabaseManager:
     @contextmanager
     def transaction(self):
         """Context manager for database transactions with automatic rollback on failure.
-        
+
         Usage:
             with db.transaction():
                 db.add_individual(...)
                 db.add_loan_record(...)
-        
+
         If any exception occurs, the transaction is rolled back.
+
+        Opens with BEGIN IMMEDIATE, which takes the write lock up front. The
+        default deferred BEGIN acquires a read lock and only tries to upgrade
+        at the first write; if another connection took the write lock in
+        between, SQLite returns SQLITE_BUSY *without consulting the busy
+        handler* — because waiting there would deadlock. So busy_timeout does
+        not protect a read-then-write transaction, and this application has
+        exactly that shape (read the ledger, compute, write it back) plus a
+        second connection opened by the report thread.
+
+        Re-entrant: a nested call joins the transaction already in flight
+        rather than failing on "cannot start a transaction within a
+        transaction", so composing two guarded operations stays safe.
         """
+        if self.conn.in_transaction:
+            yield          # already inside a transaction; the outermost owns commit/rollback
+            return
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
             yield
             self.conn.commit()
         except sqlite3.Error as e:
@@ -860,10 +1037,27 @@ class DatabaseManager:
         self.conn.commit()
 
     def delete_individual(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE individual_id=?", (id,))
-        cursor.execute("DELETE FROM individuals WHERE id=?", (id,))
-        self.conn.commit()
+        """Delete a member and their records as a single atomic operation.
+
+        The two statements were previously issued without a transaction. Once
+        foreign-key enforcement engaged (which happens automatically as soon as
+        a journal has no orphaned rows), the second statement began failing —
+        the member still has savings, fund, enrolment and suspension rows that
+        no code path removes — while the first had already succeeded. The
+        exception propagated with the transaction still open, so the *next*
+        unrelated write committed the half-delete: the member's entire loan
+        ledger destroyed, the member still listed. Reproduced against a copy of
+        a production journal before this change.
+
+        Wrapping both statements makes the operation all-or-nothing on every
+        schema generation. Migration 001 additionally installs cascade triggers
+        so the remaining child tables are cleared with the parent instead of
+        being left behind.
+        """
+        with self.transaction():
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM ledger WHERE individual_id=?", (id,))
+            cursor.execute("DELETE FROM individuals WHERE id=?", (id,))
 
     def get_statement_data(self, individual_id, start_date=None, end_date=None) -> StatementData:
         """Fetch all data required for statement generation in one go."""
