@@ -31,7 +31,7 @@ class ReportGenerator:
 
     def _get_fy_start_date(self, report_start_date):
         """Determine the Financial Year start date based on report date and settings."""
-        fy_start_month_name = self.db.get_setting("fy_start_month", "January")
+        fy_start_month_name = self.db.settings.fy_start_month
         try:
             fy_start_month_idx = datetime.strptime(fy_start_month_name, "%B").month
         except ValueError:
@@ -49,7 +49,7 @@ class ReportGenerator:
 
     def get_fy_start_month_index(self):
         """Get 1-based index of the Financial Year start month from settings."""
-        fy_start_month_name = self.db.get_setting("fy_start_month", "January")
+        fy_start_month_name = self.db.settings.fy_start_month
         try:
             return datetime.strptime(fy_start_month_name, "%B").month
         except ValueError:
@@ -65,15 +65,13 @@ class ReportGenerator:
             
         fy_start_idx = self.get_fy_start_month_index()
         
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT MIN(date) FROM (SELECT date FROM ledger UNION ALL SELECT date FROM savings)")
-        row = cursor.fetchone()
-        
+        earliest = self.db.ledger.earliest_date_overall()
+
         start_year = ref_date.year
-        if row and row[0]:
+        if earliest:
             try:
                 # Expecting YYYY-MM-DD
-                earliest_date = datetime.strptime(row[0][:10], "%Y-%m-%d")
+                earliest_date = datetime.strptime(earliest[:10], "%Y-%m-%d")
                 start_year = earliest_date.year
             except ValueError:
                 pass
@@ -126,7 +124,7 @@ class ReportGenerator:
         if start_date.day != 1:
             return False, "Start date must be the 1st day of the month."
             
-        fy_start_month_name = self.db.get_setting("fy_start_month", "January")
+        fy_start_month_name = self.db.settings.fy_start_month
         try:
             fy_start = datetime.strptime(fy_start_month_name, "%B").month
         except ValueError:
@@ -792,8 +790,8 @@ class ReportGenerator:
         """
         try:
             # Get colors from settings
-            header_bg = self.db.get_setting("excel_header_bg", branding.EXCEL_HEADER_BG)
-            total_bg = self.db.get_setting("excel_total_bg", branding.EXCEL_TOTAL_BG)
+            header_bg = self.db.settings.excel_header_bg
+            total_bg = self.db.settings.excel_total_bg
             
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False, sheet_name=sheet_name)

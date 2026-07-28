@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 from src.exceptions import LoanNotFoundError, LoanInactiveError, LoanSuspendedError
 from src.config import DEFAULT_INTEREST_RATE
+from src.db import position_from_frame
 
 
 class LoanService:
@@ -68,8 +69,8 @@ class LoanService:
         unearned_interest = interest_total
         
         df = self.get_ledger_df(individual_id)
-        current_balance = df["balance"].iloc[-1] if not df.empty else 0.0
-        prev_principal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+        pos = position_from_frame(df)
+        current_balance, prev_principal = pos.balance, pos.principal_balance
         
         # Determine next loan ID
         all_loans = self.db.get_loans(individual_id)
@@ -90,14 +91,15 @@ class LoanService:
         
         start_date_obj = datetime.strptime(date_str, "%Y-%m-%d")
         
-        deduct_same_month = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+        deduct_same_month = self.db.settings.deduct_same_month
         next_due_obj = start_date_obj if deduct_same_month else start_date_obj + relativedelta(months=1)
         next_due_date = next_due_obj.strftime("%Y-%m-%d")
         
         self.db.add_loan_record(
             individual_id, loan_id, principal, total_repayment, principal,
             monthly_deduction, monthly_interest, date_str, next_due_date,
-            unearned_interest=unearned_interest
+            unearned_interest=unearned_interest,
+            duration_months=duration, interest_rate=interest_rate
         )
         
         new_balance = current_balance + principal
@@ -147,12 +149,8 @@ class LoanService:
 
     def has_loan_restructure_events(self, individual_id, loan_ref):
         """True if the loan has top-ups or buy-offs (a plain rebuild is unsafe)."""
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-            "AND event_type IN ('Loan Top-Up', 'Loan Buyoff')",
-            (individual_id, loan_ref))
-        return cursor.fetchone()[0] > 0
+        return self.db.ledger.count_events(
+            individual_id, loan_ref, ("Loan Top-Up", "Loan Buyoff")) > 0
 
     def rebuild_loan_schedule(self, individual_id, loan_ref, target_date=None):
         """Re-derive a loan's repayment schedule from issue, applying suspensions.
@@ -171,32 +169,24 @@ class LoanService:
             raise ValueError(
                 "Cannot auto-rebuild a loan with top-ups or buy-offs; adjust it manually.")
 
-        cursor = self.db.conn.cursor()
         # Rebuild up to the latest existing deduction (or an explicit target).
-        cursor.execute("SELECT MAX(date) FROM ledger WHERE individual_id=? AND loan_id=? "
-                       "AND event_type='Repayment'", (individual_id, loan_ref))
-        last = cursor.fetchone()[0]
+        last = self.db.ledger.max_date(individual_id, loan_ref, "Repayment")
         limit = target_date or last or datetime.now().strftime("%Y-%m-%d")
 
         # Wipe auto rows (keep the Loan Issued record).
-        cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=? "
-                       "AND event_type IN ('Repayment', 'Interest Earned')",
-                       (individual_id, loan_ref))
+        self.db.ledger.delete_events(individual_id, loan_ref,
+                                     ("Repayment", "Interest Earned"))
 
         # Reset to issued state: full principal outstanding, all interest unearned.
         principal = float(loan.get('principal') or 0)
         unearned = round(principal * DEFAULT_INTEREST_RATE, 2)
-        cursor.execute("SELECT MIN(date) FROM ledger WHERE individual_id=? AND loan_id=? "
-                       "AND event_type='Loan Issued'", (individual_id, loan_ref))
-        issue = cursor.fetchone()[0] or loan.get('start_date')
-        deduct_same = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+        issue = (self.db.ledger.min_date(individual_id, loan_ref, "Loan Issued")
+                 or loan.get('start_date'))
+        deduct_same = self.db.settings.deduct_same_month
         issue_dt = datetime.strptime(str(issue)[:10], "%Y-%m-%d")
         next_due = (issue_dt if deduct_same else issue_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
 
-        cursor.execute(
-            "UPDATE loans SET balance=?, interest_balance=0, unearned_interest=?, "
-            "next_due_date=?, status='Active' WHERE id=?",
-            (principal, unearned, next_due, loan['id']))
+        self.db.loans.reset_to_issued(loan['id'], principal, unearned, next_due)
         self.db.conn.commit()
 
         self.balance_recalculator.recalculate_balances(individual_id)
@@ -246,9 +236,7 @@ class LoanService:
                 
                 if months_skipped > 0:
                     # Advance next_due_date on the loan record (extending term)
-                    cursor = self.db.conn.cursor()
-                    cursor.execute("UPDATE loans SET next_due_date=? WHERE id=?", 
-                                   (due_date.strftime("%Y-%m-%d"), loan['id']))
+                    self.db.loans.set_next_due(loan['id'], due_date.strftime("%Y-%m-%d"))
                     self.db.conn.commit()
                 
                 # If suspension period has now passed, auto-resume and re-fetch
@@ -275,9 +263,9 @@ class LoanService:
         
         # We need current balances to start simulation
         df = self.get_ledger_df(individual_id)
-        current_balance = df["balance"].iloc[-1] if not df.empty else 0.0
-        current_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        current_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        current_balance, current_p_bal, current_i_bal = (
+            pos.balance, pos.principal_balance, pos.interest_balance)
         
         # We modify 'loan' dict in place as we simulate
         # Important: 'loan' from get_loan_by_ref might not have all fields if they are calc from ledger?
@@ -413,20 +401,11 @@ class LoanService:
             
             # Update Loan Record to final state
             # We need to update existing loan record with new balances and next due date
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                UPDATE loans 
-                SET balance=?, interest_balance=?, unearned_interest=?, next_due_date=?, status=? 
-                WHERE id=? AND individual_id=?
-            """, (
-                sim_loan['balance'], 
-                sim_loan['interest_balance'], 
-                sim_loan['unearned_interest'], 
-                sim_loan['next_due_date'], 
-                sim_loan['status'],
-                loan['id'], # Need internal ID? get_loan_by_ref returns dict with 'id' usually?
-                individual_id
-            ))
+            self.db.loans.set_catch_up_state(
+                loan['id'], individual_id,
+                sim_loan['balance'], sim_loan['interest_balance'],
+                sim_loan['unearned_interest'], sim_loan['next_due_date'],
+                sim_loan['status'])
             # get_loan_by_ref returns joined data? Let's check keys.
             # Assuming 'id' is present. If row factory used, yes.
             
@@ -437,9 +416,8 @@ class LoanService:
         elif skipped_count > 0:
             # The catch-up window fell entirely inside a suspension: no
             # deductions, but the term still advances — persist the new due date.
-            cursor = self.db.conn.cursor()
-            cursor.execute("UPDATE loans SET next_due_date=? WHERE id=? AND individual_id=?",
-                           (sim_loan['next_due_date'], loan['id'], individual_id))
+            self.db.loans.set_next_due(loan['id'], sim_loan['next_due_date'],
+                                       member_id=individual_id)
             self.db.conn.commit()
 
         return count
@@ -498,13 +476,10 @@ class LoanService:
         if not batch_id: return False
         
         # 1. Identify affected individuals
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT DISTINCT individual_id FROM ledger WHERE batch_id=?", (batch_id,))
-        affected_ids = [row[0] for row in cursor.fetchall()]
-        
+        affected_ids = self.db.ledger.members_in_batch(batch_id)
+
         # 2. Identify affected loans to restore state
-        cursor.execute("SELECT DISTINCT loan_id, individual_id FROM ledger WHERE batch_id=?", (batch_id,))
-        affected_loans = cursor.fetchall() # List of (loan_id, ind_id)
+        affected_loans = self.db.ledger.loans_in_batch(batch_id)  # (loan_ref, member_id)
 
         # 3. Restore previous states for each transaction in reverse order?
         # Since we use `previous_state` JSON in ledger, we can restore loan state from the FIRST transaction for each loan in the batch?
@@ -571,9 +546,7 @@ class LoanService:
                     break
                 due = due + relativedelta(months=1)
             loan['next_due_date'] = due.strftime("%Y-%m-%d")
-            cursor = self.db.conn.cursor()
-            cursor.execute("UPDATE loans SET next_due_date=? WHERE id=?",
-                           (loan['next_due_date'], loan['id']))
+            self.db.loans.set_next_due(loan['id'], loan['next_due_date'])
             self.db.conn.commit()
 
         previous_state_json = json.dumps(self._capture_loan_state(loan))
@@ -589,9 +562,8 @@ class LoanService:
         new_interest_bal = current_interest_bal + accrual_amount
         
         df = self.get_ledger_df(individual_id)
-        last_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         if accrual_amount > 0:
             accrual_tx_bal = last_bal + accrual_amount
@@ -702,9 +674,8 @@ class LoanService:
         new_monthly_interest = math.ceil(new_unearned / new_duration)
         
         df = self.get_ledger_df(individual_id)
-        last_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         new_tx_bal = last_bal + top_up_amount
         new_ledger_p_bal = last_p_bal + top_up_amount
@@ -714,6 +685,9 @@ class LoanService:
         
         self.db.update_loan_details(loan['id'], new_total_amount, new_principal, new_installment,
                                     new_monthly_interest, next_due, unearned_interest=new_unearned)
+        # The top-up re-terms the loan; keep the stored duration describing it.
+        with self.db.transaction():
+            self.db.loans.set_terms(loan['id'], new_duration)
         
         self.db.add_transaction(
             individual_id, date_str, "Loan Top-Up", loan_ref,
@@ -765,7 +739,10 @@ class LoanService:
         today = datetime.now().strftime("%Y-%m-%d")
         next_due = (datetime.now() + relativedelta(months=1)).strftime("%Y-%m-%d")
         
-        self.db.update_loan_details(loan['id'], new_total, current_balance, new_installment, new_monthly_interest, next_due)
+        self.db.update_loan_details(loan['id'], new_total, current_balance, new_installment,
+                                    new_monthly_interest, next_due)
+        with self.db.transaction():
+            self.db.loans.set_terms(loan['id'], new_duration, new_interest_rate)
         
         interest_note = f", New Rate: {new_interest_rate*100:.0f}%" if new_interest_rate else ""
         self.db.add_transaction(
@@ -830,9 +807,9 @@ class LoanService:
         # Let's trust loan dict for 'principal_balance' concept if it maps to 'balance'.
         
         # Ledger way:
-        current_tx_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        current_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        current_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        current_tx_bal, current_p_bal, current_i_bal = (
+            pos.balance, pos.principal_balance, pos.interest_balance)
         
         if current_p_bal <= 0 and current_i_bal <= 0:
             # Already paid?

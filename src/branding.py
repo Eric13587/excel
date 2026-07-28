@@ -30,7 +30,7 @@ def bundled_logo_path():
 def get_org_name(db):
     """The configured organization name, or '' when not set."""
     try:
-        return (db.get_setting(ORG_NAME_KEY, "") or "").strip()
+        return db.settings.org_name
     except Exception:
         return ""
 
@@ -41,7 +41,7 @@ def resolve_logo_path(db=None, override=None):
         return override
     if db is not None:
         try:
-            configured = db.get_setting(ORG_LOGO_KEY, "") or ""
+            configured = db.settings.org_logo_path
         except Exception:
             configured = ""
         if configured and os.path.exists(configured):

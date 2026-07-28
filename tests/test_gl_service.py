@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.database import DatabaseManager
 from src.services.gl_service import GLService
-from src.exceptions import UnbalancedJournalError, UnknownAccountError
+from src.exceptions import (UnbalancedJournalError, UnknownAccountError,
+                            ImmutableEntryError)
 from src.config import (
     DEFAULT_CHART_OF_ACCOUNTS, GL_CASH, GL_LOANS_RECEIVABLE,
     GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS, GL_LOAN_INTEREST_INCOME,
@@ -488,3 +489,445 @@ def test_hook_then_rebuild_is_consistent(gl):
     live = svc.get_account_balance(GL_LOANS_RECEIVABLE)
     svc.sync()  # full rebuild from subledgers
     assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == live  # identical
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5a — incremental projection of individual subledger rows
+# --------------------------------------------------------------------------- #
+def _repayment_row(db):
+    return db.conn.execute(
+        "SELECT id FROM ledger WHERE event_type='Repayment'").fetchone()[0]
+
+
+def test_project_rows_posts_a_new_row(gl):
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    before = svc.get_account_balance(GL_MEMBER_DEPOSITS)
+
+    db.add_savings_transaction(ind, "2026-04-01", "Deposit", 750, "later")
+    row_id = db.conn.execute("SELECT MAX(id) FROM savings").fetchone()[0]
+    posted, withdrawn = svc.project_rows("savings", [row_id])
+
+    assert (posted, withdrawn) == (1, 0)  # nothing to withdraw; no hook registered here
+    assert svc.get_account_balance(GL_MEMBER_DEPOSITS) == before + 750.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_replaces_the_entry_for_an_edited_row(gl):
+    """The case post_journal's idempotency cannot express: the row already has
+    an entry, and the entry is now wrong."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    entries_before = svc._entry_count()
+    row_id = _repayment_row(db)
+
+    # The user corrects the repayment from 1000 (850/150) to 2000 (1850/150).
+    db.conn.execute("UPDATE ledger SET deducted=2000, principal_portion=1850 WHERE id=?",
+                    (row_id,))
+    db.conn.commit()
+    posted, withdrawn = svc.project_rows("ledger", [row_id])
+
+    assert (posted, withdrawn) == (1, 1)
+    assert svc._entry_count() == entries_before, "the entry was replaced, not duplicated"
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == 10000.0 - 1850.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_withdraws_the_entry_for_a_deleted_row(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    before = svc.get_account_balance(GL_LOANS_RECEIVABLE)
+    row_id = _repayment_row(db)
+
+    db.conn.execute("DELETE FROM ledger WHERE id=?", (row_id,))
+    db.conn.commit()
+    posted, withdrawn = svc.project_rows("ledger", [row_id])
+
+    assert (posted, withdrawn) == (0, 1)
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == before + 850.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_follows_a_row_that_changes_source(gl):
+    """Regression: a ledger row's *source* is decided by its event type, so an
+    edit can move its entry between sources. Matching on (source, source_ref)
+    missed the old entry and left a duplicate behind."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    entries_before = svc._entry_count()
+    row_id = _repayment_row(db)
+
+    db.conn.execute("UPDATE ledger SET event_type='Interest Earned', deducted=0, "
+                    "added=150, interest_amount=150, principal_portion=0, "
+                    "interest_portion=0 WHERE id=?", (row_id,))
+    db.conn.commit()
+    svc.project_rows("ledger", [row_id])
+
+    assert svc._entry_count() == entries_before, "the repayment entry was left behind"
+    refs = [r[0] for r in db.conn.execute(
+        "SELECT source FROM journal_entries WHERE source_ref=?", (f"ledger:{row_id}",))]
+    assert refs == ["interest"]
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_never_withdraws_a_manual_entry(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    row_id = _repayment_row(db)
+
+    # A manual entry that happens to carry the same source_ref.
+    manual = svc.post_journal("2026-05-01", [
+        {'account': GL_CASH, 'debit': 10}, {'account': GL_LOAN_INTEREST_INCOME, 'credit': 10},
+    ], source="manual", source_ref=f"ledger:{row_id}")
+
+    svc.project_rows("ledger", [row_id])
+    assert svc._find_entry("manual", f"ledger:{row_id}") == manual
+
+
+def test_project_rows_matches_a_full_rebuild(gl):
+    """The equivalence the incremental path has to hold: projecting the changed
+    rows leaves the books exactly where wiping and re-deriving would."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+
+    row_id = _repayment_row(db)
+    gone = db.conn.execute(
+        "SELECT id FROM savings WHERE transaction_type='Withdrawal'").fetchone()[0]
+    db.conn.execute("UPDATE ledger SET deducted=1500, principal_portion=1350 WHERE id=?", (row_id,))
+    db.conn.execute("DELETE FROM savings WHERE id=?", (gone,))
+    db.conn.commit()
+
+    svc.project_rows("ledger", [row_id])
+    svc.project_rows("savings", [gone, gone + 1000])   # deleted, and one that never existed
+
+    def snapshot():
+        rows, balanced = svc.get_trial_balance()
+        assert balanced
+        return {r['code']: (r['debit'], r['credit']) for r in rows}
+
+    incremental = snapshot()
+    svc.rebuild_auto_journals()
+    assert incremental == snapshot()
+    assert ind
+
+
+def test_project_rows_rejects_an_unprojected_table(gl):
+    svc, _ = gl
+    with pytest.raises(ValueError):
+        svc.project_rows("loans", [1])
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5b — the change queue drives sync
+# --------------------------------------------------------------------------- #
+def _depth(db):
+    return db.conn.execute("SELECT COUNT(*) FROM gl_outbox").fetchone()[0]
+
+
+def test_first_sync_rebuilds_then_later_syncs_drain(gl):
+    """An empty queue cannot distinguish 'nothing changed' from 'never
+    projected', so the first sync must not trust it."""
+    svc, db = gl
+    _seed_subledgers(db)
+    db.conn.execute("DELETE FROM gl_outbox")   # as if the rows predate migration 005
+    db.conn.commit()
+    assert not svc.projection_established()
+
+    svc.sync()
+    assert svc.projection_established()
+    assert svc._entry_count() == 5
+    assert _depth(db) == 0
+
+    svc.sync()                                  # nothing queued, nothing to do
+    assert svc._entry_count() == 5
+
+
+def test_writes_queue_and_sync_projects_only_them(gl):
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+    entries = svc._entry_count()
+
+    db.add_savings_transaction(ind, "2026-05-01", "Deposit", 400, "new")
+    assert _depth(db) == 1
+
+    posted, withdrawn = svc.drain_outbox()
+    assert (posted, withdrawn) == (1, 0)
+    assert svc._entry_count() == entries + 1
+    assert _depth(db) == 0
+
+
+def test_a_balance_only_rewrite_queues_nothing(gl):
+    """The running-balance recalculators rewrite `balance` on thousands of rows
+    without changing a single journal. UPDATE OF keeps them out of the queue."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("UPDATE ledger SET balance = balance + 1")
+    db.conn.execute("UPDATE savings SET balance = balance + 1")
+    db.conn.commit()
+    assert _depth(db) == 0
+
+
+def test_an_edit_through_raw_sql_still_reaches_the_gl(gl):
+    """The reason the queue is a trigger and not a Python hook: this write never
+    passes through DatabaseManager."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("UPDATE ledger SET deducted=2000, principal_portion=1850 "
+                    "WHERE event_type='Repayment'")
+    db.conn.commit()
+    assert _depth(db) == 1
+
+    svc.sync()
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == 10000.0 - 1850.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_a_deletion_withdraws_its_entry_on_sync(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    before = svc.get_account_balance(GL_LOANS_RECEIVABLE)
+
+    db.conn.execute("DELETE FROM ledger WHERE event_type='Repayment'")
+    db.conn.commit()
+    svc.sync()
+
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == before + 850.0
+    assert _depth(db) == 0
+
+
+def test_fund_activity_reaches_the_gl_without_a_python_hook(gl):
+    """Closes the gap fund_add_transaction documented: Christmas and Benevolent
+    rows fire no post hook, so before the queue they only reached the books on
+    the next full rebuild."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+
+    db.fund_add_transaction("christmas_savings", ind, "2026-06-01", "Deposit", 1200)
+    db.fund_add_transaction("benevolent_ledger", ind, "2026-06-01", "Contribution", 300)
+    assert _depth(db) == 2
+
+    svc.sync()
+    assert svc.get_account_balance(GL_CHRISTMAS_SAVINGS) == 1200.0
+    assert svc.get_account_balance(GL_BENEVOLENT_FUND) == 300.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_incremental_sync_matches_a_full_rebuild(gl):
+    """The equivalence the whole sub-phase rests on."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("UPDATE ledger SET deducted=1500, principal_portion=1350 "
+                    "WHERE event_type='Repayment'")
+    db.conn.execute("DELETE FROM savings WHERE transaction_type='Withdrawal'")
+    db.conn.commit()
+    db.add_savings_transaction(ind, "2026-07-01", "Deposit", 90, "late")
+    db.fund_add_transaction("christmas_savings", ind, "2026-07-02", "Deposit", 45)
+    svc.sync()
+
+    def snapshot():
+        rows, balanced = svc.get_trial_balance()
+        assert balanced
+        return {r['code']: (r['debit'], r['credit']) for r in rows}
+
+    incremental = snapshot()
+    svc.sync(full=True)
+    assert incremental == snapshot()
+
+
+def test_a_failed_drain_leaves_the_queue_intact(gl):
+    """Outbox semantics: the queue is emptied only once the projection commits,
+    so a failure is retried rather than silently dropped."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+    db.add_savings_transaction(ind, "2026-08-01", "Deposit", 60, "boom")
+    assert _depth(db) == 1
+
+    original = svc._project_one
+
+    def explode(table, row_id, ref):
+        raise RuntimeError("projection failed")
+
+    svc._project_one = explode
+    with pytest.raises(RuntimeError):
+        svc.drain_outbox()
+    svc._project_one = original
+
+    assert _depth(db) == 1, "the change must survive to be retried"
+    svc.drain_outbox()
+    assert _depth(db) == 0
+
+
+def test_a_rebuild_resets_the_queue(gl):
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+    db.add_savings_transaction(ind, "2026-09-01", "Deposit", 30, "x")
+    assert _depth(db) == 1
+
+    svc.rebuild_auto_journals()
+    assert _depth(db) == 0
+    assert svc.projection_established()
+
+
+def test_clearing_the_marker_forces_a_rebuild(gl):
+    """The self-healing escape hatch: whatever state the projection is in,
+    clearing the marker makes the next sync re-derive it from scratch."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("DELETE FROM journal_entries WHERE source='savings'")
+    db.settings.set(svc._PROJECTION_MARKER, "0")
+    db.conn.commit()
+
+    svc.sync()
+    assert svc.get_account_balance(GL_MEMBER_DEPOSITS) == 1500.0
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6a — posted entries are immutable; corrections are reversals
+# --------------------------------------------------------------------------- #
+def _manual_entry(svc, memo="rent"):
+    return svc.post_journal("2026-01-01", [
+        {'account': GL_CASH, 'debit': 100},
+        {'account': GL_LOAN_INTEREST_INCOME, 'credit': 100},
+    ], source="manual", memo=memo)
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE journal_entries SET memo='changed' WHERE id=?",
+    "UPDATE journal_entries SET entry_date='2027-01-01' WHERE id=?",
+    "UPDATE journal_entries SET source='repayment' WHERE id=?",
+    "DELETE FROM journal_entries WHERE id=?",
+])
+def test_an_authored_entry_cannot_be_altered(gl, sql):
+    import sqlite3
+    svc, db = gl
+    entry = _manual_entry(svc)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute(sql, (entry,))
+    db.conn.rollback()
+    assert svc._entry_count() == 1
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE journal_lines SET debit=999 WHERE entry_id=?",
+    "DELETE FROM journal_lines WHERE entry_id=?",
+])
+def test_an_authored_entrys_lines_cannot_be_altered(gl, sql):
+    import sqlite3
+    svc, db = gl
+    entry = _manual_entry(svc)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute(sql, (entry,))
+    db.conn.rollback()
+    assert svc.get_account_balance(GL_CASH) == 100.0
+
+
+def test_reversing_still_records_the_status_change(gl):
+    """The UPDATE trigger is scoped to accounting substance: writing `status`
+    and `reversal_of` is the audit trail being recorded, not the entry being
+    changed, so it must stay allowed."""
+    svc, db = gl
+    entry = _manual_entry(svc)
+    reversal = svc.reverse_entry(entry)
+
+    rows = dict(db.conn.execute("SELECT id, status FROM journal_entries").fetchall())
+    assert rows[entry] == "reversed" and rows[reversal] == "reversal"
+    assert db.conn.execute("SELECT reversal_of FROM journal_entries WHERE id=?",
+                           (reversal,)).fetchone()[0] == entry
+    assert svc.get_account_balance(GL_CASH) == 0.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_the_projection_is_still_free_to_re_derive_itself(gl):
+    """Freezing the projected slice would freeze the projection. It is derived
+    data, and rebuilding it is recomputing a view, not rewriting the books."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    manual = _manual_entry(svc)
+
+    projected_before = db.conn.execute(
+        "SELECT COUNT(*) FROM journal_entries WHERE source IN "
+        "('loan_disbursement','repayment','interest','savings')").fetchone()[0]
+    assert projected_before == 5
+
+    svc.sync(full=True)          # wipes and re-derives every projected entry
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM journal_entries WHERE source IN "
+        "('loan_disbursement','repayment','interest','savings')").fetchone()[0] == 5
+    assert db.conn.execute("SELECT memo FROM journal_entries WHERE id=?",
+                           (manual,)).fetchone()[0] == "rent", "the authored entry survived"
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_a_projected_entry_cannot_be_reversed(gl):
+    """The reversal is authored and survives; the original is re-derived on the
+    next rebuild. The pair stops netting to zero and the correction doubles."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    projected = db.conn.execute(
+        "SELECT id FROM journal_entries WHERE source='repayment'").fetchone()[0]
+
+    with pytest.raises(ImmutableEntryError):
+        svc.reverse_entry(projected)
+    assert db.conn.execute("SELECT COUNT(*) FROM journal_entries WHERE source='reversal'"
+                           ).fetchone()[0] == 0
+
+
+def test_an_entry_cannot_be_reversed_twice(gl):
+    svc, _ = gl
+    entry = _manual_entry(svc)
+    svc.reverse_entry(entry)
+    with pytest.raises(ImmutableEntryError):
+        svc.reverse_entry(entry)
+
+
+def test_a_reversal_is_itself_immutable(gl):
+    import sqlite3
+    svc, db = gl
+    reversal = svc.reverse_entry(_manual_entry(svc))
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("DELETE FROM journal_entries WHERE id=?", (reversal,))
+    db.conn.rollback()
+
+
+def test_projected_sources_match_the_trigger(gl):
+    """Migration 006 hard-codes the projected sources — a trigger cannot read a
+    Python constant. This fails if the two lists ever drift apart."""
+    svc, db = gl
+    sql = db.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='trg_journal_entry_immutable_del'"
+    ).fetchone()[0]
+    for source in svc._AUTO_SOURCES:
+        assert f"'{source}'" in sql, f"{source} is projected but the trigger freezes it"
+    quoted = {s.strip().strip("'") for s in
+              sql.split("NOT IN (")[1].split(")")[0].split(",")}
+    assert quoted == set(svc._AUTO_SOURCES)

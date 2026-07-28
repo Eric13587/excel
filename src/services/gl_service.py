@@ -10,10 +10,14 @@ posted here through the ``post_*`` helpers, which means the existing ``ledger``
 and ``savings`` tables become subledgers that reconcile to GL control accounts
 rather than three disconnected sources of truth.
 """
+import logging
+import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-from src.exceptions import UnbalancedJournalError, UnknownAccountError
+from src.exceptions import (PERIOD_LOCK_MARKER, ImmutableEntryError,
+                            PeriodClosedError, UnbalancedJournalError,
+                            UnknownAccountError)
 from src.config import (
     GL_CASH, GL_LOANS_RECEIVABLE, GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS,
     GL_LOAN_INTEREST_INCOME, GL_OPENING_EQUITY, GL_FEES_INCOME,
@@ -21,6 +25,8 @@ from src.config import (
     GL_ALLOWANCE_LOAN_LOSS, GL_SHARE_CAPITAL, GL_RETAINED_EARNINGS,
     GL_CHRISTMAS_SAVINGS, GL_BENEVOLENT_FUND,
 )
+
+logger = logging.getLogger(__name__)
 
 # Money is tracked to whole cents; debits and credits must agree within this
 # tolerance for an entry to be considered balanced.
@@ -64,21 +70,12 @@ class GLService:
     # ------------------------------------------------------------------ #
     def _valid_codes(self):
         if self._account_codes is None:
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT code FROM chart_of_accounts")
-            self._account_codes = {r[0] for r in cur.fetchall()}
+            self._account_codes = self.db.journal.account_codes()
         return self._account_codes
 
     def get_accounts(self, active_only=True):
         """Return the chart of accounts as a list of dicts."""
-        cur = self.db.conn.cursor()
-        q = "SELECT code, name, type, normal_balance, is_active, description FROM chart_of_accounts"
-        if active_only:
-            q += " WHERE is_active = 1"
-        q += " ORDER BY code"
-        cur.execute(q)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return self.db.journal.accounts(active_only)
 
     # ------------------------------------------------------------------ #
     # Posting
@@ -134,19 +131,20 @@ class GLService:
         if abs(round(total_debit - total_credit, 2)) > _BALANCE_TOLERANCE:
             raise UnbalancedJournalError(total_debit, total_credit)
 
-        cur = self.db.conn.cursor()
-        cur.execute(
-            """INSERT INTO journal_entries
-                   (entry_date, memo, source, source_ref, status, created_at, created_by)
-               VALUES (?, ?, ?, ?, 'posted', ?, ?)""",
-            (entry_date, memo, source, source_ref,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by),
-        )
-        entry_id = cur.lastrowid
-        cur.executemany(
-            "INSERT INTO journal_lines (entry_id, account_code, debit, credit, line_memo) VALUES (?, ?, ?, ?, ?)",
-            [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm],
-        )
+        try:
+            entry_id = self.db.journal.add_entry(
+                entry_date, memo, source, source_ref,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by)
+            self.db.journal.add_lines(
+                [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm])
+        except sqlite3.IntegrityError as e:
+            # Posting does not go through DatabaseManager.transaction, so the
+            # period lock (migration 009) is translated here instead — same
+            # contract, so a caller sees one exception type either way.
+            if PERIOD_LOCK_MARKER in str(e):
+                raise PeriodClosedError(entry_date, "a closed period",
+                                        what="This journal entry") from e
+            raise
         self._maybe_commit()
         return entry_id
 
@@ -155,14 +153,29 @@ class GLService:
 
         Corrections never edit or delete a posted entry; they post the inverse.
         Both entries remain in the ledger and net to zero.
+
+        Two entries cannot be reversed, and the rule belongs here rather than in
+        the dialog that happens to offer the button:
+
+        * **a projected entry**, because the reversal is authored and survives
+          while the original is re-derived on the next rebuild. The pair stops
+          netting to zero and the correction silently doubles. Such an entry is
+          corrected by editing the loan or savings row behind it, which
+          re-projects through the change queue.
+        * **an entry that is already reversed**, which would net the correction
+          back to the original amount.
         """
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT entry_date, memo FROM journal_entries WHERE id=?", (entry_id,))
-        head = cur.fetchone()
+        head = self.db.journal.entry_header(entry_id)
         if not head:
             raise ValueError(f"Journal entry {entry_id} not found.")
-        cur.execute("SELECT account_code, debit, credit FROM journal_lines WHERE entry_id=?", (entry_id,))
-        orig_lines = cur.fetchall()
+        source, status = self.db.journal.entry_origin(entry_id)
+        if self.is_auto_source(source):
+            raise ImmutableEntryError(
+                entry_id, "it is projected from member activity — correct the "
+                          "underlying loan or savings record instead")
+        if status != "posted":
+            raise ImmutableEntryError(entry_id, f"it is already '{status}'")
+        orig_lines = self.db.journal.entry_lines(entry_id)
 
         rev_lines = [{'account': code, 'debit': credit, 'credit': debit}
                      for (code, debit, credit) in orig_lines]
@@ -172,49 +185,131 @@ class GLService:
             memo=memo or f"Reversal of entry #{entry_id}",
             source="reversal",
         )
-        cur.execute("UPDATE journal_entries SET status='reversed' WHERE id=?", (entry_id,))
-        cur.execute("UPDATE journal_entries SET status='reversal', reversal_of=? WHERE id=?",
-                    (entry_id, reversal_id))
+        self.db.journal.mark_reversed(entry_id)
+        self.db.journal.mark_reversal(reversal_id, entry_id)
         self.db.conn.commit()
         return reversal_id
 
     def _find_entry(self, source, source_ref):
-        cur = self.db.conn.cursor()
-        cur.execute(
-            "SELECT id FROM journal_entries WHERE source=? AND source_ref=? LIMIT 1",
-            (source, source_ref),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
+        return self.db.journal.find_by_source_ref(source, source_ref)
 
     def _entry_count(self):
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM journal_entries")
-        return cur.fetchone()[0]
+        return self.db.journal.entry_count()
+
+    # ------------------------------------------------------------------ #
+    # Period-end snapshots (migration 010)
+    # ------------------------------------------------------------------ #
+    def snapshot_period(self, period):
+        """Record every account's cumulative position at a period's end date.
+
+        Called when a period closes. What makes this a record rather than a
+        cache is that a closed period cannot change — migration 009 refuses
+        every write into one — so the figures stored here are settled by
+        definition and never need invalidating.
+
+        Returns the number of accounts written.
+        """
+        as_of = period["end_date"]
+        rows = self.db.journal.cumulative_totals(as_of)
+        with self._bulk():
+            self.db.snapshots.write(period["id"], as_of, rows)
+        return len(rows)
+
+    def discard_snapshots_from(self, as_of):
+        """Drop snapshots dated on or after ``as_of``. Returns the count.
+
+        Reopening a period invalidates its own snapshot *and every later one*:
+        the totals are cumulative, so a change inside the reopened period moves
+        every figure that includes it.
+        """
+        with self._bulk():
+            return self.db.snapshots.discard_from(as_of)
+
+    def rebuild_snapshots(self):
+        """Re-derive the snapshot of every closed period, earliest first.
+
+        The counterpart of ``sync(full=True)``. Needed after a period is
+        reopened and re-closed, since the later snapshots discarded at reopen
+        are not restored by closing one period.
+        """
+        written = 0
+        with self._bulk():
+            self.db.snapshots.discard_from("0000-00-00")
+            for period in self.db.periods.all():
+                if period["status"] == "closed":
+                    as_of = period["end_date"]
+                    self.db.snapshots.write(
+                        period["id"], as_of, self.db.journal.cumulative_totals(as_of))
+                    written += 1
+        return written
+
+    def snapshot_discrepancies(self):
+        """Snapshots that disagree with a fresh computation.
+
+        The guarantee behind the read path. Returns
+        ``[(as_of, account_code, stored, recomputed)]`` — empty when every
+        snapshot still reflects the journal it was taken from.
+        """
+        out = []
+        for as_of in self.db.snapshots.dates():
+            stored = self.db.snapshots.balances_at(as_of)
+            fresh = {code: (d, c)
+                     for code, d, c in self.db.journal.cumulative_totals(as_of)}
+            for code in set(stored) | set(fresh):
+                s = stored.get(code, (0.0, 0.0))
+                f = fresh.get(code, (0.0, 0.0))
+                if abs(round((s[0] - s[1]) - (f[0] - f[1]), 2)) > _BALANCE_TOLERANCE:
+                    out.append((as_of, code, round(s[0] - s[1], 2), round(f[0] - f[1], 2)))
+        return out
 
     # ------------------------------------------------------------------ #
     # Balances & trial balance
     # ------------------------------------------------------------------ #
+    def _trial_balance_source(self, as_of):
+        """``(code, name, type, net)`` per account, via a snapshot when one covers
+        ``as_of``. Falls back to the full aggregate otherwise."""
+        baseline = self.db.snapshots.latest_at_or_before(as_of) if as_of else None
+        if not baseline:
+            return self.db.journal.trial_balance_rows(as_of)
+
+        nets = {code: d - c
+                for code, (d, c) in self.db.snapshots.balances_at(baseline).items()}
+        if baseline < as_of:
+            for code, debit, credit in self.db.journal.movements_between(baseline, as_of):
+                nets[code] = nets.get(code, 0.0) + debit - credit
+        return [(code, name, typ, nets.get(code, 0.0))
+                for code, name, typ in self.db.journal.accounts_with_names()]
+
+    def _net_via_snapshot(self, account_code, as_of):
+        """``SUM(debit) - SUM(credit)`` for one account, using a snapshot baseline.
+
+        Falls back to a full aggregate when no snapshot covers the date, which
+        is every journal until a period is closed.
+        """
+        if not as_of:
+            return None
+        baseline = self.db.snapshots.latest_at_or_before(as_of)
+        if not baseline:
+            return None
+        stored = self.db.snapshots.balance_at(account_code, baseline)
+        net = (stored[0] - stored[1]) if stored else 0.0
+        if baseline < as_of:
+            net += self.db.journal.account_net_between(account_code, baseline, as_of)
+        return net
+
     def get_account_balance(self, account_code, as_of=None):
         """Return an account's balance in its natural (positive) sense.
 
         Debit-normal accounts are positive when debit-heavy; credit-normal
         accounts are positive when credit-heavy.
-        """
-        cur = self.db.conn.cursor()
-        q = ("SELECT COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) "
-             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
-             "WHERE l.account_code = ?")
-        params = [account_code]
-        if as_of:
-            q += " AND e.entry_date <= ?"
-            params.append(as_of)
-        cur.execute(q, params)
-        debit_minus_credit = cur.fetchone()[0] or 0.0
 
-        cur.execute("SELECT normal_balance FROM chart_of_accounts WHERE code=?", (account_code,))
-        row = cur.fetchone()
-        normal = row[0] if row else 'debit'
+        When a closed period's snapshot covers the date, the settled part is
+        read rather than re-aggregated and only the movement since is summed.
+        """
+        debit_minus_credit = self._net_via_snapshot(account_code, as_of)
+        if debit_minus_credit is None:
+            debit_minus_credit = self.db.journal.account_net(account_code, as_of)
+        normal = self.db.journal.normal_balance(account_code) or 'debit'
         signed = debit_minus_credit if normal == 'debit' else -debit_minus_credit
         return round(signed, 2)
 
@@ -226,23 +321,10 @@ class GLService:
         and credit columns must be equal — that equality is the proof the ledger
         is internally consistent.
         """
-        cur = self.db.conn.cursor()
-        q = ("SELECT a.code, a.name, a.type, "
-             "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
-             "FROM chart_of_accounts a "
-             "LEFT JOIN journal_lines l ON l.account_code = a.code "
-             "LEFT JOIN journal_entries e ON l.entry_id = e.id")
-        params = []
-        if as_of:
-            q += " AND e.entry_date <= ?"
-            params.append(as_of)
-        q += " GROUP BY a.code, a.name, a.type ORDER BY a.code"
-        cur.execute(q, params)
-
         rows = []
         total_debit = 0.0
         total_credit = 0.0
-        for code, name, typ, net in cur.fetchall():
+        for code, name, typ, net in self._trial_balance_source(as_of):
             net = round(net or 0.0, 2)
             if abs(net) < 0.005:
                 continue  # skip accounts with no balance
@@ -267,25 +349,8 @@ class GLService:
         returned positive when the account sits on its normal side. Accounts
         netting to zero in the range are omitted.
         """
-        cur = self.db.conn.cursor()
-        q = ("SELECT a.code, a.name, "
-             "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
-             "FROM chart_of_accounts a "
-             "LEFT JOIN journal_lines l ON l.account_code = a.code "
-             "LEFT JOIN journal_entries e ON l.entry_id = e.id "
-             "WHERE a.type = ?")
-        params = [acct_type]
-        if start_date:
-            q += " AND e.entry_date >= ?"
-            params.append(start_date)
-        if end_date:
-            q += " AND e.entry_date <= ?"
-            params.append(end_date)
-        q += " GROUP BY a.code, a.name ORDER BY a.code"
-        cur.execute(q, params)
-
         lines = []
-        for code, name, net in cur.fetchall():
+        for code, name, net in self.db.journal.statement_rows(acct_type, start_date, end_date):
             net = round(net or 0.0, 2)
             amount = net if positive_side == 'debit' else -net
             amount = round(amount, 2)
@@ -366,33 +431,12 @@ class GLService:
         subtotals sum to the change in the cash account, so opening + net change
         == closing cash by construction.
         """
-        cur = self.db.conn.cursor()
-
-        if start_date:
-            cur.execute(
-                "SELECT COALESCE(SUM(l.debit - l.credit),0) FROM journal_lines l "
-                "JOIN journal_entries e ON l.entry_id = e.id "
-                "WHERE l.account_code = ? AND e.entry_date < ?",
-                (GL_CASH, start_date))
-            opening = round(cur.fetchone()[0] or 0.0, 2)
-        else:
-            opening = 0.0
-
-        q = ("SELECT l.account_code, a.name, l.debit, l.credit "
-             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
-             "JOIN chart_of_accounts a ON a.code = l.account_code "
-             "WHERE l.account_code != ?")
-        params = [GL_CASH]
-        if start_date:
-            q += " AND e.entry_date >= ?"
-            params.append(start_date)
-        if end_date:
-            q += " AND e.entry_date <= ?"
-            params.append(end_date)
-        cur.execute(q, params)
+        opening = (round(self.db.journal.cash_before(GL_CASH, start_date), 2)
+                   if start_date else 0.0)
 
         cats = {'Operating': {}, 'Lending to members': {}, 'Financing': {}}
-        for code, name, debit, credit in cur.fetchall():
+        for code, name, debit, credit in self.db.journal.counterpart_lines(
+                GL_CASH, start_date, end_date):
             contrib = round((credit or 0.0) - (debit or 0.0), 2)  # +ve = cash in
             if contrib == 0:
                 continue
@@ -422,37 +466,16 @@ class GLService:
     # ------------------------------------------------------------------ #
     def get_journal_entries(self, limit=200):
         """Recent journal entries with their total amount (sum of debits)."""
-        cur = self.db.conn.cursor()
-        cur.execute(
-            "SELECT e.id, e.entry_date, e.memo, e.source, e.status, "
-            "COALESCE(SUM(l.debit), 0) AS amount "
-            "FROM journal_entries e LEFT JOIN journal_lines l ON l.entry_id = e.id "
-            "GROUP BY e.id ORDER BY e.entry_date DESC, e.id DESC LIMIT ?",
-            (limit,),
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return self.db.journal.recent_entries(limit)
 
     def get_account_ledger(self, account_code, as_of=None):
         """One account's posting history with a running balance (natural sign)."""
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT normal_balance FROM chart_of_accounts WHERE code=?", (account_code,))
-        row = cur.fetchone()
-        normal = row[0] if row else 'debit'
-
-        q = ("SELECT e.id, e.entry_date, e.memo, e.source, l.debit, l.credit "
-             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
-             "WHERE l.account_code = ?")
-        params = [account_code]
-        if as_of:
-            q += " AND e.entry_date <= ?"
-            params.append(as_of)
-        q += " ORDER BY e.entry_date, e.id, l.id"
-        cur.execute(q, params)
+        normal = self.db.journal.normal_balance(account_code) or 'debit'
 
         running = 0.0
         out = []
-        for (eid, date, memo, source, debit, credit) in cur.fetchall():
+        for (eid, date, memo, source, debit, credit) in self.db.journal.account_postings(
+                account_code, as_of):
             debit = round(debit or 0.0, 2)
             credit = round(credit or 0.0, 2)
             delta = (debit - credit) if normal == 'debit' else (credit - debit)
@@ -582,38 +605,74 @@ class GLService:
     _AUTO_SOURCES = ("loan_disbursement", "repayment", "interest", "savings",
                      "christmas", "benevolent")
 
+    # Set once a full rebuild has established the projection. Until then the
+    # change queue cannot be trusted as the complete list of outstanding work,
+    # because an empty queue is indistinguishable from an empty GL.
+    _PROJECTION_MARKER = "gl_projection_established"
+
+    def projection_established(self):
+        return self.db.settings.get(self._PROJECTION_MARKER) == "1"
+
     def rebuild_auto_journals(self, progress=None):
         """Drop and re-derive the subledger-projected journals.
 
-        Member activity supports edits and undos, which incremental backfill
-        cannot reflect (it only ever adds). Rebuilding the projection slice
-        keeps the GL exactly consistent with the current ledger/savings state
-        while preserving manual and migration entries. Returns the new count.
+        The unconditional path: correct from any starting state, and the cost of
+        the whole projection every time. It is what establishes the baseline the
+        change queue is measured against, so it empties the queue and marks the
+        projection established. Manual and migration entries are preserved.
+        Returns the new count.
         """
         with self._bulk():
-            cur = self.db.conn.cursor()
-            placeholders = ",".join("?" * len(self._AUTO_SOURCES))
-            cur.execute(
-                f"DELETE FROM journal_lines WHERE entry_id IN "
-                f"(SELECT id FROM journal_entries WHERE source IN ({placeholders}))",
-                self._AUTO_SOURCES,
-            )
-            cur.execute(
-                f"DELETE FROM journal_entries WHERE source IN ({placeholders})",
-                self._AUTO_SOURCES,
-            )
-            return self.backfill_from_subledgers(progress=progress)
+            self.db.journal.delete_by_sources(self._AUTO_SOURCES)
+            count = self.backfill_from_subledgers(progress=progress)
+            self.db.journal.outbox_clear()
+            self.db.settings.set(self._PROJECTION_MARKER, "1")
+        return count
 
-    def sync(self, progress=None):
+    def drain_outbox(self, progress=None):
+        """Project the rows recorded in the change queue. Returns (posted, withdrawn).
+
+        The queue is emptied only up to the id that was read, so a change
+        arriving mid-drain keeps its place instead of being discarded
+        unprojected. The whole drain is one transaction: if it fails the queue
+        survives intact and the next sync retries it.
+        """
+        high, batch = self.db.journal.outbox_batch()
+        if not batch:
+            return (0, 0)
+        posted = withdrawn = 0
+        with self._bulk():
+            for table, row_ids in batch.items():
+                if table not in self._PROJECTION_PREFIX:
+                    logger.warning("Ignoring queued change for unknown table %r", table)
+                    continue
+                if progress:
+                    progress(0, 0, f"Updating the ledger for {len(row_ids)} change(s)…")
+                p, w = self.project_rows(table, row_ids)
+                posted += p
+                withdrawn += w
+            self.db.journal.outbox_clear(up_to_id=high)
+        return (posted, withdrawn)
+
+    def sync(self, progress=None, full=False):
         """Bring the GL fully up to date before reading statements.
 
-        Rebuilds the subledger projection (covering new activity, edits and
-        undos) and migrates any not-yet-migrated legacy treasury rows. The whole
-        operation runs in a single transaction (one commit), and reports coarse
-        progress via the optional callback ``progress(done, total, message)``.
+        Applies everything the subledgers have done since the last sync —
+        new activity, edits and undos — and migrates any not-yet-migrated legacy
+        treasury rows. The whole operation runs in a single transaction (one
+        commit), and reports coarse progress via ``progress(done, total, msg)``.
+
+        Normally this drains the change queue, so the cost is proportional to
+        what changed rather than to the size of the journal. It falls back to a
+        full rebuild when ``full`` is set, or when no rebuild has established
+        the projection yet — on a journal opened for the first time after
+        migration 005, and on any journal whose marker has been cleared.
         """
         with self._bulk():
-            self.rebuild_auto_journals(progress=progress)
+            if full or not self.projection_established():
+                self.rebuild_auto_journals(progress=progress)
+            else:
+                self.drain_outbox(progress=progress)
             if progress:
                 progress(0, 0, "Migrating legacy treasury entries…")
             self.migrate_legacy_gl()
@@ -628,17 +687,10 @@ class GLService:
         """
         before = self._entry_count()
         with self._bulk():
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT id, date, event_type, added, deducted, "
-                        "principal_portion, interest_portion, interest_amount "
-                        "FROM ledger ORDER BY date, id")
-            ledger_rows = cur.fetchall()
-            cur.execute("SELECT id, date, transaction_type, amount FROM savings ORDER BY date, id")
-            savings_rows = cur.fetchall()
-            cur.execute("SELECT id, date, transaction_type, amount FROM christmas_savings ORDER BY date, id")
-            christmas_rows = cur.fetchall()
-            cur.execute("SELECT id, date, transaction_type, amount FROM benevolent_ledger ORDER BY date, id")
-            benevolent_rows = cur.fetchall()
+            ledger_rows = self.db.ledger.gl_projection_rows()
+            savings_rows = self.db.funds.gl_projection_rows("savings")
+            christmas_rows = self.db.funds.gl_projection_rows("christmas_savings")
+            benevolent_rows = self.db.funds.gl_projection_rows("benevolent_ledger")
 
             total = len(ledger_rows) + len(savings_rows) + len(christmas_rows) + len(benevolent_rows)
             done = 0
@@ -670,35 +722,90 @@ class GLService:
 
         return self._entry_count() - before
 
+    # ------------------------------------------------------------------ #
+    # Incremental projection
+    # ------------------------------------------------------------------ #
+    # Subledger table -> the source_ref prefix its rows are projected under.
+    # `savings` and `christmas_savings` are distinct tables with independent id
+    # sequences, so the prefix is what keeps "savings:7" and "christmas:7" apart.
+    _PROJECTION_PREFIX = {
+        "ledger": "ledger",
+        "savings": "savings",
+        "christmas_savings": "christmas",
+        "benevolent_ledger": "benevolent",
+    }
+
+    def project_rows(self, table, row_ids):
+        """Bring the GL into line with specific subledger rows.
+
+        The single-row equivalent of ``rebuild_auto_journals``, and the reason
+        it exists: the wipe-and-re-derive is correct but costs the whole
+        projection every time, because posting alone cannot express the two
+        things a member can do after the fact.
+
+        Each id is re-derived from scratch — the previous entry is withdrawn,
+        then the current state of the row is posted — which covers all three
+        cases with one path:
+
+        * **new row** — nothing to withdraw, the entry is posted;
+        * **edited row** — the stale entry is withdrawn and replaced, rather
+          than being kept by ``post_journal``'s idempotency short-circuit;
+        * **deleted or undone row** — nothing remains to derive, so the
+          withdrawal stands and the entry is gone.
+
+        Only the projected sources are touched. Manual, migration and reversal
+        entries are never withdrawn, whatever ``source_ref`` they carry.
+
+        Returns ``(posted, withdrawn)``.
+        """
+        prefix = self._PROJECTION_PREFIX.get(table)
+        if prefix is None:
+            raise ValueError(f"{table!r} is not a projected subledger")
+        ids = [int(i) for i in row_ids]
+        if not ids:
+            return (0, 0)
+
+        refs = [f"{prefix}:{i}" for i in ids]
+        posted = 0
+        with self._bulk():
+            withdrawn = self.db.journal.delete_projected(refs, self._AUTO_SOURCES)
+            for row_id, ref in zip(ids, refs):
+                if self._project_one(table, row_id, ref) is not None:
+                    posted += 1
+        return (posted, withdrawn)
+
+    def _project_one(self, table, row_id, ref):
+        """Derive and post the journal for one subledger row, or None if the
+        row is gone or its event has no accounting effect."""
+        if table == "ledger":
+            row = self.db.ledger.gl_projection_row(row_id)
+            if not row:
+                return None
+            date, event, added, deducted, p_portion, i_portion, i_amt = row
+            return self._post_ledger_event(event, date, added, deducted,
+                                           p_portion, i_portion, i_amt, ref)
+        row = self.db.funds.gl_projection_row(table, row_id)
+        if not row:
+            return None
+        date, ttype, amount = row
+        if table == "savings":
+            return self._post_savings_event(ttype, amount, date, ref)
+        if table == "christmas_savings":
+            return self._post_christmas_event(ttype, amount, date, ref)
+        return self._post_benevolent_event(ttype, amount, date, ref)
+
     # ----- Live write-path hooks (post journals as rows are created) ----- #
     # Registered on DatabaseManager so member activity posts to the GL the moment
-    # it is written, rather than only on the next rebuild. Idempotent via
-    # source_ref, so they never conflict with backfill/rebuild; edits and undos
-    # are still reconciled by rebuild_auto_journals on the next sync.
+    # it is written, rather than only on the next rebuild. They delegate to
+    # project_rows, so re-firing one for a row that has since been edited
+    # corrects its entry instead of leaving the stale one in place.
     def post_ledger_rows(self, ledger_ids):
         """Post journals for the given ledger rows (one batched transaction)."""
-        with self._bulk():
-            cur = self.db.conn.cursor()
-            for lid in ledger_ids:
-                cur.execute(
-                    "SELECT date, event_type, added, deducted, principal_portion, "
-                    "interest_portion, interest_amount FROM ledger WHERE id=?", (lid,))
-                row = cur.fetchone()
-                if row:
-                    date, event, added, deducted, p_portion, i_portion, i_amt = row
-                    self._post_ledger_event(event, date, added, deducted,
-                                            p_portion, i_portion, i_amt, f"ledger:{lid}")
+        self.project_rows("ledger", ledger_ids)
 
     def post_savings_rows(self, savings_ids):
         """Post journals for the given savings rows (one batched transaction)."""
-        with self._bulk():
-            cur = self.db.conn.cursor()
-            for sid in savings_ids:
-                cur.execute("SELECT date, transaction_type, amount FROM savings WHERE id=?", (sid,))
-                row = cur.fetchone()
-                if row:
-                    date, ttype, amount = row
-                    self._post_savings_event(ttype, amount, date, f"savings:{sid}")
+        self.project_rows("savings", savings_ids)
 
     def _post_ledger_event(self, event, date, added, deducted,
                            p_portion, i_portion, i_amt, ref):
@@ -763,9 +870,7 @@ class GLService:
         """
         before = self._entry_count()
         with self._bulk():
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT id, date, category, type, amount, notes FROM general_ledger ORDER BY date, id")
-            for (gid, date, category, gtype, amount, notes) in cur.fetchall():
+            for (gid, date, category, gtype, amount, notes) in self.db.journal.legacy_rows():
                 amount = round(float(amount or 0), 2)
                 if amount <= 0:
                     continue

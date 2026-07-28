@@ -22,7 +22,7 @@ def setup_source():
     # John Doe (Source)
     c.execute("INSERT INTO individuals (name, phone) VALUES ('John Doe', '111-1234')")
     src_id = c.lastrowid
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-SRC', 1000)", (src_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-SRC', 1000, '2026-01-01')", (src_id,))
     
     # Alice (Source) - No conflict
     c.execute("INSERT INTO individuals (name, phone) VALUES ('Alice', '999')")

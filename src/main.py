@@ -113,6 +113,19 @@ class MainApp(QMainWindow):
                 "The journal was still opened so you can export your data, "
                 "but you should restore a recent backup from the 'backups' "
                 "folder next to the journal file as soon as possible.")
+        # A migration that could not be applied leaves the journal on an older
+        # schema — usable, but without cascading deletes or the new indexes.
+        # Silent degradation is exactly what we must not do with a financial
+        # journal, so say so and name the remedy.
+        if not self.db.migration_report.ok:
+            QMessageBox.warning(
+                self, "Schema Update Incomplete",
+                f"This journal could not be brought fully up to date:\n\n"
+                f"{self.db.migration_report.summary()}\n\n"
+                "It has been opened on its existing schema and is safe to use, "
+                "but some integrity protections are not active. Run\n"
+                f"    python -m src.integrity \"{db_path}\"\n"
+                "for details, or use the Repair tools under Mass Operations.")
 
         # Live general-ledger posting: member loan/savings activity posts to the
         # double-entry GL the moment it is written. Idempotent and defensive, so

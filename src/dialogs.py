@@ -809,14 +809,13 @@ class ExcelFormatDialog(QDialog):
         form = QFormLayout()
         
         # Header Color
-        from src import branding
-        self.header_color = self.db.get_setting("excel_header_bg", branding.EXCEL_HEADER_BG)
+        self.header_color = self.db.settings.excel_header_bg
         self.btn_header = QPushButton(self.header_color)
         self.btn_header.setStyleSheet(f"background-color: {self.header_color};")
         self.btn_header.clicked.connect(lambda: self.pick_color("header"))
         
         # Total Row Color
-        self.total_color = self.db.get_setting("excel_total_bg", branding.EXCEL_TOTAL_BG)
+        self.total_color = self.db.settings.excel_total_bg
         self.btn_total = QPushButton(self.total_color)
         self.btn_total.setStyleSheet(f"background-color: {self.total_color};")
         self.btn_total.clicked.connect(lambda: self.pick_color("total"))

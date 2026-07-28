@@ -136,11 +136,8 @@ class BenevolentService:
         next-due to the batch's earliest date, and recalc the running total."""
         if not batch_id:
             return False
-        cur = self.db.conn.cursor()
         # earliest contribution per member == that member's next_due before the run
-        cur.execute(f"SELECT individual_id, MIN(date) FROM {_TABLE} WHERE batch_id=? "
-                    f"GROUP BY individual_id", (batch_id,))
-        rows = cur.fetchall()
+        rows = self.db.funds.earliest_date_per_member_in_batch(_TABLE, batch_id)
         self.db.fund_delete_batch(_TABLE, batch_id)
         for ind, earliest in rows:
             self.db.set_benevolent_next_due(ind, earliest)

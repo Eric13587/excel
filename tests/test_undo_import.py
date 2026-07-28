@@ -22,12 +22,12 @@ def setup_source():
     # 1. To be NEW: "Bob New"
     c.execute("INSERT INTO individuals (name) VALUES ('Bob New')")
     bob_id = c.lastrowid
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-BOB', 500)", (bob_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-BOB', 500, '2026-01-01')", (bob_id,))
     
     # 2. To be MERGED: "Alice Exists"
     c.execute("INSERT INTO individuals (name) VALUES ('Alice Exists')")
     alice_id = c.lastrowid
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-ALICE-NEW', 1000)", (alice_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-ALICE-NEW', 1000, '2026-01-01')", (alice_id,))
     
     conn.commit()
     conn.close()
@@ -45,7 +45,7 @@ def setup_dest():
     alice_dest_id = c.lastrowid
     
     # Create an old loan for Alice (should NOT be deleted by undo)
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-ALICE-OLD', 200)", (alice_dest_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-ALICE-OLD', 200, '2026-01-01')", (alice_dest_id,))
     old_loan_id = c.lastrowid
     
     conn.commit()

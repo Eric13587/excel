@@ -10,9 +10,9 @@ from .christmas_service import ChristmasService
 from .benevolent_service import BenevolentService
 from .balance_calculator import BalanceRecalculator
 from .transaction_manager import TransactionManager
-from .undo_manager import UndoManager, UndoableCommand, DeleteTransactionCommand, UndoTransactionCommand, LoanSnapshot, TransactionSnapshot
+from .undo_manager import UndoManager, UndoableCommand, UndoTransactionCommand, LoanSnapshot, TransactionSnapshot
 
 __all__ = ['LoanService', 'SavingsService', 'ChristmasService', 'BenevolentService',
            'BalanceRecalculator', 'TransactionManager',
-           'UndoManager', 'UndoableCommand', 'DeleteTransactionCommand', 'UndoTransactionCommand',
+           'UndoManager', 'UndoableCommand', 'UndoTransactionCommand',
            'LoanSnapshot', 'TransactionSnapshot']

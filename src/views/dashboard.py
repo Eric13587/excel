@@ -993,7 +993,8 @@ class Dashboard(QWidget):
 
     def open_settings(self):
         """Open settings dialog (Organization / Financial / Appearance)."""
-        from PyQt6.QtWidgets import QComboBox, QDialogButtonBox, QGroupBox
+        from PyQt6.QtWidgets import (QComboBox, QDialogButtonBox, QDoubleSpinBox,
+                                     QGroupBox)
         from src import branding
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
@@ -1003,12 +1004,12 @@ class Dashboard(QWidget):
         # --- Organization (branding used on every statement and report) ---
         org_box = QGroupBox("Organization")
         org_form = QFormLayout(org_box)
-        org_name_edit = QLineEdit(self.db.get_setting(branding.ORG_NAME_KEY, "") or "")
+        org_name_edit = QLineEdit(self.db.settings.org_name)
         org_name_edit.setPlaceholderText("e.g. Umoja Staff Co-operative")
         org_form.addRow("Organization Name:", org_name_edit)
 
         logo_row = QHBoxLayout()
-        logo_edit = QLineEdit(self.db.get_setting(branding.ORG_LOGO_KEY, "") or "")
+        logo_edit = QLineEdit(self.db.settings.org_logo_path)
         logo_edit.setPlaceholderText("Bundled default logo")
         logo_edit.setReadOnly(True)
         browse_btn = QPushButton("Browse…")
@@ -1036,16 +1037,46 @@ class Dashboard(QWidget):
         months = ["January", "February", "March", "April", "May", "June",
                   "July", "August", "September", "October", "November", "December"]
         fy_combo.addItems(months)
-        current_fy_str = self.db.get_setting("fy_start_month", "November")
+        current_fy_str = self.db.settings.fy_start_month
         if current_fy_str in months:
             fy_combo.setCurrentText(current_fy_str)
         fin_form.addRow("Financial Year Start:", fy_combo)
 
         deduct_cb = QCheckBox("Allow Deduction in Same Month of Issue")
-        deduct_val = self.db.get_setting("deduct_same_month", "false")
-        deduct_cb.setChecked(deduct_val.lower() == "true")
+        deduct_cb.setChecked(self.db.settings.deduct_same_month)
         fin_form.addRow(deduct_cb)
         outer.addWidget(fin_box)
+
+        # --- Funds ---
+        # These three were readable by the code but had no UI, so the only way
+        # to change them was to edit the settings table by hand.
+        fund_box = QGroupBox("Funds")
+        fund_form = QFormLayout(fund_box)
+
+        unlock_combo = QComboBox()
+        unlock_combo.addItems(months)
+        unlock_idx = self.db.settings.christmas_unlock_month
+        if 1 <= unlock_idx <= 12:
+            unlock_combo.setCurrentIndex(unlock_idx - 1)
+        fund_form.addRow("Christmas Withdrawal Month:", unlock_combo)
+
+        savings_inc = QDoubleSpinBox()
+        savings_inc.setRange(0, 10_000_000)
+        savings_inc.setDecimals(2)
+        savings_inc.setGroupSeparatorShown(True)
+        savings_inc.setValue(self.db.settings.default_savings_increment)
+        fund_form.addRow("Default Monthly Savings:", savings_inc)
+
+        xmas_inc = QDoubleSpinBox()
+        xmas_inc.setRange(0, 10_000_000)
+        xmas_inc.setDecimals(2)
+        xmas_inc.setGroupSeparatorShown(True)
+        xmas_inc.setValue(self.db.settings.default_christmas_increment)
+        fund_form.addRow("Default Monthly Christmas:", xmas_inc)
+
+        fund_form.addRow(QLabel("<small>Defaults used when a member has no "
+                                "contribution history to infer an amount from.</small>"))
+        outer.addWidget(fund_box)
 
         # --- Appearance ---
         app_box = QGroupBox("Appearance")
@@ -1067,6 +1098,9 @@ class Dashboard(QWidget):
             self.db.set_setting("fy_start_month", fy_combo.currentText())
             self.db.set_setting("deduct_same_month",
                                 "true" if deduct_cb.isChecked() else "false")
+            self.db.set_setting("christmas_unlock_month", unlock_combo.currentIndex() + 1)
+            self.db.set_setting("default_savings_increment", savings_inc.value())
+            self.db.set_setting("default_christmas_increment", xmas_inc.value())
 
             # Reflect the organization name in the window title immediately.
             main_win = self.window()
@@ -1799,7 +1833,7 @@ class Dashboard(QWidget):
         
         layout.addWidget(QLabel("<b>Select individuals to increment savings:</b>"))
         layout.addWidget(QLabel("Checked individuals will be processed to catch up savings contributions."))
-        default_amount = self.db.get_setting("default_savings_increment", "2500")
+        default_amount = self.db.settings.default_savings_increment
         layout.addWidget(QLabel(f"<i>Amt will be auto-detected from each user's last transaction (Default: {default_amount}).</i>"))
         
         # Get all individuals
@@ -2123,7 +2157,6 @@ class Dashboard(QWidget):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
                                      QHeaderView, QDialogButtonBox, QProgressDialog)
-        import shutil
         from datetime import datetime
 
         healable = self.engine.scan_healable_loans()
@@ -2182,7 +2215,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    shutil.copy(src, f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.backup_to(f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return
@@ -2212,7 +2245,6 @@ class Dashboard(QWidget):
         """
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
                                      QHeaderView, QDialogButtonBox)
-        import shutil
         from datetime import datetime
 
         orphans = self.db.find_orphaned_rows()
@@ -2287,7 +2319,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    shutil.copy(src, f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.backup_to(f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return

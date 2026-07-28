@@ -1329,7 +1329,6 @@ class LedgerView(QWidget):
                         # Adding this difference to another date applies the same relative shift (e.g. +1 month).
                         
                         # Batch Update
-                        cursor = self.engine.db.conn.cursor()
                         
                         for i in range(row, total_rows):
                             r_id = table.item(i, 2).data(Qt.ItemDataRole.UserRole)
@@ -1345,7 +1344,7 @@ class LedgerView(QWidget):
                             n_date_obj = r_old + shift_delta
                             n_date_str = n_date_obj.strftime("%Y-%m-%d")
                             
-                            cursor.execute("UPDATE ledger SET date = ? WHERE id = ?", (n_date_str, r_id))
+                            self.db.ledger.set_date(r_id, n_date_str)
                         
                         self.engine.db.conn.commit()
                         self.engine.recalculate_balances(self.current_individual_id)
@@ -2336,7 +2335,6 @@ class LedgerView(QWidget):
                         from datetime import datetime as dt
                         
                         base_date = dt.strptime(new_date, "%Y-%m-%d")
-                        cursor = self.db.conn.cursor()
                         
                         # Update all rows from current to end
                         for i in range(row, total_rows):
@@ -2346,10 +2344,9 @@ class LedgerView(QWidget):
                             row_amount = float(table.item(i, 3).text().replace(',', ''))
                             row_notes = table.item(i, 5).text()
                             
-                            cursor.execute("""
-                                UPDATE savings SET date=?, amount=?, notes=? WHERE id=?
-                            """, (calc_date, row_amount, row_notes, row_trans_id))
-                        
+                            self.db.funds.update("savings", row_trans_id, calc_date,
+                                                 row_amount, row_notes)
+
                         self.db.conn.commit()
                         self.db.recalculate_savings_balances(self.current_individual_id)
                         table.blockSignals(False)
@@ -2358,11 +2355,7 @@ class LedgerView(QWidget):
                         return
             
             # Update the single transaction
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                UPDATE savings SET date=?, amount=?, notes=? WHERE id=?
-            """, (new_date, new_amount, new_notes, trans_id))
-            self.db.conn.commit()
+            self.db.update_savings_transaction(trans_id, new_date, new_amount, new_notes)
             
             # Recalculate balances
             self.db.recalculate_savings_balances(self.current_individual_id)
@@ -2441,9 +2434,7 @@ class LedgerView(QWidget):
                                        f"Delete ALL {len(savings_df)} savings entries?\nThis cannot be undone!",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if confirm == QMessageBox.StandardButton.Yes:
-            cursor = self.db.conn.cursor()
-            cursor.execute("DELETE FROM savings WHERE individual_id=?", (self.current_individual_id,))
-            self.db.conn.commit()
+            self.db.fund_delete_all("savings", self.current_individual_id)
             self.refresh_table()
             self.refresh_savings_balance()
             QMessageBox.information(self, "Success", "All savings entries deleted.")

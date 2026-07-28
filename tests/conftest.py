@@ -6,3 +6,4 @@ headlessly (CI containers, SSH sessions) without a display server.
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+

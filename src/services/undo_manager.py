@@ -214,10 +214,9 @@ class UndoTransactionCommand(UndoableCommand):
             self.transaction_manager.delete_transaction(self.individual_id, self.trans_id)
         else:
             # Fallback for tests or legacy calls (though we should avoid this path)
-            cursor = self.db.conn.cursor()
             if self.sibling_id:
-                cursor.execute("DELETE FROM ledger WHERE id = ?", (self.sibling_id,))
-            cursor.execute("DELETE FROM ledger WHERE id = ?", (self.trans_id,))
+                self.db.ledger.delete(self.sibling_id)
+            self.db.ledger.delete(self.trans_id)
             self.db.conn.commit()
             
             # Recalculate balances (TransactionManager handles this internally if called)
@@ -234,58 +233,32 @@ class UndoTransactionCommand(UndoableCommand):
         if not self.tx_snapshots:
             return False
         
-        cursor = self.db.conn.cursor()
         
         # Restore loan state FIRST (before transactions)
         if self.loan_snapshot:
-            cursor.execute("""
-                UPDATE loans SET
-                    principal = ?, total_amount = ?, balance = ?, installment = ?,
-                    interest_balance = ?, unearned_interest = ?, monthly_interest = ?,
-                    next_due_date = ?, status = ?
-                WHERE id = ?
-            """, (
-                self.loan_snapshot.principal,
-                self.loan_snapshot.total_amount,
-                self.loan_snapshot.balance,
-                self.loan_snapshot.installment,
-                self.loan_snapshot.interest_balance,
-                self.loan_snapshot.unearned_interest,
-                self.loan_snapshot.monthly_interest,
-                self.loan_snapshot.next_due_date,
-                self.loan_snapshot.status,
-                self.loan_snapshot.id
-            ))
+            self.db.loans.restore(
+                self.loan_snapshot.id,
+                principal=self.loan_snapshot.principal,
+                total_amount=self.loan_snapshot.total_amount,
+                balance=self.loan_snapshot.balance,
+                installment=self.loan_snapshot.installment,
+                interest_balance=self.loan_snapshot.interest_balance,
+                unearned_interest=self.loan_snapshot.unearned_interest,
+                monthly_interest=self.loan_snapshot.monthly_interest,
+                next_due_date=self.loan_snapshot.next_due_date,
+                status=self.loan_snapshot.status)
         
         # Restore transactions (in correct order - sibling/Interest first, then main)
         # Sort by ID to ensure proper order (Interest Earned typically has lower ID)
         sorted_snapshots = sorted(self.tx_snapshots, key=lambda s: s.id)
         
         for snapshot in sorted_snapshots:
-            cursor.execute("""
-                INSERT INTO ledger (
-                    id, individual_id, date, event_type, added, deducted, 
-                    balance, loan_id, notes, interest_amount, 
-                    principal_balance, interest_balance, principal_portion, interest_portion, is_edited
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                snapshot.id,
-                snapshot.individual_id,
-                snapshot.date,
-                snapshot.event_type,
-                snapshot.added,
-                snapshot.deducted,
-                snapshot.balance,
-                snapshot.loan_id,
-                snapshot.notes,
-                snapshot.interest_amount,
-                snapshot.principal_balance,
-                snapshot.interest_balance,
-                snapshot.principal_portion,
-                snapshot.interest_portion,
-                snapshot.is_edited
-            ))
+            self.db.ledger.restore((
+                snapshot.id, snapshot.individual_id, snapshot.date, snapshot.event_type,
+                snapshot.added, snapshot.deducted, snapshot.balance, snapshot.loan_id,
+                snapshot.notes, snapshot.interest_amount, snapshot.principal_balance,
+                snapshot.interest_balance, snapshot.principal_portion,
+                snapshot.interest_portion, snapshot.is_edited))
         
         self.db.conn.commit()
         
@@ -314,9 +287,8 @@ class UndoTransactionCommand(UndoableCommand):
                 self.loan_snapshot = self._capture_loan_snapshot(loan)
         
         # Delete the transaction(s) again
-        cursor = self.db.conn.cursor()
         for snapshot in self.tx_snapshots:
-            cursor.execute("DELETE FROM ledger WHERE id = ?", (snapshot.id,))
+            self.db.ledger.delete(snapshot.id)
         self.db.conn.commit()
         
         # Recalculate balances
@@ -326,96 +298,6 @@ class UndoTransactionCommand(UndoableCommand):
             self.balance_recalculator.recalculate_balances(self.individual_id)
         
         self._was_executed = True
-        return True
-
-
-class DeleteTransactionCommand(UndoableCommand):
-    """Legacy command for deleting a transaction (can be undone by restoring).
-    
-    Note: For new code, prefer UndoTransactionCommand which also captures loan state.
-    """
-    
-    def __init__(self, db_manager, individual_id: int, trans_id: int, 
-                 balance_recalculator=None, snapshot: Optional[TransactionSnapshot] = None):
-        self.db = db_manager
-        self.individual_id = individual_id
-        self.trans_id = trans_id
-        self.balance_recalculator = balance_recalculator
-        self.snapshot = snapshot
-        self._was_executed = False
-    
-    @property
-    def description(self) -> str:
-        if self.snapshot:
-            return f"Delete {self.snapshot.event_type} ({self.snapshot.date})"
-        return f"Delete transaction #{self.trans_id}"
-    
-    def execute(self) -> bool:
-        """Delete the transaction, saving snapshot for undo."""
-        if not self.snapshot:
-            # Capture snapshot before deletion
-            tx = self.db.get_transaction(self.trans_id)
-            if not tx:
-                return False
-            
-            self.snapshot = TransactionSnapshot(
-                id=tx['id'],
-                individual_id=self.individual_id,
-                date=tx['date'],
-                event_type=tx['event_type'],
-                added=tx['added'],
-                deducted=tx['deducted'],
-                balance=tx['balance'],
-                loan_id=tx.get('loan_id'),
-                notes=tx.get('notes', ''),
-                interest_amount=tx.get('interest_amount', 0.0),
-                principal_amount=tx.get('principal_amount', 0.0),
-                linked_trans_id=tx.get('linked_trans_id')
-            )
-        
-        # Delete the transaction
-        cursor = self.db.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE id = ?", (self.trans_id,))
-        self.db.conn.commit()
-        
-        # Recalculate balances
-        if self.balance_recalculator:
-            self.balance_recalculator.recalculate(self.individual_id)
-        
-        self._was_executed = True
-        return True
-    
-    def undo(self) -> bool:
-        """Restore the deleted transaction."""
-        if not self.snapshot:
-            return False
-        
-        cursor = self.db.conn.cursor()
-        cursor.execute("""
-            INSERT INTO ledger (id, individual_id, date, event_type, added, deducted, 
-                               balance, loan_id, notes, interest_amount, principal_amount, linked_trans_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            self.snapshot.id,
-            self.snapshot.individual_id,
-            self.snapshot.date,
-            self.snapshot.event_type,
-            self.snapshot.added,
-            self.snapshot.deducted,
-            self.snapshot.balance,
-            self.snapshot.loan_id,
-            self.snapshot.notes,
-            self.snapshot.interest_amount,
-            self.snapshot.principal_amount,
-            self.snapshot.linked_trans_id
-        ))
-        self.db.conn.commit()
-        
-        # Recalculate balances
-        if self.balance_recalculator:
-            self.balance_recalculator.recalculate(self.individual_id)
-        
-        self._was_executed = False
         return True
 
 

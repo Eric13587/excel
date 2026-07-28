@@ -5,12 +5,13 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.helpers import make_settings
 from src import branding
 
 
 class FakeDB:
     def __init__(self, settings=None):
-        self.settings = settings or {}
+        self.settings = make_settings(settings)
 
     def get_setting(self, key, default=None):
         return self.settings.get(key, default)

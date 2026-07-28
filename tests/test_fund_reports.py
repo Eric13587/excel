@@ -18,6 +18,10 @@ from src.services.benevolent_service import BenevolentService
 def env():
     d = tempfile.mkdtemp()
     db = DatabaseManager(os.path.join(d, "r.db"))
+    # These tests assert column ordering, not fiscal-year handling, and use
+    # calendar quarters (2026-01-01). Pin the financial year rather than
+    # inheriting the journal default, which is the institution's November.
+    db.set_setting("fy_start_month", "January")
     return db, d
 
 

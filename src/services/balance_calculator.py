@@ -116,7 +116,7 @@ class BalanceRecalculator:
                             if last_repayment_date:
                                 new_due_dt = base_dt + relativedelta(months=1)
                             else:
-                                deduct_same = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+                                deduct_same = self.db.settings.deduct_same_month
                                 new_due_dt = base_dt if deduct_same else base_dt + relativedelta(months=1)
                                     
                             new_due_date = new_due_dt.strftime("%Y-%m-%d")
@@ -397,7 +397,6 @@ class BalanceRecalculator:
         last_accrual_date = None
         
         # Helper for update
-        cursor = self.db.conn.cursor()
         
 
         for index, row in loan_df.iterrows():
@@ -473,8 +472,7 @@ class BalanceRecalculator:
                 
                 # Update DB
                 if abs(new_accrual - float(row['added'])) > 0.01:
-                    cursor.execute("UPDATE ledger SET added = ?, interest_amount = ? WHERE id = ?", 
-                                   (new_accrual, new_accrual, trans_id))
+                    self.db.ledger.set_accrual(trans_id, new_accrual, new_accrual)
                     
                 last_accrual_id = trans_id
                 last_accrual_date = row['date']
@@ -507,7 +505,7 @@ class BalanceRecalculator:
                 
                 # Detect if we need to Update DB (Physics enforced change)
                 if abs(payment_amount - float(row['deducted'])) > 0.01:
-                     cursor.execute("UPDATE ledger SET deducted = ? WHERE id = ?", (payment_amount, trans_id))
+                     self.db.ledger.set_deducted(trans_id, payment_amount)
 
                 if not is_edited:
                     # Auto Heal: Update to correct installment
@@ -520,7 +518,7 @@ class BalanceRecalculator:
                     
                     if abs(target_payment - payment_amount) > 0.01:
                         payment_amount = target_payment
-                        cursor.execute("UPDATE ledger SET deducted = ? WHERE id = ?", (payment_amount, trans_id))
+                        self.db.ledger.set_deducted(trans_id, payment_amount)
                 else:
                     # Anchor found! (is_edited=1)
                     # We already applied Physics Capping above.
@@ -544,8 +542,7 @@ class BalanceRecalculator:
                              if last_accrual_id and last_accrual_date == row['date']:
                                  # Same day transaction (e.g. 1st of Month)
                                  n_acc = current_monthly_interest
-                                 cursor.execute("UPDATE ledger SET added = ?, interest_amount = ? WHERE id = ?", 
-                                                (n_acc, n_acc, last_accrual_id))
+                                 self.db.ledger.set_accrual(last_accrual_id, n_acc, n_acc)
                 # Else: Keep payment_amount as it was (from DB) - Anchor
                 
                 # 4. Recalculate Split
@@ -574,8 +571,7 @@ class BalanceRecalculator:
                 running_interest -= i_pay
                 
                 # Update DB Split
-                cursor.execute("UPDATE ledger SET principal_portion = ?, interest_portion = ? WHERE id = ?", 
-                               (p_pay, i_pay, trans_id))
+                self.db.ledger.set_portions(trans_id, p_pay, i_pay)
             
             # Handle float drift
             if abs(running_principal) < 0.01: running_principal = 0
@@ -587,8 +583,7 @@ class BalanceRecalculator:
             # UPDATE: We MUST update `principal_balance` and `interest_balance` here because
             # `recalculate_balances` relies on simple summing and glosses over these split states.
             # Smart Replay is the only place determining the running Principal/Interest split.
-            cursor.execute("UPDATE ledger SET principal_balance = ?, interest_balance = ? WHERE id = ?", 
-                           (running_principal, running_interest, trans_id))
+            self.db.ledger.set_component_balances(trans_id, running_principal, running_interest)
             
         self.db.conn.commit()
         
