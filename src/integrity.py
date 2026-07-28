@@ -264,6 +264,48 @@ def _check_accounting(conn, report):
                    f"their issue note did not parse", n)
 
 
+def _check_projection(conn, report):
+    """The GL projection's own health, independent of whether it reconciles.
+
+    Since migration 005 the projection is maintained incrementally from a change
+    queue rather than rebuilt wholesale, so two things are worth stating
+    explicitly: whether the queue has been drained, and whether any projected
+    entry has outlived the subledger row it was derived from. The opposite kind
+    of drift — a subledger row with no journal — is what the control-account
+    comparisons above already measure.
+    """
+    if not _table_exists(conn, "gl_outbox"):
+        return
+    cat = "projection"
+
+    established = _scalar(conn, "SELECT COUNT(*) FROM settings "
+                                "WHERE key='gl_projection_established' AND value='1'")
+    report.add("projection baseline established", cat, PASS if established else WARN,
+               "established" if established else
+               "not yet — the next sync will rebuild in full")
+
+    depth = _scalar(conn, "SELECT COUNT(*) FROM gl_outbox")
+    report.add("projection change queue drained", cat, PASS if not depth else WARN,
+               "empty" if not depth else
+               f"{depth} change(s) not yet posted — run Treasury → Sync", depth)
+
+    stale = conn.execute(
+        "SELECT COUNT(*) FROM journal_entries e WHERE ("
+        "  (e.source_ref LIKE 'ledger:%' AND NOT EXISTS (SELECT 1 FROM ledger l"
+        "     WHERE l.id = CAST(substr(e.source_ref, 8) AS INTEGER)))"
+        "  OR (e.source_ref LIKE 'savings:%' AND NOT EXISTS (SELECT 1 FROM savings s"
+        "     WHERE s.id = CAST(substr(e.source_ref, 9) AS INTEGER)))"
+        "  OR (e.source_ref LIKE 'christmas:%' AND NOT EXISTS (SELECT 1 FROM christmas_savings c"
+        "     WHERE c.id = CAST(substr(e.source_ref, 11) AS INTEGER)))"
+        "  OR (e.source_ref LIKE 'benevolent:%' AND NOT EXISTS (SELECT 1 FROM benevolent_ledger b"
+        "     WHERE b.id = CAST(substr(e.source_ref, 12) AS INTEGER)))"
+        ") AND e.source IN ('loan_disbursement','repayment','interest','savings',"
+        "                   'christmas','benevolent')").fetchone()[0]
+    report.add("projected entries have a live source row", cat, PASS if not stale else WARN,
+               "all live" if not stale else
+               f"{stale} entry/entries outlived their subledger row", stale)
+
+
 def _control(conn, report, label, code, side, subledger_sql, subledger_name):
     """Compare a GL control account against the subledger it summarises."""
     expr = ("SUM(debit)-SUM(credit)") if side == "debit" else ("SUM(credit)-SUM(debit)")
@@ -349,6 +391,7 @@ def verify(target, quick=False):
     _check_schema(conn, report)
     _check_referential(conn, report)
     _check_accounting(conn, report)
+    _check_projection(conn, report)
     _check_phase4_readiness(conn, report)
     return report
 

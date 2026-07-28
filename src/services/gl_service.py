@@ -10,6 +10,7 @@ posted here through the ``post_*`` helpers, which means the existing ``ledger``
 and ``savings`` tables become subledgers that reconcile to GL control accounts
 rather than three disconnected sources of truth.
 """
+import logging
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -21,6 +22,8 @@ from src.config import (
     GL_ALLOWANCE_LOAN_LOSS, GL_SHARE_CAPITAL, GL_RETAINED_EARNINGS,
     GL_CHRISTMAS_SAVINGS, GL_BENEVOLENT_FUND,
 )
+
+logger = logging.getLogger(__name__)
 
 # Money is tracked to whole cents; debits and credits must agree within this
 # tolerance for an entry to be considered balanced.
@@ -469,28 +472,74 @@ class GLService:
     _AUTO_SOURCES = ("loan_disbursement", "repayment", "interest", "savings",
                      "christmas", "benevolent")
 
+    # Set once a full rebuild has established the projection. Until then the
+    # change queue cannot be trusted as the complete list of outstanding work,
+    # because an empty queue is indistinguishable from an empty GL.
+    _PROJECTION_MARKER = "gl_projection_established"
+
+    def projection_established(self):
+        return self.db.settings.get(self._PROJECTION_MARKER) == "1"
+
     def rebuild_auto_journals(self, progress=None):
         """Drop and re-derive the subledger-projected journals.
 
-        Member activity supports edits and undos, which incremental backfill
-        cannot reflect (it only ever adds). Rebuilding the projection slice
-        keeps the GL exactly consistent with the current ledger/savings state
-        while preserving manual and migration entries. Returns the new count.
+        The unconditional path: correct from any starting state, and the cost of
+        the whole projection every time. It is what establishes the baseline the
+        change queue is measured against, so it empties the queue and marks the
+        projection established. Manual and migration entries are preserved.
+        Returns the new count.
         """
         with self._bulk():
             self.db.journal.delete_by_sources(self._AUTO_SOURCES)
-            return self.backfill_from_subledgers(progress=progress)
+            count = self.backfill_from_subledgers(progress=progress)
+            self.db.journal.outbox_clear()
+            self.db.settings.set(self._PROJECTION_MARKER, "1")
+        return count
 
-    def sync(self, progress=None):
+    def drain_outbox(self, progress=None):
+        """Project the rows recorded in the change queue. Returns (posted, withdrawn).
+
+        The queue is emptied only up to the id that was read, so a change
+        arriving mid-drain keeps its place instead of being discarded
+        unprojected. The whole drain is one transaction: if it fails the queue
+        survives intact and the next sync retries it.
+        """
+        high, batch = self.db.journal.outbox_batch()
+        if not batch:
+            return (0, 0)
+        posted = withdrawn = 0
+        with self._bulk():
+            for table, row_ids in batch.items():
+                if table not in self._PROJECTION_PREFIX:
+                    logger.warning("Ignoring queued change for unknown table %r", table)
+                    continue
+                if progress:
+                    progress(0, 0, f"Updating the ledger for {len(row_ids)} change(s)…")
+                p, w = self.project_rows(table, row_ids)
+                posted += p
+                withdrawn += w
+            self.db.journal.outbox_clear(up_to_id=high)
+        return (posted, withdrawn)
+
+    def sync(self, progress=None, full=False):
         """Bring the GL fully up to date before reading statements.
 
-        Rebuilds the subledger projection (covering new activity, edits and
-        undos) and migrates any not-yet-migrated legacy treasury rows. The whole
-        operation runs in a single transaction (one commit), and reports coarse
-        progress via the optional callback ``progress(done, total, message)``.
+        Applies everything the subledgers have done since the last sync —
+        new activity, edits and undos — and migrates any not-yet-migrated legacy
+        treasury rows. The whole operation runs in a single transaction (one
+        commit), and reports coarse progress via ``progress(done, total, msg)``.
+
+        Normally this drains the change queue, so the cost is proportional to
+        what changed rather than to the size of the journal. It falls back to a
+        full rebuild when ``full`` is set, or when no rebuild has established
+        the projection yet — on a journal opened for the first time after
+        migration 005, and on any journal whose marker has been cleared.
         """
         with self._bulk():
-            self.rebuild_auto_journals(progress=progress)
+            if full or not self.projection_established():
+                self.rebuild_auto_journals(progress=progress)
+            else:
+                self.drain_outbox(progress=progress)
             if progress:
                 progress(0, 0, "Migrating legacy treasury entries…")
             self.migrate_legacy_gl()

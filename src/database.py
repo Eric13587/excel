@@ -1422,9 +1422,10 @@ class DatabaseManager:
         """Append a fund transaction with a running balance. Withdrawals reduce
         the balance; everything else (Deposit/Contribution/Interest) increases it.
 
-        Unlike add_savings_transaction this fires no general-ledger post hook,
-        so Christmas and Benevolent activity only reaches the books on the next
-        GLService.sync(). Preserved deliberately; fixed in Phase 5.
+        Unlike add_savings_transaction this fires no Python post hook. Since
+        migration 005 it does not need one: the gl_outbox triggers record the
+        write, so Christmas and Benevolent activity reaches the books on the
+        next GLService.sync() like everything else.
         """
         current = self.fund_balance(table, individual_id)
         new_balance = round(current - amount, 2) if transaction_type == "Withdrawal" \

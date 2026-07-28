@@ -8,14 +8,17 @@ posting helper builds a list of ``{account, debit|credit}`` dicts and hands it
 to one insert.
 
 The GL is a *projection*. Entries whose ``source`` is one of the auto set are
-deleted and re-derived from the subledgers on every sync, which is why
-``(source, source_ref)`` is an idempotency key — and, since migration 001, a
-unique index.
+derived from the subledgers, which is why ``source_ref`` links each one back to
+its row — and, since migration 001, why ``(source, source_ref)`` is unique.
+Since migration 005 the projection is maintained from the ``gl_outbox`` change
+queue rather than wiped and re-derived on every sync; the wipe remains as
+``rebuild_auto_journals``, the baseline the queue is measured against.
 
 Repositories do not commit; the caller owns the transaction. ``GLService``
 batches thousands of posts into one transaction, so this matters.
 """
 import logging
+import sqlite3
 
 from src.db.base import Repository
 
@@ -131,6 +134,78 @@ class JournalRepository(Repository):
             removed += self._execute(
                 f"DELETE FROM journal_entries WHERE {where}", params).rowcount
         return removed
+
+    # ------------------------------------------------------------------ #
+    # Projection change queue (migration 005)
+    # ------------------------------------------------------------------ #
+
+    def outbox_depth(self):
+        """How many queued changes are waiting to be projected."""
+        try:
+            return self._scalar("SELECT COUNT(*) FROM gl_outbox", (), 0)
+        except sqlite3.OperationalError:
+            return 0        # pre-005 journal: the queue does not exist yet
+
+    def outbox_batch(self):
+        """The queued changes as ``(high_water_id, {table: [row_id, ...]})``.
+
+        The high-water id is returned so the drain can delete exactly what it
+        read: anything queued while the projection runs keeps its place in the
+        queue instead of being discarded unprojected.
+        """
+        try:
+            rows = self._rows(
+                "SELECT id, source_table, row_id FROM gl_outbox ORDER BY id")
+        except sqlite3.OperationalError:
+            return (0, {})
+        high = 0
+        batch = {}
+        for entry_id, table, row_id in rows:
+            high = max(high, entry_id)
+            seen = batch.setdefault(table, [])
+            if row_id not in seen:
+                seen.append(row_id)     # a row touched twice needs projecting once
+        return (high, batch)
+
+    def outbox_clear(self, up_to_id=None):
+        """Drop the drained changes, or the whole queue when ``up_to_id`` is None."""
+        try:
+            if up_to_id is None:
+                self._execute("DELETE FROM gl_outbox")
+            else:
+                self._execute("DELETE FROM gl_outbox WHERE id <= ?", (up_to_id,))
+        except sqlite3.OperationalError:
+            pass
+
+    def orphaned_projections(self):
+        """Projected entries whose subledger row no longer exists.
+
+        Drift in the dangerous direction: a journal on the books with nothing
+        behind it. The opposite direction — a subledger row with no journal —
+        is what the control-account reconciliation in :mod:`src.integrity`
+        already measures, and measuring it here would mean duplicating the
+        event vocabulary that decides which rows post at all.
+        """
+        return self._rows(
+            "SELECT e.id, e.source, e.source_ref FROM journal_entries e "
+            "WHERE e.source_ref LIKE 'ledger:%' "
+            "  AND NOT EXISTS (SELECT 1 FROM ledger l "
+            "                   WHERE l.id = CAST(substr(e.source_ref, 8) AS INTEGER)) "
+            "UNION ALL "
+            "SELECT e.id, e.source, e.source_ref FROM journal_entries e "
+            "WHERE e.source_ref LIKE 'savings:%' "
+            "  AND NOT EXISTS (SELECT 1 FROM savings s "
+            "                   WHERE s.id = CAST(substr(e.source_ref, 9) AS INTEGER)) "
+            "UNION ALL "
+            "SELECT e.id, e.source, e.source_ref FROM journal_entries e "
+            "WHERE e.source_ref LIKE 'christmas:%' "
+            "  AND NOT EXISTS (SELECT 1 FROM christmas_savings c "
+            "                   WHERE c.id = CAST(substr(e.source_ref, 11) AS INTEGER)) "
+            "UNION ALL "
+            "SELECT e.id, e.source, e.source_ref FROM journal_entries e "
+            "WHERE e.source_ref LIKE 'benevolent:%' "
+            "  AND NOT EXISTS (SELECT 1 FROM benevolent_ledger b "
+            "                   WHERE b.id = CAST(substr(e.source_ref, 12) AS INTEGER))")
 
     # ------------------------------------------------------------------ #
     # Balances and statements

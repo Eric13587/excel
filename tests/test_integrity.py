@@ -51,7 +51,7 @@ def test_fresh_journal_has_no_failures(journal):
 def test_report_covers_every_category(journal):
     categories = {c.category for c in integrity.verify(journal).checks}
     assert categories == {"structural", "schema", "referential",
-                          "accounting", "phase 4 readiness"}
+                          "accounting", "projection", "phase 4 readiness"}
 
 
 def test_live_connection_enforcement_is_reported(journal):
@@ -198,3 +198,43 @@ def test_cli_quiet_prints_one_line(journal, capsys):
 def test_cli_reports_a_missing_file(capsys):
     assert integrity.main([os.path.join(tempfile.mkdtemp(), "nope.db")]) == 1
     assert "Cannot open" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Projection health (Phase 5b)
+# --------------------------------------------------------------------------- #
+
+def test_projection_checks_report_an_undrained_queue(journal):
+    from src.services.gl_service import GLService
+    svc = GLService(journal)
+    _seed_member_with_loan(journal)
+    svc.sync()
+    assert _check(integrity.verify(journal), "projection change queue drained").status \
+        == integrity.PASS
+
+    journal.add_savings_transaction(
+        journal.conn.execute("SELECT id FROM individuals").fetchone()[0],
+        "2026-02-01", "Deposit", 100, "")
+    check = _check(integrity.verify(journal), "projection change queue drained")
+    assert check.status == integrity.WARN and check.count == 1
+
+
+def test_projection_baseline_is_reported_before_the_first_sync(journal):
+    _seed_member_with_loan(journal)
+    assert _check(integrity.verify(journal), "projection baseline established").status \
+        == integrity.WARN
+
+
+def test_detects_an_entry_that_outlived_its_source_row(journal):
+    from src.services.gl_service import GLService
+    svc = GLService(journal)
+    _seed_member_with_loan(journal)
+    svc.sync()
+
+    # Delete the row behind the entry without letting the queue see it.
+    journal.conn.execute("DROP TRIGGER trg_outbox_ledger_del")
+    journal.conn.execute("DELETE FROM ledger")
+    journal.conn.commit()
+
+    check = _check(integrity.verify(journal), "projected entries have a live source row")
+    assert check.status == integrity.WARN and check.count == 1

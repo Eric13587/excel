@@ -624,3 +624,182 @@ def test_project_rows_rejects_an_unprojected_table(gl):
     svc, _ = gl
     with pytest.raises(ValueError):
         svc.project_rows("loans", [1])
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5b — the change queue drives sync
+# --------------------------------------------------------------------------- #
+def _depth(db):
+    return db.conn.execute("SELECT COUNT(*) FROM gl_outbox").fetchone()[0]
+
+
+def test_first_sync_rebuilds_then_later_syncs_drain(gl):
+    """An empty queue cannot distinguish 'nothing changed' from 'never
+    projected', so the first sync must not trust it."""
+    svc, db = gl
+    _seed_subledgers(db)
+    db.conn.execute("DELETE FROM gl_outbox")   # as if the rows predate migration 005
+    db.conn.commit()
+    assert not svc.projection_established()
+
+    svc.sync()
+    assert svc.projection_established()
+    assert svc._entry_count() == 5
+    assert _depth(db) == 0
+
+    svc.sync()                                  # nothing queued, nothing to do
+    assert svc._entry_count() == 5
+
+
+def test_writes_queue_and_sync_projects_only_them(gl):
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+    entries = svc._entry_count()
+
+    db.add_savings_transaction(ind, "2026-05-01", "Deposit", 400, "new")
+    assert _depth(db) == 1
+
+    posted, withdrawn = svc.drain_outbox()
+    assert (posted, withdrawn) == (1, 0)
+    assert svc._entry_count() == entries + 1
+    assert _depth(db) == 0
+
+
+def test_a_balance_only_rewrite_queues_nothing(gl):
+    """The running-balance recalculators rewrite `balance` on thousands of rows
+    without changing a single journal. UPDATE OF keeps them out of the queue."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("UPDATE ledger SET balance = balance + 1")
+    db.conn.execute("UPDATE savings SET balance = balance + 1")
+    db.conn.commit()
+    assert _depth(db) == 0
+
+
+def test_an_edit_through_raw_sql_still_reaches_the_gl(gl):
+    """The reason the queue is a trigger and not a Python hook: this write never
+    passes through DatabaseManager."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("UPDATE ledger SET deducted=2000, principal_portion=1850 "
+                    "WHERE event_type='Repayment'")
+    db.conn.commit()
+    assert _depth(db) == 1
+
+    svc.sync()
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == 10000.0 - 1850.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_a_deletion_withdraws_its_entry_on_sync(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    before = svc.get_account_balance(GL_LOANS_RECEIVABLE)
+
+    db.conn.execute("DELETE FROM ledger WHERE event_type='Repayment'")
+    db.conn.commit()
+    svc.sync()
+
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == before + 850.0
+    assert _depth(db) == 0
+
+
+def test_fund_activity_reaches_the_gl_without_a_python_hook(gl):
+    """Closes the gap fund_add_transaction documented: Christmas and Benevolent
+    rows fire no post hook, so before the queue they only reached the books on
+    the next full rebuild."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+
+    db.fund_add_transaction("christmas_savings", ind, "2026-06-01", "Deposit", 1200)
+    db.fund_add_transaction("benevolent_ledger", ind, "2026-06-01", "Contribution", 300)
+    assert _depth(db) == 2
+
+    svc.sync()
+    assert svc.get_account_balance(GL_CHRISTMAS_SAVINGS) == 1200.0
+    assert svc.get_account_balance(GL_BENEVOLENT_FUND) == 300.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_incremental_sync_matches_a_full_rebuild(gl):
+    """The equivalence the whole sub-phase rests on."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("UPDATE ledger SET deducted=1500, principal_portion=1350 "
+                    "WHERE event_type='Repayment'")
+    db.conn.execute("DELETE FROM savings WHERE transaction_type='Withdrawal'")
+    db.conn.commit()
+    db.add_savings_transaction(ind, "2026-07-01", "Deposit", 90, "late")
+    db.fund_add_transaction("christmas_savings", ind, "2026-07-02", "Deposit", 45)
+    svc.sync()
+
+    def snapshot():
+        rows, balanced = svc.get_trial_balance()
+        assert balanced
+        return {r['code']: (r['debit'], r['credit']) for r in rows}
+
+    incremental = snapshot()
+    svc.sync(full=True)
+    assert incremental == snapshot()
+
+
+def test_a_failed_drain_leaves_the_queue_intact(gl):
+    """Outbox semantics: the queue is emptied only once the projection commits,
+    so a failure is retried rather than silently dropped."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+    db.add_savings_transaction(ind, "2026-08-01", "Deposit", 60, "boom")
+    assert _depth(db) == 1
+
+    original = svc._project_one
+
+    def explode(table, row_id, ref):
+        raise RuntimeError("projection failed")
+
+    svc._project_one = explode
+    with pytest.raises(RuntimeError):
+        svc.drain_outbox()
+    svc._project_one = original
+
+    assert _depth(db) == 1, "the change must survive to be retried"
+    svc.drain_outbox()
+    assert _depth(db) == 0
+
+
+def test_a_rebuild_resets_the_queue(gl):
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.sync()
+    db.add_savings_transaction(ind, "2026-09-01", "Deposit", 30, "x")
+    assert _depth(db) == 1
+
+    svc.rebuild_auto_journals()
+    assert _depth(db) == 0
+    assert svc.projection_established()
+
+
+def test_clearing_the_marker_forces_a_rebuild(gl):
+    """The self-healing escape hatch: whatever state the projection is in,
+    clearing the marker makes the next sync re-derive it from scratch."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+
+    db.conn.execute("DELETE FROM journal_entries WHERE source='savings'")
+    db.settings.set(svc._PROJECTION_MARKER, "0")
+    db.conn.commit()
+
+    svc.sync()
+    assert svc.get_account_balance(GL_MEMBER_DEPOSITS) == 1500.0

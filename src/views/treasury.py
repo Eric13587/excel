@@ -103,6 +103,15 @@ class TreasuryDialog(QDialog):
         self.btn_report.setStyleSheet(self.theme_manager.button_css("success"))
         self.btn_report.clicked.connect(self.generate_reports)
         btn_layout.addWidget(self.btn_report)
+        # Opening this screen used to re-derive the whole projection every time,
+        # which doubled as the recovery route whenever the books looked wrong.
+        # Now that it only applies what changed, that route needs a door.
+        self.btn_rebuild = QPushButton("Rebuild Ledger")
+        self.btn_rebuild.setToolTip(
+            "Discard the projected journals and re-derive them from member "
+            "activity. Manual entries are not affected.")
+        self.btn_rebuild.clicked.connect(self.rebuild_ledger)
+        btn_layout.addWidget(self.btn_rebuild)
         btn_layout.addStretch()
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.accept)
@@ -563,6 +572,28 @@ class TreasuryDialog(QDialog):
             QHeaderView::section {{ background-color: {t.get_color('bg_header')}; color: {t.get_color('text_secondary')}; font-weight: bold; padding: 4px; border: none; border-right: 1px solid {t.get_color('border')}; }}
             QLineEdit, QComboBox, QDateEdit {{ background-color: {t.get_color('input_bg')}; border: 1px solid {t.get_color('border')}; padding: 6px; border-radius: 4px; color: {t.get_color('text_primary')}; }}
         """)
+
+    def rebuild_ledger(self):
+        """Re-derive every projected journal from the member subledgers.
+
+        The unconditional counterpart of the incremental sync that runs when
+        this screen opens. It is the answer to "the books look wrong": whatever
+        state the projection is in, this puts it back in step with the
+        subledgers. Manual, migration and reversal entries are untouched.
+        """
+        if QMessageBox.question(
+                self, "Rebuild Ledger",
+                "Re-derive all projected journals from member activity?\n\n"
+                "Manually posted entries are not affected. This may take a "
+                "moment on a large journal.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_with_progress(
+            "Rebuilding general ledger…",
+            lambda progress: self.gl.sync(progress=progress, full=True))
+        self.refresh_all()
+        QMessageBox.information(self, "Rebuild Ledger", "The general ledger has been rebuilt.")
 
     # ------------------------------------------------------------------ #
     # Statements (GL-derived; balances by construction)
