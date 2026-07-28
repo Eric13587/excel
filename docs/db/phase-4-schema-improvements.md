@@ -7,8 +7,8 @@ Bringing the journal to the strict schema in
 | Sub-phase | Status | Scope |
 |---|---|---|
 | **4a** | **done** | Import normalisation — the prerequisite for any constraint |
-| 4b | next | `loans.duration_months` / `interest_rate`, replacing the regex parse |
-| 4c | pending | Migration 004: the strict-schema table rebuild |
+| **4b** | **done** | `loans.duration_months` / `interest_rate`, replacing the regex parse |
+| **4c** | **done** | Migration 004: the strict-schema table rebuild |
 
 ---
 
@@ -100,3 +100,78 @@ lexicographic. It is now restricted to ISO-shaped values.
 
 `git revert` the 4a commit. No schema or data change; imports return to copying
 values verbatim.
+
+---
+
+## 4c — the strict schema
+
+Migration 004 rebuilds fourteen tables to add `NOT NULL`, `CHECK` domains,
+declarative `ON DELETE CASCADE`, and `ledger.loan_pk` as a real foreign key.
+The cascade triggers from migration 001 are dropped — they were the interim
+mechanism for the same guarantee, and keeping both would delete children twice.
+
+The runner gained a header directive, `-- pragma: foreign_keys=off`, because
+SQLite's table-rebuild procedure needs it and `PRAGMA foreign_keys` is a silent
+no-op inside a transaction. Such a migration is verified with
+`PRAGMA foreign_key_check` **before** it commits, so a rebuild that would leave
+dangling references is rolled back rather than persisted.
+
+### Applied to the production journal
+
+```
+migration : applied 004_strict_schema | 0.161s
+row counts identical : True   (all 15 tables)
+integrity_check      : ok
+foreign_key_check    : clean
+loan_pk backfilled   : 0 nulls
+cascade triggers     : dropped
+control accounts     : all four reconcile, unchanged
+```
+
+The only content change is `pf_no`/`id_no` moving from `NULL` to `''` on 85
+members, forced by the new `NOT NULL`. Nothing distinguishes the two: the
+partial unique indexes exclude both, the owner lookup returns early on a blank,
+and the application already writes `''` for every member it creates.
+
+### Two things the constraints caught
+
+**A gap in the migration itself.** The first rehearsal backfilled `loan_pk` for
+existing rows, but new rows written afterwards left it `NULL` — the foreign key
+would have been correct once and then rotted. It is now filled by a trigger
+rather than by the insert statement, so it holds for every code path including
+bulk catch-up and the importer. Caught by the smoke test, not by the row counts.
+
+**A contradiction in the application.** `CHECK (is_edited IN (0,1))` was in the
+draft and had to be removed. The column does two jobs: it is an edit lock, and
+when above 1 it also carries the payment amount the user intended, which
+`BalanceRecalculator` reads back as a replay anchor (`balance_calculator.py`,
+"Hysteresis Fix"). Constraining it would change how an edited repayment
+replays.
+
+It is also already self-defeating: `create_tables` normalises anything outside
+0/1 back to 1 on every open, so the anchor survives only until the application
+restarts. Two parts of the codebase disagree about what the column means.
+Resolving it means splitting the two jobs into `is_edited` plus an
+`edited_amount` column — a schema change with a behavioural decision attached,
+so it is **migration 005**, not a rider on this one. The integrity report now
+counts the rows carrying an anchor so the change can be sized.
+
+### Test fallout
+
+Sixteen tests failed, and every one was a fixture relying on the absence of a
+constraint — minimal loan inserts with no `start_date`, an `event_type` of
+`'Loan Disbursed'`, a savings row with a `NULL` member. They are fixed rather
+than relaxed, and the two that model a *pre-004* journal (orphan repair, and
+the atomicity of a blocked delete) now reconstruct the older table shape
+explicitly instead of pretending the current one allows it.
+
+The suite runs in 13 s, up from 5 s: every test journal now performs the full
+14-table rebuild on creation. Building a new journal directly from `schema.sql`
+instead of creating the legacy shape and migrating it would remove that, and is
+the natural next step for `create_tables`.
+
+### Rollback
+
+Restore the backup named in the commit message. This rewrites every table, so
+there is no cheap undo — which is why the pre-flight guards abort before
+anything is touched.

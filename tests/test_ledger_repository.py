@@ -224,15 +224,21 @@ def test_balance_setters(journal):
     assert (row["balance"], row["principal_balance"], row["interest_balance"],
             row["gross_balance"]) == (400, 300, 100, 450)
 
+    # A row moves debt one way, so `added` and `deducted` are exercised on
+    # separate rows — migration 004 rejects a two-sided row outright.
     with journal.transaction():
         journal.ledger.set_portions(row_id, 70, 30)
-        journal.ledger.set_accrual(row_id, 12, 12)
         journal.ledger.set_deducted(row_id, 99)
         journal.ledger.set_date(row_id, "2026-06-06")
     row = journal.get_transaction(row_id)
     assert (row["principal_portion"], row["interest_portion"]) == (70, 30)
-    assert (row["added"], row["interest_amount"], row["deducted"]) == (12, 12, 99)
-    assert row["date"] == "2026-06-06"
+    assert row["deducted"] == 99 and row["date"] == "2026-06-06"
+
+    accrual = _row(journal, ind, "2026-02-01", "Interest Earned", added=5)
+    with journal.transaction():
+        journal.ledger.set_accrual(accrual, 12, 12)
+    row = journal.get_transaction(accrual)
+    assert (row["added"], row["interest_amount"]) == (12, 12)
 
 
 def test_delete_and_restore_round_trip(journal):

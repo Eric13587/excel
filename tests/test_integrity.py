@@ -62,7 +62,7 @@ def test_live_connection_enforcement_is_reported(journal):
 def test_schema_checks_see_migration_001(journal):
     report = integrity.verify(journal)
     assert _check(report, "schema version").status == integrity.PASS
-    assert _check(report, "trigger trg_cascade_individual_delete").status == integrity.PASS
+    assert _check(report, "index idx_loans_member_ref").status == integrity.PASS
 
 
 # --------------------------------------------------------------------------- #
@@ -130,19 +130,20 @@ def test_detects_settled_loan_with_a_balance(journal):
     assert check.count == 1
 
 
-def test_phase4_readiness_flags_out_of_vocabulary_values(journal):
-    """The values Phase 4's CHECK constraints would reject, warned about now."""
-    ind = journal.add_individual("Legacy", "0700", "l@x.com")
-    journal.conn.execute(
-        "INSERT INTO ledger (individual_id, date, event_type, loan_id, added, balance) "
-        "VALUES (?, '2026-01-01', 'Loan Disbursed', 'L-001', 100, 100)", (ind,))
-    journal.conn.commit()
+def test_phase4_readiness_is_clean_once_the_constraints_are_enforced(journal):
+    """Migration 004 turned these probes into constraints, so a migrated journal
+    cannot hold a value they would flag. The probes stay: they still describe a
+    pre-004 journal, and the reporting is what tells you it is safe to migrate."""
+    import sqlite3
+    ind = journal.add_individual("Modern", "0700", "m@x.com")
+    with pytest.raises(sqlite3.IntegrityError):
+        journal.conn.execute(
+            "INSERT INTO ledger (individual_id, date, event_type, loan_id, added, balance) "
+            "VALUES (?, '2026-01-01', 'Loan Disbursed', 'L-001', 100, 100)", (ind,))
+    journal.conn.rollback()
 
     report = integrity.verify(journal)
-    check = _check(report, "ledger.event_type in vocabulary")
-    assert check.status == integrity.WARN
-    assert check.count == 1
-    # Readiness gaps are warnings, never failures — the constraint is not in force.
+    assert _check(report, "ledger.event_type in vocabulary").status == integrity.PASS
     assert report.ok
 
 

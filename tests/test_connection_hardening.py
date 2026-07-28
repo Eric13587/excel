@@ -17,6 +17,45 @@ from src.database import BUSY_TIMEOUT_MS, JOURNAL_MODE_ENV, DatabaseManager
 from src.exceptions import TransactionError
 
 
+def _block_member_deletion(db):
+    """Recreate `savings` referencing individuals with ON DELETE RESTRICT.
+
+    Migration 004 made the cascade declarative, so a member delete now succeeds
+    and clears the children. To test that a *failing* delete is atomic we need a
+    child that refuses to go — the situation every pre-004 journal was in, where
+    nothing cleared savings and the foreign key blocked the parent.
+    """
+    db.conn.executescript("""
+        PRAGMA foreign_keys = OFF;
+        DROP TRIGGER IF EXISTS trg_savings_created;
+        ALTER TABLE savings RENAME TO savings_cascading;
+        CREATE TABLE savings (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            individual_id INTEGER NOT NULL REFERENCES individuals(id) ON DELETE RESTRICT,
+            date TEXT, transaction_type TEXT, amount REAL, balance REAL, notes TEXT,
+            import_id INTEGER, batch_id TEXT, created_at TEXT);
+        INSERT INTO savings SELECT * FROM savings_cascading;
+        DROP TABLE savings_cascading;
+    """)
+    db.conn.commit()
+    db.conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _block_loan_deletion(db):
+    """Same idea for loans: a suspension row that refuses to cascade."""
+    db.conn.executescript("""
+        PRAGMA foreign_keys = OFF;
+        ALTER TABLE loan_suspensions RENAME TO loan_suspensions_cascading;
+        CREATE TABLE loan_suspensions (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            loan_id INTEGER REFERENCES loans(id) ON DELETE RESTRICT,
+            individual_id INTEGER, loan_ref TEXT, start_date TEXT, suspend_until TEXT,
+            resumed_date TEXT, status TEXT, created_at TEXT);
+        INSERT INTO loan_suspensions SELECT * FROM loan_suspensions_cascading;
+        DROP TABLE loan_suspensions_cascading;
+    """)
+    db.conn.commit()
+    db.conn.execute("PRAGMA foreign_keys = ON")
+
+
 @pytest.fixture
 def journal():
     """A file-backed journal (WAL only applies to real files)."""
@@ -139,10 +178,7 @@ def test_delete_individual_is_atomic_when_children_block_it(journal):
                 "VALUES (?, '2026-01-15', 'Deposit', 250, 250)", (ind,))
     journal.conn.commit()
 
-    for trg in ("trg_cascade_individual_delete", "trg_cascade_loan_delete"):
-        journal.conn.execute(f"DROP TRIGGER IF EXISTS {trg}")
-    journal.conn.commit()
-    journal.conn.execute("PRAGMA foreign_keys = ON")
+    _block_member_deletion(journal)
 
     # TransactionError wraps the underlying sqlite3.IntegrityError.
     with pytest.raises(TransactionError):
@@ -200,10 +236,7 @@ def test_delete_loan_is_atomic(journal):
                 "VALUES (?, ?, 'L-001', '2026-02-01', 'active')", (loan_pk, ind))
     journal.conn.commit()
 
-    # Simulate a pre-migration journal, where nothing clears the suspension.
-    journal.conn.execute("DROP TRIGGER IF EXISTS trg_cascade_loan_delete")
-    journal.conn.commit()
-    journal.conn.execute("PRAGMA foreign_keys = ON")
+    _block_loan_deletion(journal)
 
     with pytest.raises(TransactionError):
         journal.delete_loan(ind, "L-001")

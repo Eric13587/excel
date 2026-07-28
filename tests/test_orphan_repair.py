@@ -11,6 +11,55 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.database import DatabaseManager
 
 
+def _relax_to_legacy_shape(db):
+    """Recreate `savings`, `ledger` and `loans` without the strict constraints.
+
+    The repair tooling exists for journals written before migrations 001 and
+    004, where a parent could be deleted without cascading and a child row could
+    carry a NULL member. Neither is representable once those migrations have
+    run, so a test for the tooling has to reconstruct the older shape rather
+    than pretend the current one allows it.
+    """
+    db.conn.executescript("""
+        PRAGMA foreign_keys = OFF;
+        DROP TRIGGER IF EXISTS trg_cascade_individual_delete;
+        DROP TRIGGER IF EXISTS trg_cascade_loan_delete;
+        DROP TRIGGER IF EXISTS trg_savings_created;
+        DROP TRIGGER IF EXISTS trg_loans_created;
+        DROP TRIGGER IF EXISTS trg_loans_updated;
+        DROP TRIGGER IF EXISTS trg_audit_loan_ins;
+        DROP TRIGGER IF EXISTS trg_audit_loan_del;
+
+        ALTER TABLE savings RENAME TO savings_strict;
+        CREATE TABLE savings (id INTEGER PRIMARY KEY AUTOINCREMENT, individual_id INTEGER,
+            date TEXT, transaction_type TEXT, amount REAL, balance REAL, notes TEXT,
+            import_id INTEGER, batch_id TEXT, created_at TEXT);
+        INSERT INTO savings SELECT * FROM savings_strict;
+        DROP TABLE savings_strict;
+
+        ALTER TABLE ledger RENAME TO ledger_strict;
+        CREATE TABLE ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, individual_id INTEGER,
+            date TEXT, event_type TEXT, loan_id TEXT, added REAL, deducted REAL, balance REAL,
+            notes TEXT, installment_amount REAL, batch_id TEXT, interest_amount REAL,
+            principal_balance REAL, interest_balance REAL, principal_portion REAL,
+            interest_portion REAL, is_edited INTEGER, previous_state TEXT, import_id INTEGER,
+            gross_balance REAL, loan_pk INTEGER);
+        INSERT INTO ledger SELECT * FROM ledger_strict;
+        DROP TABLE ledger_strict;
+
+        ALTER TABLE loans RENAME TO loans_strict;
+        CREATE TABLE loans (id INTEGER PRIMARY KEY AUTOINCREMENT, individual_id INTEGER,
+            ref TEXT, principal REAL, total_amount REAL, balance REAL, installment REAL,
+            start_date TEXT, next_due_date TEXT, status TEXT, monthly_interest REAL,
+            unearned_interest REAL, interest_balance REAL, import_id INTEGER,
+            is_suspended INTEGER, suspend_until TEXT, created_at TEXT, updated_at TEXT,
+            duration_months INTEGER, interest_rate REAL);
+        INSERT INTO loans SELECT * FROM loans_strict;
+        DROP TABLE loans_strict;
+    """)
+    db.conn.commit()
+
+
 @pytest.fixture
 def db():
     fd, path = tempfile.mkstemp(suffix=".db")
@@ -32,9 +81,7 @@ def _seed_with_orphans(db):
     clean up. test_deleting_a_member_leaves_no_orphans covers the migrated
     behaviour.
     """
-    db.conn.execute("DROP TRIGGER IF EXISTS trg_cascade_individual_delete")
-    db.conn.execute("DROP TRIGGER IF EXISTS trg_cascade_loan_delete")
-    db.conn.commit()
+    _relax_to_legacy_shape(db)
 
     keep = db.add_individual("Keep Me", "0700", "keep@x.com")
     gone = db.add_individual("Delete Me", "0711", "gone@x.com")

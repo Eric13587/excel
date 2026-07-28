@@ -26,10 +26,10 @@ def setup_source():
     ind_id = c.lastrowid
     
     # 2. Loan with REF "L-100" (Will collide)
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-100', 500)", (ind_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-100', 500, '2026-01-01')", (ind_id,))
     
     # 3. Ledger Entry for L-100
-    c.execute("INSERT INTO ledger (individual_id, loan_id, event_type, added) VALUES (?, 'L-100', 'Loan Disbursed', 500)", (ind_id,))
+    c.execute("INSERT INTO ledger (individual_id, loan_id, event_type, added) VALUES (?, 'L-100', 'Loan Issued', 500)", (ind_id,))
     
     conn.commit()
     conn.close()
@@ -48,10 +48,10 @@ def setup_dest():
     dest_ind_id = c.lastrowid
     
     # 2. Existing Loan "L-100" (Collision!)
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-100', 1000)", (dest_ind_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-100', 1000, '2026-01-01')", (dest_ind_id,))
     
     # 3. Existing Loan "L-100-Import" (Collision Level 2!)
-    c.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-100-Import', 2000)", (dest_ind_id,))
+    c.execute("INSERT INTO loans (individual_id, ref, principal, start_date) VALUES (?, 'L-100-Import', 2000, '2026-01-01')", (dest_ind_id,))
     
     conn.commit()
     conn.close()

@@ -143,9 +143,7 @@ def _check_schema(conn, report):
         report.add("schema version", "schema", WARN,
                    f"{version}, latest is {latest} — migrations pending")
 
-    for kind, name in (("trigger", "trg_cascade_individual_delete"),
-                       ("trigger", "trg_cascade_loan_delete"),
-                       ("index", "idx_loans_member_ref"),
+    for kind, name in (("index", "idx_loans_member_ref"),
                        ("index", "idx_journal_entries_source_ref"),
                        ("index", "idx_ledger_individual_date")):
         present = conn.execute("SELECT 1 FROM sqlite_master WHERE type=? AND name=?",
@@ -303,7 +301,10 @@ def _check_phase4_readiness(conn, report):
          "SELECT COUNT(*) FROM loans WHERE start_date IS NULL OR start_date = ''", ()),
         ("ledger.loan_id present",
          "SELECT COUNT(*) FROM ledger WHERE loan_id IS NULL OR loan_id = ''", ()),
-        ("ledger.is_edited is 0 or 1",
+        # Not a Phase 4 blocker: the column deliberately carries a replay
+        # anchor above 1. Reported so the split into is_edited + edited_amount
+        # (migration 005) can be sized.
+        ("ledger.is_edited carries an anchor amount",
          "SELECT COUNT(*) FROM ledger WHERE is_edited NOT IN (0, 1)", ()),
         ("ledger rows are one-sided",
          "SELECT COUNT(*) FROM ledger WHERE added <> 0 AND deducted <> 0", ()),

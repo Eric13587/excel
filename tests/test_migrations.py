@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src import migrations
 from src.database import DatabaseManager
+from src.exceptions import TransactionError
 
 
 @pytest.fixture
@@ -120,9 +121,14 @@ def test_split_statements_ignores_comment_only_fragments():
 # Migration 001 content
 # --------------------------------------------------------------------------- #
 
-def test_cascade_triggers_exist(journal):
-    assert _objects(journal.conn, "trigger", "trg_cascade") == [
-        "trg_cascade_individual_delete", "trg_cascade_loan_delete"]
+def test_cascade_is_declarative_after_004(journal):
+    """Migration 001 installed BEFORE DELETE triggers as the interim mechanism;
+    004 replaced them with ON DELETE CASCADE and dropped them, so children are
+    not deleted twice."""
+    assert _objects(journal.conn, "trigger", "trg_cascade") == []
+    schema = journal.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='ledger'").fetchone()[0]
+    assert "ON DELETE CASCADE" in schema
 
 
 def test_expected_indexes_exist(journal):
@@ -142,12 +148,13 @@ def test_loan_ref_is_unique_per_member(journal):
     a = journal.add_individual("A", "1", "a@x.com")
     b = journal.add_individual("B", "2", "b@x.com")
     cur = journal.conn.cursor()
-    cur.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-001', 100)", (a,))
-    # Same ref for a different member is fine — refs are per-member.
-    cur.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-001', 100)", (b,))
+    ins = ("INSERT INTO loans (individual_id, ref, principal, start_date) "
+           "VALUES (?, 'L-001', ?, '2026-01-01')")
+    cur.execute(ins, (a, 100))
+    cur.execute(ins, (b, 100))      # same ref, different member — refs are per-member
     journal.conn.commit()
     with pytest.raises(sqlite3.IntegrityError):
-        cur.execute("INSERT INTO loans (individual_id, ref, principal) VALUES (?, 'L-001', 200)", (a,))
+        cur.execute(ins, (a, 200))
 
 
 def test_journal_source_ref_cannot_double_post(journal):
@@ -272,3 +279,111 @@ def test_a_python_migration_that_raises_is_rolled_back(journal, monkeypatch, tmp
     assert 998 not in migrations.applied_versions(journal.conn)
     assert "idx_probe_py" not in _objects(journal.conn, "index", "idx_")
     assert journal.add_individual("Still Works", "0700", "s@x.com")
+
+
+# --------------------------------------------------------------------------- #
+# Migration 004 — the strict schema
+# --------------------------------------------------------------------------- #
+
+def test_strict_schema_rejects_bad_writes(journal):
+    """The constraints the application used to enforce only in Python."""
+    ind = journal.add_individual("Constrained", "0700", "c@x.com")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, status, start_date) "
+                "VALUES (?, 'L-001', 100, 'Active', '2026-01-01')", (ind,))
+    journal.conn.commit()
+
+    for label, sql, params in (
+        ("unknown event_type",
+         "INSERT INTO ledger (individual_id, date, event_type, loan_id) "
+         "VALUES (?, '2026-01-01', 'Nonsense', 'L-001')", (ind,)),
+        ("row that both adds and deducts",
+         "INSERT INTO ledger (individual_id, date, event_type, loan_id, added, deducted) "
+         "VALUES (?, '2026-01-01', 'Repayment', 'L-001', 5, 5)", (ind,)),
+        ("malformed date",
+         "INSERT INTO ledger (individual_id, date, event_type, loan_id) "
+         "VALUES (?, '01/02/2026', 'Repayment', 'L-001')", (ind,)),
+        ("negative savings amount",
+         "INSERT INTO savings (individual_id, date, transaction_type, amount) "
+         "VALUES (?, '2026-01-01', 'Deposit', -5)", (ind,)),
+        ("unknown savings type",
+         "INSERT INTO savings (individual_id, date, transaction_type, amount) "
+         "VALUES (?, '2026-01-01', 'Levy', 5)", (ind,)),
+        ("blank member name", "INSERT INTO individuals (name) VALUES ('   ')", ()),
+        ("unknown loan status",
+         "INSERT INTO loans (individual_id, ref, status, start_date) "
+         "VALUES (?, 'L-ZZ', 'Frozen', '2026-01-01')", (ind,)),
+        ("loan with no start date",
+         "INSERT INTO loans (individual_id, ref, status) VALUES (?, 'L-YY', 'Active')", (ind,)),
+        ("one-sided journal line",
+         "INSERT INTO journal_lines (entry_id, account_code, debit, credit) "
+         "VALUES (1, '1000', 5, 5)", ()),
+    ):
+        with pytest.raises(sqlite3.IntegrityError):
+            cur.execute(sql, params)
+        journal.conn.rollback()
+
+
+def test_declarative_cascade_replaces_the_triggers(journal):
+    assert _objects(journal.conn, "trigger", "trg_cascade") == []
+
+    ind = journal.add_individual("Cascader", "0700", "c@x.com")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, status, start_date) "
+                "VALUES (?, 'L-001', 100, 'Active', '2026-01-01')", (ind,))
+    cur.execute("INSERT INTO savings (individual_id, date, transaction_type, amount) "
+                "VALUES (?, '2026-01-01', 'Deposit', 10)", (ind,))
+    cur.execute("INSERT INTO benevolent_accounts (individual_id, monthly_amount) "
+                "VALUES (?, 50)", (ind,))
+    journal.conn.commit()
+
+    journal.delete_individual(ind)
+    for table in ("loans", "savings", "benevolent_accounts", "ledger"):
+        assert journal.conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE individual_id=?", (ind,)).fetchone()[0] == 0
+
+
+def test_loan_pk_is_filled_on_every_insert_path(journal):
+    """Backfilled once is not enough: without the trigger the column would rot
+    to NULL for everything written afterwards."""
+    from src.engine import LoanEngine
+    ind = journal.add_individual("PK", "0700", "p@x.com")
+    eng = LoanEngine(journal)
+    eng.add_loan_event(ind, 50000, 12, "2026-01-15")     # single insert
+    ref = journal.get_loans(ind)[0]["ref"]
+    eng.catch_up_loan(ind, ref)                          # bulk insert
+
+    total, missing = journal.conn.execute(
+        "SELECT COUNT(*), SUM(loan_pk IS NULL) FROM ledger WHERE individual_id=?",
+        (ind,)).fetchone()
+    assert total > 1 and missing == 0
+    loan_pk = journal.get_loans(ind)[0]["id"]
+    assert journal.conn.execute(
+        "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_pk<>?",
+        (ind, loan_pk)).fetchone()[0] == 0
+
+
+def test_deleting_a_loan_cascades_its_ledger(journal):
+    from src.engine import LoanEngine
+    ind = journal.add_individual("Loanee", "0700", "l@x.com")
+    eng = LoanEngine(journal)
+    eng.add_loan_event(ind, 50000, 12, "2026-01-15")
+    ref = journal.get_loans(ind)[0]["ref"]
+    eng.catch_up_loan(ind, ref)
+    assert len(journal.get_ledger(ind)) > 1
+
+    eng.delete_loan(ind, ref)
+    assert len(journal.get_ledger(ind)) == 0
+    assert journal.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_blank_pf_and_id_are_empty_strings_not_null(journal):
+    """The strict schema makes them NOT NULL; the partial unique indexes treat
+    NULL and '' alike, so uniqueness is unaffected."""
+    a = journal.add_individual("NoNumbers", "0700", "n@x.com")
+    b = journal.add_individual("AlsoNone", "0711", "a@x.com")
+    assert journal.get_individual(a)["pf_no"] == ""
+    assert journal.get_individual(b)["pf_no"] == ""      # blanks do not collide
+    journal.update_individual(a, "NoNumbers", "0700", "n@x.com", pf_no="PF-1")
+    with pytest.raises(TransactionError):
+        journal.update_individual(b, "AlsoNone", "0711", "a@x.com", pf_no="PF-1")

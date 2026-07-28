@@ -27,6 +27,16 @@ Design notes
   statement. ``NNN_name.py`` must define ``apply(conn)`` and is called with the
   open connection inside the same transaction — needed whenever a migration has
   to do something SQL cannot express, such as parsing a value out of free text.
+
+* **A migration may ask for foreign keys off** with a header directive::
+
+      -- pragma: foreign_keys=off
+
+  SQLite's table-rebuild procedure requires it, and ``PRAGMA foreign_keys`` is
+  a silent no-op inside a transaction, so the runner must set it before
+  ``BEGIN``. Such a migration is verified with ``PRAGMA foreign_key_check``
+  *before* it commits, so a rebuild that would leave dangling references is
+  rolled back rather than persisted.
 """
 import logging
 import os
@@ -143,6 +153,17 @@ def split_statements(script):
     return statements
 
 
+def _wants_foreign_keys_off(script):
+    """True if the migration's header asks for ``-- pragma: foreign_keys=off``."""
+    for raw in script.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("--"):
+            break                       # directives live in the header only
+        if line.replace(" ", "").lower().startswith("--pragma:foreign_keys=off"):
+            return True
+    return False
+
+
 def _has_sql(text):
     """True if the fragment contains anything other than comments/whitespace."""
     for raw in text.splitlines():
@@ -174,24 +195,41 @@ def apply_pending(conn):
             continue
         is_python = path.endswith(".py")
         statements = []
+        needs_fk_off = False
         if not is_python:
             try:
                 with open(path, encoding="utf-8") as fh:
-                    statements = split_statements(fh.read())
+                    script = fh.read()
+                needs_fk_off = _wants_foreign_keys_off(script)
+                statements = split_statements(script)
             except OSError as e:
                 report.failed = (version, name, f"unreadable: {e}")
                 logger.error("Migration %03d_%s unreadable: %s", version, name, e)
                 return report
 
+        restore_fk = False
         try:
             if conn.in_transaction:
                 conn.commit()
+            if needs_fk_off:
+                # Must be set outside a transaction; inside one it is ignored.
+                restore_fk = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+                conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN IMMEDIATE")
             if is_python:
                 statements = [None] * _run_python_migration(path, conn)
             else:
                 for statement in statements:
                     conn.execute(statement)
+            if needs_fk_off:
+                # Checked before the commit, so a rebuild that would leave
+                # dangling references is rolled back rather than persisted.
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    tables = sorted({v[0] for v in violations})
+                    raise RuntimeError(
+                        f"{len(violations)} foreign-key violation(s) after rebuild "
+                        f"in {', '.join(tables)}")
             conn.execute(
                 f"INSERT INTO {MIGRATION_TABLE} (version, name, applied_at, statements) "
                 f"VALUES (?, ?, ?, ?)",
@@ -205,6 +243,12 @@ def apply_pending(conn):
             report.failed = (version, name, str(e))
             logger.error("Migration %03d_%s rolled back: %s", version, name, e)
             return report          # stop at the first failure; later ones may depend on it
+        finally:
+            if restore_fk:
+                try:
+                    conn.execute("PRAGMA foreign_keys = ON")
+                except sqlite3.DatabaseError:
+                    logger.warning("Could not restore foreign-key enforcement", exc_info=True)
 
         report.applied.append((version, name))
         logger.info("Applied migration %03d_%s (%d statements)", version, name, len(statements))
