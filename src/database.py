@@ -16,7 +16,8 @@ from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
                     JournalRepository, LedgerRepository, LoanRepository,
                     MemberRepository, PeriodRepository, RepairRepository,
                     SettingsRepository, SourceJournal)
-from src.exceptions import TransactionError
+from src.exceptions import (PERIOD_LOCK_MARKER, PeriodClosedError,
+                            TransactionError)
 from src.data_structures import StatementData
 
 # How many timestamped on-open backups to keep per journal.
@@ -498,6 +499,12 @@ class DatabaseManager:
             self.conn.commit()
         except sqlite3.Error as e:
             self.conn.rollback()
+            # The period lock (migration 009) is enforced by triggers, so every
+            # write path hits it — including ones that never reach a service.
+            # Translating it here once means the caller gets an exception that
+            # says what to do instead of a generic transaction failure.
+            if PERIOD_LOCK_MARKER in str(e):
+                raise PeriodClosedError.from_trigger(str(e)) from e
             raise TransactionError(f"Transaction failed: {str(e)}") from e
         except Exception:
             self.conn.rollback()

@@ -158,6 +158,12 @@ class ImmutableEntryError(LoanMasterError):
         )
 
 
+# The phrase every migration-009 trigger ends its RAISE(ABORT) message with.
+# It is the contract that lets DatabaseManager.transaction turn a trigger abort
+# into PeriodClosedError; change it in one place and you change it in both.
+PERIOD_LOCK_MARKER = "closed fiscal period"
+
+
 class PeriodClosedError(LoanMasterError):
     """Raised when a write lands in a fiscal period that has been closed.
 
@@ -166,12 +172,28 @@ class PeriodClosedError(LoanMasterError):
     not a change to a settled one.
     """
 
-    def __init__(self, date: str, period_label: str, what: str = "This entry"):
-        super().__init__(
-            f"{what} is dated {date}, which falls in {period_label} — a closed "
-            f"fiscal period. Post the correction in an open period instead.",
-            {'date': date, 'period': period_label},
-        )
+    ADVICE = "Post the correction in an open period instead."
+
+    def __init__(self, date: str = None, period_label: str = None,
+                 what: str = "This entry"):
+        if date and period_label:
+            message = (f"{what} is dated {date}, which falls in {period_label} "
+                       f"— a closed fiscal period. {self.ADVICE}")
+        else:
+            message = (f"{what} falls in a closed fiscal period. {self.ADVICE}")
+        super().__init__(message, {'date': date, 'period': period_label})
+
+    @classmethod
+    def from_trigger(cls, sqlite_message: str):
+        """Build one from a migration-009 trigger abort.
+
+        The trigger knows the date is locked but not which entry the caller was
+        writing, so the message stays general and carries the advice that
+        matters.
+        """
+        err = cls(what="That change")
+        err.details['sqlite'] = sqlite_message
+        return err
 
 
 class PeriodNotClosableError(LoanMasterError):

@@ -9,7 +9,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.database import DatabaseManager
-from src.exceptions import PeriodNotClosableError, TransactionError
+from src.exceptions import (PeriodClosedError, PeriodNotClosableError,
+                            TransactionError)
 from src.services.gl_service import GLService
 from src.services.period_service import FiscalPeriodService
 
@@ -231,3 +232,135 @@ def test_the_register_starts_empty_so_nothing_changes(svc):
     assert s.periods() == []
     assert db.periods.counts() == {"open": 0, "closed": 0}
     assert s.settled_through() is None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 7b — a closed period is a lock (migration 009)
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def locked(svc):
+    """Books with Q1 2026 closed and Q2 left open."""
+    s, db = svc
+    ind = _seed_balanced_books(db)
+    pid = s.create("FY 2026 Q1", "2026-01-01", "2026-03-31")
+    s.close(pid)
+    return s, db, ind
+
+
+def test_nothing_is_locked_until_something_is_closed(svc):
+    """How 009 ships: the triggers are inert on a journal with no closed
+    periods, which is every journal until a user closes one."""
+    s, db = svc
+    ind = _seed_balanced_books(db)
+    s.create("FY 2026 Q1", "2026-01-01", "2026-03-31")   # declared, still open
+    db.add_savings_transaction(ind, "2026-02-01", "Deposit", 100, "")
+    db.conn.execute("UPDATE ledger SET added=9999 WHERE event_type='Loan Issued'")
+    db.conn.commit()
+
+
+def test_activity_cannot_be_added_inside_a_closed_period(locked):
+    s, db, ind = locked
+    with pytest.raises(PeriodClosedError):
+        db.add_savings_transaction(ind, "2026-02-01", "Deposit", 100, "late")
+
+
+def test_an_amount_inside_a_closed_period_cannot_be_edited(locked):
+    s, db, ind = locked
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("UPDATE ledger SET added=9999 WHERE date='2026-01-05'")
+    db.conn.rollback()
+    assert db.conn.execute(
+        "SELECT added FROM ledger WHERE date='2026-01-05'").fetchone()[0] == 10000.0
+
+
+def test_a_row_inside_a_closed_period_cannot_be_deleted(locked):
+    s, db, ind = locked
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("DELETE FROM ledger WHERE date='2026-01-05'")
+    db.conn.rollback()
+
+
+def test_a_row_cannot_be_moved_out_of_a_closed_period(locked):
+    """Moving a row out changes that period's figures just as surely as moving
+    one in, so both sides of the date change are checked."""
+    s, db, ind = locked
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("UPDATE ledger SET date='2026-06-01' WHERE date='2026-01-05'")
+    db.conn.rollback()
+
+
+def test_a_row_cannot_be_moved_into_a_closed_period(locked):
+    s, db, ind = locked
+    db.add_savings_transaction(ind, "2026-06-01", "Deposit", 50, "open period")
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("UPDATE savings SET date='2026-02-01' WHERE date='2026-06-01'")
+    db.conn.rollback()
+
+
+def test_recalculating_balances_is_still_allowed(locked):
+    """The lock is on money, not on bookkeeping — the recalculators rewrite
+    `balance` across every row and must keep working."""
+    s, db, ind = locked
+    db.conn.execute("UPDATE ledger SET balance = balance + 1")
+    db.conn.execute("UPDATE savings SET balance = balance + 1")
+    db.conn.commit()
+
+
+def test_an_open_period_is_untouched(locked):
+    s, db, ind = locked
+    db.add_savings_transaction(ind, "2026-06-01", "Deposit", 100, "fine")
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM savings WHERE date='2026-06-01'").fetchone()[0] == 1
+
+
+def test_a_journal_cannot_be_hand_posted_into_a_closed_period(locked):
+    s, db, ind = locked
+    gl = GLService(db)
+    with pytest.raises(sqlite3.IntegrityError):
+        gl.post_journal("2026-02-01", [
+            {'account': '1000', 'debit': 10}, {'account': '4000', 'credit': 10}],
+            source="manual")
+    db.conn.rollback()
+
+
+def test_a_full_rebuild_still_works_with_a_closed_period(locked):
+    """The exemption that makes the lock survivable: sync(full=True) re-posts
+    every projected entry, including ones inside closed periods. Without it the
+    recovery path would be the first casualty of the safety feature."""
+    s, db, ind = locked
+    gl = GLService(db)
+    before = {r['code']: (r['debit'], r['credit']) for r in gl.get_trial_balance()[0]}
+
+    gl.sync(full=True)
+
+    rows, balanced = gl.get_trial_balance()
+    assert balanced
+    assert {r['code']: (r['debit'], r['credit']) for r in rows} == before
+
+
+def test_reopening_lifts_the_lock(locked):
+    s, db, ind = locked
+    pid = db.periods.by_label("FY 2026 Q1")["id"]
+    with pytest.raises(PeriodClosedError):
+        db.add_savings_transaction(ind, "2026-02-01", "Deposit", 100, "")
+
+    s.reopen(pid, reason="restating January accrual", reopened_by="auditor")
+    db.add_savings_transaction(ind, "2026-02-01", "Deposit", 100, "now fine")
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM savings WHERE date='2026-02-01'").fetchone()[0] == 1
+
+
+def test_the_error_says_what_to_do(locked):
+    s, db, ind = locked
+    with pytest.raises(PeriodClosedError) as excinfo:
+        db.add_savings_transaction(ind, "2026-02-01", "Deposit", 100, "")
+    assert "open period" in str(excinfo.value)
+
+
+def test_assert_open_is_the_same_rule_before_the_write(locked):
+    """The pre-emptive check, for callers that would rather ask than fail."""
+    s, db, ind = locked
+    s.assert_open("2026-06-01")                       # open — no raise
+    with pytest.raises(PeriodClosedError):
+        s.assert_open("2026-02-01", what="This repayment")
