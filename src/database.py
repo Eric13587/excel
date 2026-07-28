@@ -11,6 +11,7 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
+from src.db import import_rules
 from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
                     JournalRepository, LedgerRepository, LoanRepository,
                     MemberRepository, RepairRepository, SettingsRepository,
@@ -1742,7 +1743,7 @@ class DatabaseManager:
         the code it replaced, and is preserved here — deciding what a partial
         savings import should do is a business call, not a refactoring one.
         """
-        stats = {"individuals": 0, "loans": 0, "ledger": 0, "savings": 0}
+        stats = {"individuals": 0, "loans": 0, "ledger": 0, "savings": 0, "rejected": 0}
         errors = []
         status = "success"
         # Bound before the try: the original assigned it *inside*, so a failure
@@ -1821,20 +1822,17 @@ class DatabaseManager:
                         id_map[src_id] = action             # merge with existing
                     else:
                         keys = src_ind.keys()
-
-                        def sval(col, default='', src_ind=src_ind, keys=keys):
-                            return src_ind[col] if col in keys and src_ind[col] is not None else default
-
-                        phone = src_ind['phone'] if src_ind['phone'] else ""
-                        email = src_ind['email'] if src_ind['email'] else ""
-                        def_ded = (src_ind['default_deduction']
-                                   if 'default_deduction' in keys and src_ind['default_deduction'] else 0)
-                        # New individual fields (graceful if the source is an older schema)
-                        emp_status = (sval('employment_status', 'Active') or 'Active')
-                        pf_no = (sval('pf_no', '') or '').strip()
-                        id_no = (sval('id_no', '') or '').strip()
-                        is_retired = 1 if sval('is_retired', 0) else 0
-                        retired_date = sval('retired_date', None) or None
+                        norm = import_rules.normalise_member(
+                            {k: src_ind[k] for k in keys})
+                        errors.extend(norm.warnings)
+                        if norm.rejected:
+                            errors.append(f"Skipped a member: {norm.reason}")
+                            stats["rejected"] += 1
+                            current_op += 1
+                            continue
+                        v = norm.values
+                        name = v["name"]
+                        pf_no, id_no = v["pf_no"], v["id_no"]
 
                         # Drop a colliding PF/ID rather than fail the import.
                         if pf_no and pf_no in existing_pf:
@@ -1845,9 +1843,10 @@ class DatabaseManager:
                             id_no = ''
 
                         new_id = self.members.add_imported(
-                            name, phone, email, def_ded,
+                            name, v["phone"], v["email"], v["default_deduction"],
                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            emp_status, pf_no, id_no, is_retired, retired_date, import_id)
+                            v["employment_status"], pf_no, id_no,
+                            v["is_retired"], v["retired_date"], import_id)
                         id_map[src_id] = new_id
                         if pf_no:
                             existing_pf.add(pf_no)
@@ -1893,16 +1892,22 @@ class DatabaseManager:
                         existing_loan_refs.add(new_ref)
                         loan_id_map[original_ref] = new_ref
 
-                        keys = ln.keys()
-                        monthly_int = ln['monthly_interest'] if 'monthly_interest' in keys and ln['monthly_interest'] else 0
-                        unearned_int = ln['unearned_interest'] if 'unearned_interest' in keys and ln['unearned_interest'] else 0
-                        int_bal = ln['interest_balance'] if 'interest_balance' in keys and ln['interest_balance'] else 0
-
+                        norm = import_rules.normalise_loan(
+                            {k: ln[k] for k in ln.keys()},
+                            fallback_start=src.min_ledger_date(src_ind_id, original_ref))
+                        errors.extend(norm.warnings)
+                        if norm.rejected:
+                            errors.append(f"Skipped a loan: {norm.reason}")
+                            stats["rejected"] += 1
+                            existing_loan_refs.discard(new_ref)
+                            loan_id_map.pop(original_ref, None)
+                            continue
+                        v = norm.values
                         self.loans.add_imported(
-                            dest_ind_id, new_ref, ln['principal'], ln['total_amount'],
-                            ln['balance'], ln['installment'], ln['start_date'],
-                            ln['next_due_date'], ln['status'], monthly_int, unearned_int,
-                            int_bal, import_id)
+                            dest_ind_id, new_ref, v['principal'], v['total_amount'],
+                            v['balance'], v['installment'], v['start_date'],
+                            v['next_due_date'], v['status'], v['monthly_interest'],
+                            v['unearned_interest'], v['interest_balance'], import_id)
                         stats["loans"] += 1
 
                     # --- Ledger ---
@@ -1921,24 +1926,26 @@ class DatabaseManager:
                                 continue
                             dest_ind_id = id_map[src_ind_id]
 
+                            norm = import_rules.normalise_ledger(entry)
+                            errors.extend(norm.warnings)
+                            if norm.rejected:
+                                errors.append(f"Skipped a transaction: {norm.reason}")
+                                stats["rejected"] += 1
+                                continue
+                            v = norm.values
+
                             # `loan_id` holds the loan REFERENCE string, so it is
                             # remapped alongside any rename above.
-                            old_ref = entry['loan_id']
+                            old_ref = v['loan_id']
                             new_ref = loan_id_map.get(old_ref, old_ref) if old_ref else old_ref
 
                             self.ledger.add_imported((
-                                dest_ind_id, entry['date'], entry['event_type'], new_ref,
-                                entry['added'], entry['deducted'], entry['balance'], entry['notes'],
-                                entry.get('installment_amount', 0) or 0,
-                                entry.get('batch_id'),
-                                entry.get('interest_amount', 0) or 0,
-                                entry.get('principal_balance', 0) or 0,
-                                entry.get('interest_balance', 0) or 0,
-                                entry.get('principal_portion', 0) or 0,
-                                entry.get('interest_portion', 0) or 0,
-                                entry.get('previous_state'),
-                                entry.get('is_edited', 0) or 0,
-                                import_id))
+                                dest_ind_id, v['date'], v['event_type'], new_ref,
+                                v['added'], v['deducted'], v['balance'], v['notes'],
+                                v['installment_amount'], v['batch_id'], v['interest_amount'],
+                                v['principal_balance'], v['interest_balance'],
+                                v['principal_portion'], v['interest_portion'],
+                                v['previous_state'], v['is_edited'], import_id))
                             stats["ledger"] += 1
 
                     except sqlite3.OperationalError:
@@ -1973,9 +1980,17 @@ class DatabaseManager:
                                 continue
                             new_ind_id = id_map[old_ind_id]
 
+                            norm = import_rules.normalise_fund_row(sav)
+                            errors.extend(norm.warnings)
+                            if norm.rejected:
+                                errors.append(f"Skipped a savings row: {norm.reason}")
+                                stats["rejected"] += 1
+                                continue
+                            v = norm.values
+
                             self.funds.add_imported_savings(
-                                new_ind_id, sav['date'], sav['transaction_type'],
-                                sav['amount'], sav['balance'], sav['notes'], import_id)
+                                new_ind_id, v['date'], v['transaction_type'],
+                                v['amount'], v['balance'], v['notes'], import_id)
                             savings_affected_ids.add(new_ind_id)
                             stats["savings"] += 1
 

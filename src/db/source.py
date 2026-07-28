@@ -167,6 +167,22 @@ class SourceJournal:
         return [r["ref"] for r in self.conn.execute(
             "SELECT ref FROM loans WHERE individual_id=?", (member_id,))]
 
+    def min_ledger_date(self, member_id, loan_ref):
+        """Earliest *well-formed* ledger date for one loan.
+
+        The fallback when a loan in the source carries no start date. Restricted
+        to ISO-shaped dates: a plain ``MIN()`` over a column mixing
+        ``2026-01-01`` and ``01/02/2026`` returns the malformed one, because the
+        comparison is lexicographic.
+        """
+        if not self.has_table("ledger"):
+            return None
+        row = self.conn.execute(
+            "SELECT MIN(date) FROM ledger WHERE individual_id=? AND loan_id=? "
+            "AND date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'",
+            (member_id, loan_ref)).fetchone()
+        return row[0] if row else None
+
     def loans(self, member_ids):
         if not member_ids:
             return []
