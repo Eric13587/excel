@@ -23,36 +23,47 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-OUTPUT = os.path.join("docs", "db", "schema-current.sql")
+OUTPUT = os.path.join("src", "migrations", "schema_bootstrap.sql")
 
 HEADER = """\
 -- =============================================================================
--- LoanMaster — the schema a new journal is actually created with. GENERATED.
+-- LoanMaster — the schema a new journal is created with. GENERATED. DO NOT EDIT.
 -- =============================================================================
--- Do not edit. Regenerate with:
+-- Regenerate with:
 --
 --     python -m tools.dump_schema
 --
--- Produced by opening a fresh journal through DatabaseManager, so it reflects
--- create_tables followed by every migration in src/migrations/, in order. That
--- is what a new journal gets and what an old journal converges on.
+-- This file is both a reference and a load-bearing artefact: DatabaseManager
+-- applies it directly when creating a brand-new journal, instead of building
+-- the legacy table shapes and having migration 004 rebuild all fourteen of
+-- them (52% of the cost of creating a journal).
 --
--- schema.sql is the *annotated* reference — it explains why the constraints
--- exist and is worth reading first. This file is the authority on what is
--- there, and tests/test_schema_current.py fails if the two ever disagree with
--- reality.
+-- It is produced by taking the *legacy* path — create_tables followed by every
+-- migration in order — so it stays derived from the migrations rather than
+-- from itself. tests/test_schema_current.py regenerates it and fails if the
+-- committed copy is stale, and separately asserts that a journal built from
+-- this file is schema-identical to one built by migrating. That equality is
+-- the whole safety argument for the fast path.
+--
+-- schema.sql is the *annotated* reference: it explains why the constraints
+-- exist and is worth reading first. This is the authority on what is there.
 -- =============================================================================
 
 """
 
 
 def current_schema():
-    """The full DDL of a newly-created, fully-migrated journal."""
+    """The full DDL of a newly-created, fully-migrated journal.
+
+    Forces the legacy path — legacy bootstrap plus every migration — so the
+    generated file stays derived from the migrations. Without that this would
+    be circular: a new journal is built *from* this file.
+    """
     logging.disable(logging.CRITICAL)
     from src.database import DatabaseManager
 
     path = os.path.join(tempfile.mkdtemp(), "schema_probe.db")
-    db = DatabaseManager(path, auto_backup=False)
+    db = DatabaseManager(path, auto_backup=False, bootstrap="legacy")
     if not db.migration_report.ok:
         raise SystemExit(f"migrations did not apply cleanly: "
                          f"{db.migration_report.summary()}")

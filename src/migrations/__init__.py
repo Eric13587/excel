@@ -273,3 +273,37 @@ def _run_python_migration(path, conn):
     if not hasattr(module, "apply"):
         raise RuntimeError(f"{os.path.basename(path)} defines no apply(conn)")
     return module.apply(conn) or 0
+
+
+def mark_all_applied(conn):
+    """Record every migration on disk as applied, without running it.
+
+    For a journal created directly from ``schema_bootstrap.sql``: that file is
+    generated from the legacy path plus every migration, so by the time it has
+    been applied the migrations *have* run — just not one at a time. Recording
+    them keeps ``schema_version`` meaningful and stops them re-running on the
+    next open.
+
+    The equivalence this relies on is asserted by
+    ``tests/test_schema_current.py``, which builds a journal both ways and
+    compares the schemas.
+    """
+    report = MigrationReport()
+    try:
+        ensure_table(conn)
+        stamped = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        done = applied_versions(conn)
+        for version, name, _path in discover():
+            if version in done:
+                report.already_applied.append((version, name))
+                continue
+            conn.execute(
+                f"INSERT INTO {MIGRATION_TABLE} (version, name, applied_at, statements) "
+                f"VALUES (?, ?, ?, 0)", (version, name, stamped))
+            report.applied.append((version, name))
+        conn.commit()
+    except sqlite3.DatabaseError as e:
+        conn.rollback()
+        report.failed = (0, "schema_migrations", str(e))
+        logger.error("Could not record the bootstrap migrations: %s", e)
+    return report

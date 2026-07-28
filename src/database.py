@@ -84,7 +84,14 @@ class DatabaseManager:
     multi-statement operation is atomic.
     """
 
-    def __init__(self, db_name="loan_master.db", auto_backup=False):
+    def __init__(self, db_name="loan_master.db", auto_backup=False, bootstrap="auto"):
+        """Open (or create) a journal.
+
+        ``bootstrap`` controls how a brand-new journal is built. "auto" applies
+        the generated final schema directly; "legacy" forces the historical
+        path — legacy table shapes plus every migration — which is how
+        tools/dump_schema regenerates that schema without circularity.
+        """
         self.db_name = db_name
         pre_existing = db_name != ":memory:" and os.path.exists(db_name)
         self.conn = sqlite3.connect(db_name)
@@ -121,12 +128,19 @@ class DatabaseManager:
         self.audit = AuditRepository(self.conn)
         self.periods = PeriodRepository(self.conn)
         self.snapshots = SnapshotRepository(self.conn)
-        self.create_tables()
-        # Versioned migrations run after the legacy bootstrap, so a brand-new
-        # journal and an existing one converge on the same schema. Failure is
-        # reported, never fatal: a journal that cannot be migrated must still
-        # open so its data can be exported or repaired.
-        self.migration_report = migrations.apply_pending(self.conn)
+        if bootstrap == "auto" and self._is_empty_journal():
+            # A brand-new journal is built in its final shape. The legacy path
+            # below creates the pre-migration tables and then has migration 004
+            # rebuild all fourteen of them — 52% of the cost of creating a
+            # journal, spent undoing work that was just done.
+            self.migration_report = self._bootstrap_new_journal()
+        else:
+            self.create_tables()
+            # Versioned migrations run after the legacy bootstrap, so an
+            # existing journal converges on the same schema a new one is built
+            # with. Failure is reported, never fatal: a journal that cannot be
+            # migrated must still open so its data can be exported or repaired.
+            self.migration_report = migrations.apply_pending(self.conn)
         if not self.migration_report.ok:
             logger.error("Schema migration incomplete — %s", self.migration_report.summary())
         # Cascading deletes may have just become available, and a repaired
@@ -431,7 +445,11 @@ class DatabaseManager:
         journal that was fast at 2,000 ledger rows starts full-scanning at
         200,000. Best effort — never let it block a clean shutdown.
         """
-        if self.conn and not self._closed:
+        # getattr, not attribute access: if __init__ raised before setting
+        # these, __del__ still calls close(), and an AttributeError raised
+        # there is swallowed by the interpreter and printed as "Exception
+        # ignored" — burying the real failure under noise.
+        if getattr(self, "conn", None) and not getattr(self, "_closed", False):
             try:
                 self.conn.execute("PRAGMA optimize")
             except sqlite3.DatabaseError:
@@ -510,6 +528,75 @@ class DatabaseManager:
         except Exception:
             self.conn.rollback()
             raise
+
+    def _is_empty_journal(self):
+        """True when this connection holds no user tables at all.
+
+        File existence is not the test: several callers create the file with
+        tempfile.mkstemp and hand over an empty one, and an empty file is a new
+        journal however it came to exist.
+        """
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 0
+
+    def _bootstrap_new_journal(self):
+        """Create a new journal directly in its final shape.
+
+        Applies src/migrations/schema_bootstrap.sql — generated from the legacy
+        path plus every migration, and verified by tests to be schema-identical
+        to it — then records those migrations as applied, because they have
+        been, by construction.
+
+        Falls back to the legacy path if the file is missing or unusable. It is
+        an optimisation; being unable to read it must not stop a journal
+        opening.
+        """
+        path = os.path.join(migrations.migrations_dir(), "schema_bootstrap.sql")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                script = fh.read()
+            self.conn.executescript(script)
+            self.conn.commit()
+        except (OSError, sqlite3.DatabaseError) as e:
+            logger.warning("Could not bootstrap from %s (%s); using the legacy path",
+                           path, e)
+            self.conn.rollback()
+            self.create_tables()
+            return migrations.apply_pending(self.conn)
+
+        self._seed_reference_data(self.conn.cursor())
+        self.conn.commit()
+        return migrations.mark_all_applied(self.conn)
+
+    # Migrations that carry *data*, not schema. schema_bootstrap.sql is dumped
+    # from sqlite_master, so it holds DDL only; anything a migration inserts has
+    # to be applied separately when a journal takes the fast path. Getting this
+    # wrong gives a journal the right shape and the wrong contents, which is why
+    # test_a_new_journal_has_the_same_reference_data_as_a_migrated_one exists.
+    _SEED_MIGRATIONS = ("002_seed_default_settings.sql",)
+
+    def _seed_reference_data(self, cursor):
+        """Rows a journal is unusable without. Idempotent.
+
+        Shared by both bootstrap paths, so a new journal cannot end up with the
+        schema but not the chart of accounts or the default settings.
+        """
+        from src.config import DEFAULT_CHART_OF_ACCOUNTS
+        cursor.executemany(
+            "INSERT OR IGNORE INTO chart_of_accounts (code, name, type, normal_balance) "
+            "VALUES (?, ?, ?, ?)", DEFAULT_CHART_OF_ACCOUNTS)
+
+        for filename in self._SEED_MIGRATIONS:
+            path = os.path.join(migrations.migrations_dir(), filename)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    statements = migrations.split_statements(fh.read())
+            except OSError:
+                logger.warning("Seed migration %s is missing", filename)
+                continue
+            for statement in statements:
+                cursor.execute(statement)
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -872,11 +959,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_source ON journal_entries(source, source_ref)")
 
         # Seed the standard chart of accounts (idempotent — UNIQUE code + IGNORE).
-        from src.config import DEFAULT_CHART_OF_ACCOUNTS
-        cursor.executemany(
-            "INSERT OR IGNORE INTO chart_of_accounts (code, name, type, normal_balance) VALUES (?, ?, ?, ?)",
-            DEFAULT_CHART_OF_ACCOUNTS,
-        )
+        self._seed_reference_data(cursor)
 
         # Normalise a legacy corruption where an edited repayment stored the
         # payment AMOUNT in is_edited (e.g. 5857) instead of the flag 1. The

@@ -63,15 +63,24 @@ behavioural decision about how an edited repayment replays, not a schema tidy-up
 which is why it was documented rather than half-built. The integrity report
 counts the affected rows so the change can be sized before it is attempted.
 
-### B2. Build new journals from the migrations, not the legacy bootstrap
+### B2. Build new journals from the migrations — **done**
 
-`create_tables` still creates the pre-migration table shapes, which migration 004
-then rebuilds. Every new journal — including every test journal — therefore
-performs a full 14-table rebuild on creation. That is why the suite takes ~20 s
-instead of ~5 s.
+A new journal is now created directly from `src/migrations/schema_bootstrap.sql`
+instead of building the legacy shapes and having migration 004 rebuild all
+fourteen. Journal creation went 36.3 ms → 7.9 ms and the suite 20.3 s → 8.6 s.
 
-Creating new journals directly from the final shape would remove that. It is
-contained work with a clear payoff and no behavioural risk.
+The claim above that it carried "no behavioural risk" was wrong, and the work
+proved it: the bootstrap file is dumped from `sqlite_master`, so it is DDL only,
+and the first version recorded migration 002 as applied without ever inserting
+its default settings — right shape, wrong contents. Three tests caught it. There
+are now two guards, and the second is the one that matters:
+
+* `test_a_new_journal_matches_a_migrated_one_exactly` — schema equality;
+* `test_a_new_journal_has_the_same_reference_data_as_a_migrated_one` — row
+  equality in `settings` and `chart_of_accounts`.
+
+Any future migration that carries data must be added to
+`DatabaseManager._SEED_MIGRATIONS`; the second test fails if it is not.
 
 ---
 
@@ -79,8 +88,8 @@ contained work with a clear payoff and no behavioural risk.
 
 ### C1. Nothing is on `main`
 
-Phases 1–8 are 26+ commits on `phase1-safety-and-integrity`. `main` has not
-moved. Nothing described in `docs/db/phase-*.md` is on the default branch.
+**Merged.** `main` carries the whole project as of the merge commit
+"Merge: database architecture migration, Phases 1-8". Not pushed — see C3.
 
 ### C2. No fiscal period has been closed
 
@@ -101,10 +110,17 @@ the existing history is unchanged.
 
 ### C4. Backup files accumulating in the working directory
 
-Eighteen `loan_master.pre-*.db.bak` files, one per migration step, plus older
-ones from June. They are gitignored and each is a full copy of the journal. Safe
-to prune once the phases are accepted; the most recent per phase is the rollback
-point named in that phase's commit message.
+**Pruned.** Two are kept: `loan_master.pre-phase1-ops-20260728-030342.db.bak`
+(the journal before any of this work) and
+`loan_master.pre-phase8-20260728-162132.db.bak` (before the last migration).
+Both were verified readable before the other fifteen were deleted. 43 MB → 5.2 MB.
+
+A related gap was found while merging: `.gitignore` covered `*.db` and `*.bak`
+but not SQLite's sidecars, which are named `<database><suffix>` — so
+`loan_master.pre-phase8-….db.bak-shm` matched neither, and eighteen were
+committed. They held no member data (the `-wal` files were empty; the `-shm`
+files are page indexes, scanned against all 119 names with no hits). They are
+untracked now and the ignore rules cover `*-wal`, `*-shm` and `*.db-journal`.
 
 ---
 

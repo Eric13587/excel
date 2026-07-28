@@ -246,3 +246,12 @@ def test_delete_loan_is_atomic(journal):
         "SELECT COUNT(*) FROM ledger WHERE individual_id=?", (ind,)).fetchone()[0] == 1
     assert journal.conn.execute(
         "SELECT COUNT(*) FROM loans WHERE individual_id=?", (ind,)).fetchone()[0] == 1
+
+
+def test_a_manager_that_failed_to_open_can_still_be_collected():
+    """__del__ calls close(). If __init__ raised before setting self.conn, the
+    AttributeError from close() is swallowed and printed as 'Exception
+    ignored', burying the failure that actually mattered."""
+    mgr = DatabaseManager.__new__(DatabaseManager)   # never ran __init__
+    mgr.close()                                      # must not raise
+    mgr.__del__()
