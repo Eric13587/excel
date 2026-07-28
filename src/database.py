@@ -11,8 +11,9 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import (FundRepository, JournalRepository, LedgerRepository,
-                    LoanRepository, MemberRepository, SettingsRepository)
+from src.db import (FundRepository, ImportHistoryRepository, JournalRepository,
+                    LedgerRepository, LoanRepository, MemberRepository,
+                    RepairRepository, SettingsRepository, SourceJournal)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -80,6 +81,8 @@ class DatabaseManager:
         self.loans = LoanRepository(self.conn)
         self.ledger = LedgerRepository(self.conn)
         self.journal = JournalRepository(self.conn)
+        self.repair = RepairRepository(self.conn)
+        self.imports = ImportHistoryRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -315,18 +318,7 @@ class DatabaseManager:
 
     def _tables_with_individual_id(self):
         """All tables (except individuals) that carry an individual_id column."""
-        cur = self.conn.cursor()
-        tables = [r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()]
-        out = []
-        for t in tables:
-            if t == "individuals":
-                continue
-            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t})").fetchall()]
-            if "individual_id" in cols:
-                out.append(t)
-        return out
+        return self.repair.child_tables()
 
     def find_orphaned_rows(self):
         """Group child rows whose individual_id no longer exists.
@@ -339,18 +331,10 @@ class DatabaseManager:
         (dates are None for tables without a date column).
         """
         summary = []
-        cur = self.conn.cursor()
-        for t in self._tables_with_individual_id():
-            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t})").fetchall()]
-            date_expr = "MIN(o.date), MAX(o.date)" if "date" in cols else "NULL, NULL"
-            rows = cur.execute(
-                f"SELECT o.individual_id, COUNT(*), {date_expr} FROM {t} o "
-                f"LEFT JOIN individuals i ON i.id = o.individual_id "
-                f"WHERE i.id IS NULL GROUP BY o.individual_id "
-                f"ORDER BY o.individual_id").fetchall()
-            for ind_id, n, dmin, dmax in rows:
-                summary.append({"table": t, "individual_id": ind_id, "rows": n,
-                                "first_date": dmin, "last_date": dmax})
+        for table in self.repair.child_tables():
+            for ind_id, n, first, last in self.repair.orphan_groups(table):
+                summary.append({"table": table, "individual_id": ind_id, "rows": n,
+                                "first_date": first, "last_date": last})
         return summary
 
     def export_orphaned_rows(self, path):
@@ -366,13 +350,10 @@ class DatabaseManager:
             pd.DataFrame(summary, columns=["table", "individual_id", "rows",
                                            "first_date", "last_date"]) \
                 .to_excel(writer, sheet_name="Summary", index=False)
-            for t in self._tables_with_individual_id():
-                df = pd.read_sql_query(
-                    f"SELECT o.* FROM {t} o "
-                    f"LEFT JOIN individuals i ON i.id = o.individual_id "
-                    f"WHERE i.id IS NULL", self.conn)
+            for table in self.repair.child_tables():
+                df = self.repair.orphan_frame(table)
                 if not df.empty:
-                    df.to_excel(writer, sheet_name=t[:31], index=False)
+                    df.to_excel(writer, sheet_name=table[:31], index=False)
                     total += len(df)
         logger.info("Exported %d orphaned row(s) to %s", total, path)
         return total
@@ -381,19 +362,16 @@ class DatabaseManager:
         """Delete every orphaned row in a single transaction.
 
         Matches find_orphaned_rows() exactly (NULL individual_id included).
-        Afterwards the connection is re-configured, so FK enforcement
-        switches on immediately if the journal is now consistent.
+        Afterwards foreign-key enforcement is re-evaluated, so it switches on
+        immediately if the journal is now consistent.
         Returns {table: rows_deleted} for tables that had orphans.
         """
         counts = {}
         with self.transaction():
-            cur = self.conn.cursor()
-            for t in self._tables_with_individual_id():
-                cur.execute(
-                    f"DELETE FROM {t} WHERE individual_id IS NULL "
-                    f"OR individual_id NOT IN (SELECT id FROM individuals)")
-                if cur.rowcount:
-                    counts[t] = cur.rowcount
+            for table in self.repair.child_tables():
+                removed = self.repair.delete_orphans(table)
+                if removed:
+                    counts[table] = removed
         logger.info("Deleted orphaned rows: %s", counts or "none")
         self._evaluate_foreign_keys()
         return counts
@@ -1544,125 +1522,60 @@ class DatabaseManager:
         Connect to source DB and return list of individuals for preview.
         Returns: list of dicts [{'id': 1, 'name': '...', 'phone': '...', 'email': '...'}]
         """
-        import sqlite3
         try:
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            try:
-                src_cur.execute("SELECT id, name, phone, email FROM individuals ORDER BY name")
-                rows = src_cur.fetchall()
-                result = [dict(row) for row in rows]
-                src_conn.close()
-                return result
-            except sqlite3.OperationalError:
-                src_conn.close()
-                return None
+            with SourceJournal(source_db_path) as src:
+                return src.member_summaries()
         except Exception:
             return None
+
     def check_import_conflicts(self, source_db_path, selected_ids):
         """
         Check for potential duplicates between source and destination DBs.
-        
+
         Args:
             source_db_path: Path to source DB.
             selected_ids: List of source individual IDs to check.
-            
+
         Returns:
             List of conflict dicts:
             [
                 {
                     "src": {"id": 1, "name": "John", "phone": "123", "email": "a@b.com"},
                     "matches": [
-                        {"id": 5, "name": "john", "phone": "123", "email": "a@b.com", "reasons": ["Name", "Phone"]}
+                        {"id": 5, "name": "john", "phone": "123", "email": "a@b.com", "reason": "..."}
                     ]
                 }, ...
             ]
         """
-        import sqlite3
         conflicts = []
-        
         try:
-            # 1. Get Source Data
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            placeholders = ','.join(['?'] * len(selected_ids))
-            query = f"SELECT id, name, phone, email FROM individuals WHERE id IN ({placeholders})"
-            src_cur.execute(query, selected_ids)
-            src_inds = src_cur.fetchall()
-            src_conn.close()
-            
-            if not src_inds:
-                return []
-
-            # 2. Get Dest Data
-            # Use a local connection to ensure row_factory is set without affecting global state
-            dest_conn = sqlite3.connect(self.db_name)
-            dest_conn.row_factory = sqlite3.Row
-            dest_cur = dest_conn.cursor()
-            
-            try:
-                for src_ind in src_inds:
+            with SourceJournal(source_db_path) as src:
+                for src_ind in src.member_summaries(selected_ids):
                     matches = []
-                    
-                    # Check Name (Case-insensitive)
-                    dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE name LIKE ?", (src_ind['name'],))
-                    name_matches = dest_cur.fetchall()
-                    
-                    for m in name_matches:
-                        matches.append({
-                            "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
-                            "reason": "Name (Case-insensitive)"
-                        })
+                    seen = {}
 
-                    # Check Phone (if exists)
-                    if src_ind['phone']:
-                        # Simple check: exact string match
-                        dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE phone = ?", (src_ind['phone'],))
-                        phone_matches = dest_cur.fetchall()
-                        for m in phone_matches:
-                            # Avoid duplicates in matches list
-                            if not any(x['id'] == m['id'] for x in matches):
-                                matches.append({
-                                    "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
-                                    "reason": "Phone Match"
-                                })
-                            else:
-                                # Update reason if already matched by name
-                                for x in matches:
-                                    if x['id'] == m['id'] and "Phone" not in x['reason']:
-                                        x['reason'] += ", Phone Match"
+                    def note(candidates, reason, matches=matches, seen=seen):
+                        for m in candidates:
+                            if m["id"] in seen:
+                                if reason not in seen[m["id"]]["reason"]:
+                                    seen[m["id"]]["reason"] += f", {reason}"
+                                continue
+                            entry = {**m, "reason": reason}
+                            seen[m["id"]] = entry
+                            matches.append(entry)
 
-                    # Check Email (if exists)
-                    if src_ind['email']:
-                         dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE email LIKE ?", (src_ind['email'],))
-                         email_matches = dest_cur.fetchall()
-                         for m in email_matches:
-                            if not any(x['id'] == m['id'] for x in matches):
-                                matches.append({
-                                    "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
-                                    "reason": "Email Match"
-                                })
-                            else:
-                                 for x in matches:
-                                    if x['id'] == m['id'] and "Email" not in x['reason']:
-                                        x['reason'] += ", Email Match"
-                    
+                    note(self.members.match_by_name(src_ind["name"]),
+                         "Name (Case-insensitive)")
+                    if src_ind["phone"]:
+                        note(self.members.match_by_phone(src_ind["phone"]), "Phone Match")
+                    if src_ind["email"]:
+                        note(self.members.match_by_email(src_ind["email"]), "Email Match")
+
                     if matches:
-                        conflicts.append({
-                            "src": {"id": src_ind['id'], "name": src_ind['name'], "phone": src_ind['phone'], "email": src_ind['email']},
-                            "matches": matches
-                        })
-            finally:
-                dest_conn.close()
-                    
+                        conflicts.append({"src": src_ind, "matches": matches})
         except Exception:
             logger.exception("Error checking import conflicts")
             return []
-            
         return conflicts
 
     def generate_import_preview(self, source_db_path, selected_ids, options):
@@ -2314,52 +2227,28 @@ class DatabaseManager:
 
     def get_import_history(self):
         """Fetch all import history records."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, timestamp, source_file, details, item_count FROM import_history ORDER BY id DESC")
-        return [dict(zip(['id', 'timestamp', 'source_file', 'details', 'item_count'], row)) for row in cursor.fetchall()]
+        return self.imports.all()
 
     def undo_import(self, import_id):
         """
         Revert an import operation by deleting all records associated with the given import_id.
-        
+
+        Only rows the import *created* carry an import_id, so a member who
+        already existed and was merged into is never removed.
+
         Args:
             import_id (int): ID of the import batch to undo.
-            
+
         Returns:
             bool: True if successful, False otherwise.
         """
         if not import_id:
             return False
-            
         try:
-            cur = self.conn.cursor()
-            cur.execute("BEGIN")
-            
-            # Delete in reverse order of dependency
-            
-            # 1. Savings
-            cur.execute("DELETE FROM savings WHERE import_id = ?", (import_id,))
-            
-            # 2. Ledger
-            cur.execute("DELETE FROM ledger WHERE import_id = ?", (import_id,))
-            
-            # 3. Loans
-            cur.execute("DELETE FROM loans WHERE import_id = ?", (import_id,))
-            
-            # 4. Individuals
-            # Only delete individuals that were CREATED by this import (have import_id).
-            # Merged individuals will NOT be deleted (as they don't have this import_id, or we need to check).
-            # Note: We only set import_id on INSERT. So this is safe.
-            cur.execute("DELETE FROM individuals WHERE import_id = ?", (import_id,))
-            
-            # 5. Import History
-            cur.execute("DELETE FROM import_history WHERE id = ?", (import_id,))
-            
-            self.conn.commit()
+            with self.transaction():
+                self.imports.undo(import_id)
             return True
-            
         except Exception:
-            self.conn.rollback()
             logger.exception("Undo import error")
             return False
 
@@ -2368,43 +2257,7 @@ class DatabaseManager:
         Validates that the source file is a valid SQLite database and has the required schema.
         Returns: (is_valid, error_message)
         """
-        import os
-        if not os.path.exists(source_path):
-             return False, "File does not exist."
-             
-        # basic check for file size
-        if os.path.getsize(source_path) == 0:
-             return False, "File is empty."
-
-        conn = None
-        try:
-            conn = sqlite3.connect(source_path)
-            cursor = conn.cursor()
-            
-            # 1. Check if it's a valid SQLite DB (PRAGMA integrity_check is too slow, just try simple query)
-            try:
-                cursor.execute("SELECT name FROM sqlite_master LIMIT 1")
-            except sqlite3.DatabaseError:
-                return False, "File is not a valid SQLite database or is encrypted."
-                
-            # 2. Check for 'individuals' table (Critical)
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='individuals'")
-            if not cursor.fetchone():
-                return False, "Missing required table: 'individuals'."
-                
-            # 3. Check for 'name' column in individuals (Critical)
-            cursor.execute("PRAGMA table_info(individuals)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if 'name' not in columns:
-                return False, "Table 'individuals' missing required column: 'name'."
-                
-            return True, ""
-            
-        except Exception as e:
-            return False, f"Validation Error: {str(e)}"
-        finally:
-            if conn:
-                conn.close()
+        return SourceJournal.validate(source_path)
 
     # ==========================================
     # Treasury / General Ledger

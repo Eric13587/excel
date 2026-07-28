@@ -95,6 +95,41 @@ class MemberRepository(Repository):
                 f"SELECT name FROM individuals WHERE {column}=? AND id<>?", (value, exclude_id))
         return self._scalar(f"SELECT name FROM individuals WHERE {column}=?", (value,))
 
+    def names_to_ids(self):
+        """{name: id} for merge-by-exact-name during an import."""
+        return {name: member_id for name, member_id in
+                self._rows("SELECT name, id FROM individuals")}
+
+    def used_pf_numbers(self):
+        return {r[0] for r in self._rows(
+            "SELECT pf_no FROM individuals WHERE pf_no IS NOT NULL AND pf_no != ''")}
+
+    def used_id_numbers(self):
+        return {r[0] for r in self._rows(
+            "SELECT id_no FROM individuals WHERE id_no IS NOT NULL AND id_no != ''")}
+
+    def match_by_name(self, name):
+        """Candidate duplicates by name, for the import conflict scan.
+
+        Uses ``LIKE``, which is case-insensitive for ASCII but also treats ``%``
+        and ``_`` in the *supplied* name as wildcards — so a member named
+        ``O'Brien_J`` matches names nobody intended (finding D8).
+        :meth:`name_exists` answers the same question with
+        ``LOWER(name) = LOWER(?)``. Preserved as-is; converging them changes
+        which rows the importer flags as conflicts.
+        """
+        return self._dicts(
+            "SELECT id, name, phone, email FROM individuals WHERE name LIKE ?", (name,))
+
+    def match_by_phone(self, phone):
+        return self._dicts(
+            "SELECT id, name, phone, email FROM individuals WHERE phone = ?", (phone,))
+
+    def match_by_email(self, email):
+        """Also ``LIKE`` — same caveat as :meth:`match_by_name`."""
+        return self._dicts(
+            "SELECT id, name, phone, email FROM individuals WHERE email LIKE ?", (email,))
+
     def retired_date_of(self, member_id):
         return self._scalar("SELECT retired_date FROM individuals WHERE id=?", (member_id,))
 
