@@ -144,6 +144,12 @@ Thumbs.db
 *.db-wal
 *.db-shm
 *.bak
+# SQLite sidecars. The patterns above do not catch these: a WAL/SHM file
+# is named <database><suffix>, so `loan_master.db.bak-shm` ends in neither
+# .db nor .bak. Eighteen of them were committed before this was noticed.
+*-wal
+*-shm
+*.db-journal
 .gemini/
 *.xlsx
 updates.md
