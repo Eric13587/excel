@@ -7,9 +7,11 @@ existing ledger) and `tools/replay_loans.py` (the harness) exist and are tested.
 production code path uses the model yet** — the ledger remains the source of
 truth.
 
-**112 of 113 production loans reproduce exactly** from their own recovered
-history. The one that does not is loan 483, which has no disbursement row —
-a data problem, not a modelling one.
+**111 of 111 production loans reproduce exactly** from their own recovered
+history. The two that previously did not were data problems, not modelling
+ones, and both have since been fixed (see `outstanding.md` A1) — which is
+itself the strongest evidence for the approach: the replay found them, named
+them, and once the data was right the model accounted for every loan.
 
 ## The problem, precisely
 

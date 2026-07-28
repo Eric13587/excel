@@ -13,38 +13,36 @@ would have been guessing.
 These show as warnings in `python -m src.integrity loan_master.db`. None is a
 code defect; each is a fact about the journal that someone has to rule on.
 
-### A1. Two `Paid` loans carrying a balance — **diagnosed**
+### A1. Two `Paid` loans carrying a balance — **fixed 2026-07-28**
 
-Two loans are marked `Paid` but hold a non-zero balance, totalling **−113,778**.
-They have *different* causes, found while testing the suspension work:
+Both were resolved after the replay harness diagnosed them. Neither was what
+the warning suggested.
 
-**Loan 193, BRIAN ODHIAMBO, L-001 — balance −11,898.** Properly issued at
-100,000. The final row is a 95,833 settlement entered as a `Repayment` with
-`principal_portion = 95,233`, but only 83,335 of principal was still
-outstanding. The over-allocation is 11,898 — exactly the negative balance. It
-looks like a buy-off recorded as an ordinary repayment, so the split was
-computed against the installment rather than the payoff figure. Correcting the
-split on that one row clears it.
+**Loan 483, NANCY GATHOGO, L-002 — a duplicate, not a defective loan.** She had
+*two* loan records with identical principal (529,770), total (609,235.50),
+start date and next due date. L-001 carried the disbursement and ten payments
+of 11,496; L-002 had **no disbursement at all** and ten payments of 11,717
+across the very same months. It was a phantom record whose payments were never
+really taken — confirmed by the SACCO against payroll. Deleted (20 rows). Her
+real loan, L-001, is untouched at 429,810 outstanding.
 
-**Loan 483, NANCY GATHOGO, L-002 — balance −101,880. This is the serious one.**
-There is **no `Loan Issued` row at all**. Ten deductions of 10,188 principal
-each total 101,880 against a recorded disbursement of zero, which is precisely
-the negative balance. The loan record says `principal = 529,770`.
+**Loan 193, BRIAN ODHIAMBO, L-001 — a mis-entered settlement.** The loan was
+closed with a single row recording 95,833, but only 83,935 was owed at that
+point (83,335 principal + 600 interest). The 11,898 excess is exactly the
+negative balance. The figure was wrong, not the payment: corrected to 83,935
+and the loan now clears to exactly 0.00.
 
-So either the disbursement was never entered (and this member has roughly
-**427,890 genuinely outstanding while the system says `Paid`**), or the loan
-record is a stub that should not exist. Only the SACCO can say which — but this
-is not cosmetic, and it is the one to look at first.
+Also removed: a member literally named `test` (id 143) with a loan and 23
+ledger rows, created during testing.
 
-The general failure mode is worth naming: a loan whose ledger has no issue row
-has its balance driven negative by its own repayments and is then flipped to
-`Paid`. `src.integrity` now checks for both causes directly, not just the
-symptom — **loans record their disbursement** and **principal repaid stays
-within what was lent** — so each names the loan and the member, and a
-recurrence is caught rather than discovered.
+After all three, and a GL sync: **39 checks, 0 failures, 2 warnings**, GL 1100
+equals `loans.balance` exactly at 8,621,262.18, and
+`tools/replay_loans.py` reproduces **111 of 111 loans (100%)**.
 
-Swept across the whole journal when those checks were written: **exactly one
-loan each**, and both are the two above. No other loan is affected.
+Every change is in the audit trail with before-images (51 ledger deletions, 45
+ledger updates), visible under Mass Operations → Activity Log, and the journal
+was snapshotted first to
+`backups/loan_master.pre-fix-defective-loans-20260728-210245.db`.
 
 ### A2. Three loans with no recoverable duration
 
