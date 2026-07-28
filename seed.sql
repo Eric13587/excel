@@ -73,11 +73,9 @@ INSERT OR IGNORE INTO chart_of_accounts (code, name, type, normal_balance) VALUE
 
 -- -----------------------------------------------------------------------------
 -- 2. Default settings
---    NOTE: fy_start_month is seeded as 'January', matching the single default
---    in src/db/settings.py. The Settings dialog used to display 'November' when
---    the key was unset while reports computed on 'January'; unifying on the
---    value reports already used keeps every existing figure identical. Set it
---    explicitly in the app if the institution's year starts elsewhere.
+--    Applied to every journal by migration 002_seed_default_settings.sql, which
+--    is the authority. Kept here so a hand-built journal gets them too; the two
+--    lists must stay identical.
 -- -----------------------------------------------------------------------------
 INSERT OR IGNORE INTO settings (key, value) VALUES
     ('org_name',                    ''),          -- branding: organisation name

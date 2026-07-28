@@ -33,12 +33,18 @@ def test_get_returns_stored_value(journal):
     assert journal.settings.get("app_theme") == "Dark"
 
 
-def test_get_falls_back_to_the_explicit_default_first(journal):
-    """An explicit default must still win, so no existing caller changes."""
-    assert journal.settings.get("app_theme", "Caller Wins") == "Caller Wins"
+def test_stored_value_beats_an_explicit_default(journal):
+    """Migration 002 seeds every known key, so the row wins over any fallback."""
+    assert journal.settings.get("app_theme", "Caller Wins") == "Light"
+
+
+def test_get_falls_back_to_the_explicit_default_when_absent(journal):
+    """An explicit default still wins for a key that has no row."""
+    assert journal.settings.get("unseeded_key", "Caller Wins") == "Caller Wins"
 
 
 def test_get_falls_back_to_the_module_default(journal):
+    journal.conn.execute("DELETE FROM settings WHERE key='app_theme'")
     assert journal.settings.get("app_theme") == "Light"
 
 
@@ -57,11 +63,19 @@ def test_set_stringifies(journal):
     assert journal.settings.get("christmas_unlock_month") == "6"
 
 
-def test_all_returns_only_stored_pairs(journal):
-    journal.settings.set("app_theme", "Dark")
+def test_all_returns_stored_pairs(journal):
+    journal.set_setting("app_theme", "Dark")
     stored = journal.settings.all()
     assert stored["app_theme"] == "Dark"
-    assert "christmas_unlock_month" not in stored     # defaults are not rows
+    # Migration 002 seeds every known key, so the effective configuration is
+    # visible in the journal rather than implied by code.
+    assert set(stored) == set(settings_module.DEFAULTS)
+
+
+def test_migration_002_seeds_every_known_key(journal):
+    stored = journal.settings.all()
+    for key, default in settings_module.DEFAULTS.items():
+        assert stored[key] == default, f"{key} seeded as {stored.get(key)!r}"
 
 
 def test_database_manager_still_delegates(journal):

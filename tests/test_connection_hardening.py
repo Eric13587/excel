@@ -185,3 +185,31 @@ def test_auto_backup_writes_into_backups_dir():
         assert any(f.startswith("auto.") and f.endswith(".db") for f in backups)
     finally:
         db.close()
+
+
+def test_delete_loan_is_atomic(journal):
+    """Same class of bug as delete_individual: two statements, one commit."""
+    ind = journal.add_individual("Borrower", "0700", "b@x.com")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, balance, status, start_date) "
+                "VALUES (?, 'L-001', 1000, 1000, 'Active', '2026-01-01')", (ind,))
+    loan_pk = cur.lastrowid
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, balance) "
+                "VALUES (?, '2026-01-01', 'Loan Issued', 'L-001', 1000, 1000)", (ind,))
+    cur.execute("INSERT INTO loan_suspensions (loan_id, individual_id, loan_ref, start_date, status) "
+                "VALUES (?, ?, 'L-001', '2026-02-01', 'active')", (loan_pk, ind))
+    journal.conn.commit()
+
+    # Simulate a pre-migration journal, where nothing clears the suspension.
+    journal.conn.execute("DROP TRIGGER IF EXISTS trg_cascade_loan_delete")
+    journal.conn.commit()
+    journal.conn.execute("PRAGMA foreign_keys = ON")
+
+    with pytest.raises(TransactionError):
+        journal.delete_loan(ind, "L-001")
+    journal.set_setting("unrelated", "1")        # must not commit a half-delete
+
+    assert journal.conn.execute(
+        "SELECT COUNT(*) FROM ledger WHERE individual_id=?", (ind,)).fetchone()[0] == 1
+    assert journal.conn.execute(
+        "SELECT COUNT(*) FROM loans WHERE individual_id=?", (ind,)).fetchone()[0] == 1

@@ -1356,10 +1356,21 @@ class DatabaseManager:
         self.conn.commit()
 
     def delete_loan(self, individual_id, loan_ref):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=?", (individual_id, loan_ref))
-        cursor.execute("DELETE FROM loans WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
-        self.conn.commit()
+        """Delete a loan and its transactions as a single atomic operation.
+
+        Same shape as the delete_individual bug fixed in Phase 1a: two
+        statements with one trailing commit, so a failure on the second (a
+        suspension row still referencing the loan on a pre-migration journal,
+        say) left the ledger delete pending, to be committed by the next
+        unrelated write. Scoped by individual_id because loan refs are unique
+        per member only.
+        """
+        with self.transaction():
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=?",
+                           (individual_id, loan_ref))
+            cursor.execute("DELETE FROM loans WHERE individual_id=? AND ref=?",
+                           (individual_id, loan_ref))
 
     # ========== LOAN SUSPENSION OPERATIONS ==========
 

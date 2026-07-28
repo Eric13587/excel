@@ -993,7 +993,8 @@ class Dashboard(QWidget):
 
     def open_settings(self):
         """Open settings dialog (Organization / Financial / Appearance)."""
-        from PyQt6.QtWidgets import QComboBox, QDialogButtonBox, QGroupBox
+        from PyQt6.QtWidgets import (QComboBox, QDialogButtonBox, QDoubleSpinBox,
+                                     QGroupBox)
         from src import branding
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
@@ -1046,6 +1047,37 @@ class Dashboard(QWidget):
         fin_form.addRow(deduct_cb)
         outer.addWidget(fin_box)
 
+        # --- Funds ---
+        # These three were readable by the code but had no UI, so the only way
+        # to change them was to edit the settings table by hand.
+        fund_box = QGroupBox("Funds")
+        fund_form = QFormLayout(fund_box)
+
+        unlock_combo = QComboBox()
+        unlock_combo.addItems(months)
+        unlock_idx = self.db.settings.christmas_unlock_month
+        if 1 <= unlock_idx <= 12:
+            unlock_combo.setCurrentIndex(unlock_idx - 1)
+        fund_form.addRow("Christmas Withdrawal Month:", unlock_combo)
+
+        savings_inc = QDoubleSpinBox()
+        savings_inc.setRange(0, 10_000_000)
+        savings_inc.setDecimals(2)
+        savings_inc.setGroupSeparatorShown(True)
+        savings_inc.setValue(self.db.settings.default_savings_increment)
+        fund_form.addRow("Default Monthly Savings:", savings_inc)
+
+        xmas_inc = QDoubleSpinBox()
+        xmas_inc.setRange(0, 10_000_000)
+        xmas_inc.setDecimals(2)
+        xmas_inc.setGroupSeparatorShown(True)
+        xmas_inc.setValue(self.db.settings.default_christmas_increment)
+        fund_form.addRow("Default Monthly Christmas:", xmas_inc)
+
+        fund_form.addRow(QLabel("<small>Defaults used when a member has no "
+                                "contribution history to infer an amount from.</small>"))
+        outer.addWidget(fund_box)
+
         # --- Appearance ---
         app_box = QGroupBox("Appearance")
         app_form = QFormLayout(app_box)
@@ -1066,6 +1098,9 @@ class Dashboard(QWidget):
             self.db.set_setting("fy_start_month", fy_combo.currentText())
             self.db.set_setting("deduct_same_month",
                                 "true" if deduct_cb.isChecked() else "false")
+            self.db.set_setting("christmas_unlock_month", unlock_combo.currentIndex() + 1)
+            self.db.set_setting("default_savings_increment", savings_inc.value())
+            self.db.set_setting("default_christmas_increment", xmas_inc.value())
 
             # Reflect the organization name in the window title immediately.
             main_win = self.window()
