@@ -2126,6 +2126,31 @@ class Dashboard(QWidget):
         else:
             QMessageBox.critical(self, "Members List", f"Export failed:\n{msg}")
 
+    @staticmethod
+    def _format_before_image(raw):
+        """Render an audit before-image as a short, readable line.
+
+        Stored as JSON by the triggers so it survives any schema change; shown
+        as `date 2026-01-15, deducted 5,750` rather than raw JSON, with the
+        full record on the tooltip.
+        """
+        if not raw:
+            return ""
+        import json
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return str(raw)
+        skip = {"individual_id"}
+        parts = []
+        for key, value in data.items():
+            if key in skip or value in (None, 0, 0.0, ""):
+                continue
+            if isinstance(value, float):
+                value = f"{value:,.2f}"
+            parts.append(f"{key.replace('_', ' ')} {value}")
+        return ", ".join(parts)
+
     def show_activity_log(self):
         """View the CRUD audit trail (member/loan create/update/delete with dates)."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
@@ -2137,8 +2162,9 @@ class Dashboard(QWidget):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel(f"Most recent {len(entries)} create/update/delete events:"))
         table = QTableWidget()
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["When", "Operation", "Type", "Who / What"])
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(
+            ["When", "Operation", "Type", "Who / What", "Previous values"])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setRowCount(len(entries))
@@ -2147,6 +2173,12 @@ class Dashboard(QWidget):
             table.setItem(i, 1, QTableWidgetItem(e["operation"]))
             table.setItem(i, 2, QTableWidgetItem(e["entity"]))
             table.setItem(i, 3, QTableWidgetItem(str(e["summary"] or "")))
+            # The before-image recorded by the migration-007 triggers. Without
+            # it the log answers "this was changed" but never "from what?",
+            # which is the only question worth asking about a money row.
+            before = QTableWidgetItem(self._format_before_image(e.get("before_image")))
+            before.setToolTip(str(e.get("before_image") or ""))
+            table.setItem(i, 4, before)
         layout.addWidget(table)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)

@@ -151,6 +151,37 @@ untracked now and the ignore rules cover `*-wal`, `*-shm` and `*.db-journal`.
 
 ---
 
+### C5. UI/UX review — first pass done
+
+A review of the interface found the gaps below. The first five are fixed; the
+rest are recorded rather than done.
+
+**Fixed:**
+
+* Recorded suspensions had no route out of the application, and the schedule
+  rebuild understated what it deletes. See the commit "Give recorded suspensions
+  a way out".
+* The 35 integrity checks are now a screen — Treasury → **Health Check** —
+  instead of a message box telling a clerk to run `python -m src.integrity`.
+  The startup warning offers to open it.
+* Member and loan deletion state what will be removed, count it, and take a
+  snapshot first, aborting if the snapshot cannot be written.
+* The Activity Log shows the before-image recorded by migration 007, so it
+  answers "changed from what?" rather than only "changed".
+
+**Still open:**
+
+* **Undo remains narrow.** It covers mass catch-ups and imports. Deleting a
+  member or loan is now *recoverable* (a snapshot) but not *undoable* (no
+  in-app restore). `retire_individual`, `rebuild_loan_schedule` and
+  `delete_orphaned_rows` have neither.
+* **Four swallowed exceptions** in `src/views/dashboard.py` (lines ~200, 576,
+  1639, 2124) do `except Exception: pass`. One is the "open the exported file"
+  path, so a failed export looks like a successful one.
+* **No in-app restore.** Snapshots land in `backups/` and the user is told the
+  path; opening one means finding it on disk. A "restore from backup" screen
+  would close the loop.
+
 ## D. Why Phase 9 was dropped
 
 The plan's ninth phase was converting money from `REAL` floats to integer cents.

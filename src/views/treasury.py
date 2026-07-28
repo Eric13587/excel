@@ -117,6 +117,13 @@ class TreasuryDialog(QDialog):
             "activity. Manual entries are not affected.")
         self.btn_rebuild.clicked.connect(self.rebuild_ledger)
         btn_layout.addWidget(self.btn_rebuild)
+        # 35 integrity checks existed but only ever ran from a terminal; the
+        # application used one of them, as a yes/no, at startup.
+        self.btn_health = QPushButton("Health Check")
+        self.btn_health.setToolTip(
+            "Run every consistency check on this journal and show the results")
+        self.btn_health.clicked.connect(self.show_health_check)
+        btn_layout.addWidget(self.btn_health)
         btn_layout.addStretch()
         self.btn_close = QPushButton("Close")
         self.btn_close.clicked.connect(self.accept)
@@ -701,6 +708,11 @@ class TreasuryDialog(QDialog):
             QHeaderView::section {{ background-color: {t.get_color('bg_header')}; color: {t.get_color('text_secondary')}; font-weight: bold; padding: 4px; border: none; border-right: 1px solid {t.get_color('border')}; }}
             QLineEdit, QComboBox, QDateEdit {{ background-color: {t.get_color('input_bg')}; border: 1px solid {t.get_color('border')}; padding: 6px; border-radius: 4px; color: {t.get_color('text_primary')}; }}
         """)
+
+    def show_health_check(self):
+        """Open the full integrity report."""
+        from src.views.integrity_report import IntegrityReportDialog
+        IntegrityReportDialog(self.db, self.theme_manager, self).exec()
 
     def rebuild_ledger(self):
         """Re-derive every projected journal from the member subledgers.

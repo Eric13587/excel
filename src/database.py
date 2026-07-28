@@ -1116,6 +1116,51 @@ class DatabaseManager:
         with self.transaction():
             self.members.set_default_deduction(id, amount)
 
+    def snapshot(self, tag):
+        """Back the journal up before an irreversible change. Returns the path.
+
+        Deletion cascades since migration 004 — removing a member removes their
+        ledger, savings, both funds, enrolments and suspensions with them, which
+        is right for integrity and unforgiving of a mis-click. A snapshot turns
+        that from unrecoverable into a restore.
+
+        Raises OSError or sqlite3.Error if it cannot be written; callers must
+        decide whether to proceed, and the UI does not.
+        """
+        if not self.db_name or self.db_name == ":memory:":
+            return None
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.db_name)), "backups")
+        stem = os.path.splitext(os.path.basename(self.db_name))[0]
+        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(tag))[:60]
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(
+            folder, f"{stem}.pre-{safe}-{datetime.now():%Y%m%d-%H%M%S}.db")
+        return self.backup_to(dest)
+
+    def member_record_counts(self, individual_id):
+        """What deleting this member would remove, per table.
+
+        Only non-empty tables, so a confirmation can state the real cost rather
+        than "and all their records".
+        """
+        counts = {}
+        for table, label in (("ledger", "loan ledger entries"),
+                             ("loans", "loans"),
+                             ("savings", "savings transactions"),
+                             ("christmas_savings", "Christmas savings entries"),
+                             ("benevolent_ledger", "benevolent entries"),
+                             ("benevolent_accounts", "benevolent enrolments"),
+                             ("loan_suspensions", "suspension records")):
+            try:
+                n = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE individual_id=?",
+                    (individual_id,)).fetchone()[0]
+            except sqlite3.OperationalError:
+                continue
+            if n:
+                counts[label] = n
+        return counts
+
     def delete_individual(self, id):
         """Delete a member and their records as a single atomic operation.
 

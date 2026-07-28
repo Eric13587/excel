@@ -1249,25 +1249,13 @@ class LedgerView(QWidget):
     def _backup_before(self, what, loan_ref):
         """Snapshot the journal before an irreversible operation.
 
-        Returns the path, or None if it could not be written — a failed backup
-        is reported but does not block the operation the user asked for. Uses
-        the online-backup API, so it is safe under WAL where a file copy would
-        silently miss uncheckpointed transactions.
+        Returns the path, or False if it could not be written — in which case
+        the caller must abort, because the point of the snapshot is that the
+        operation is otherwise unrecoverable.
         """
-        import os
-        from datetime import datetime as _dt
-        db_path = self.engine.db.db_name
-        if not db_path or db_path == ":memory:":
-            return None
-        folder = os.path.join(os.path.dirname(os.path.abspath(db_path)), "backups")
-        stem = os.path.splitext(os.path.basename(db_path))[0]
-        safe_ref = "".join(c for c in str(loan_ref) if c.isalnum() or c in "-_")
-        dest = os.path.join(
-            folder, f"{stem}.pre-{what}-{safe_ref}-{_dt.now():%Y%m%d-%H%M%S}.db")
         try:
-            os.makedirs(folder, exist_ok=True)
-            return self.engine.db.backup_to(dest)
-        except Exception as e:                      # noqa: BLE001 - never block the user
+            return self.engine.db.snapshot(f"{what}-{loan_ref}")
+        except Exception as e:                      # noqa: BLE001 - report, don't crash
             logger.warning("Could not back up before %s: %s", what, e)
             QMessageBox.warning(
                 self, "Backup Failed",
@@ -1608,13 +1596,37 @@ class LedgerView(QWidget):
             QMessageBox.warning(self, "Warning", "Could not process deduction.")
 
     def delete_loan_btn(self, loan_ref):
-        confirm = QMessageBox.question(self, "Confirm Delete", 
-                                       f"Delete loan {loan_ref} and ALL its history?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if confirm == QMessageBox.StandardButton.Yes:
-            self.engine.delete_loan(self.current_individual_id, loan_ref)
-            self.refresh_table()
-            self.refresh_loans_list()
+        ind = self.current_individual_id
+        entries = self.engine.db.ledger.count_events(
+            ind, loan_ref, ("Loan Issued", "Loan Top-Up", "Interest Earned",
+                            "Repayment", "Loan Buyoff"))
+        loan = self.engine.db.get_loan_by_ref(ind, loan_ref)
+        outstanding = float((loan or {}).get("balance") or 0)
+
+        confirm = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Permanently delete loan {loan_ref} and all {entries} of its ledger "
+            f"entries?\n\n"
+            + (f"This loan still shows {outstanding:,.2f} outstanding.\n\n"
+               if abs(outstanding) > 0.005 else "")
+            + "The member's other loans and savings are not affected. This cannot "
+              "be undone; a backup is saved first.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        backup = self._backup_before("delete-loan", loan_ref)
+        if backup is False:
+            return                              # backup failed; the user was told
+        self.engine.delete_loan(ind, loan_ref)
+        self.refresh_table()
+        self.refresh_loans_list()
+        if backup:
+            QMessageBox.information(
+                self, "Loan Deleted",
+                f"Loan {loan_ref} and its {entries} entries were deleted.\n\n"
+                f"A backup was saved to:\n{backup}")
 
 
 

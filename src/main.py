@@ -107,12 +107,17 @@ class MainApp(QMainWindow):
         # migration runs, keeping the last few copies.
         self.db = DatabaseManager(db_path, auto_backup=True)
         if not self.db.integrity_ok:
-            QMessageBox.warning(
+            answer = QMessageBox.warning(
                 self, "Database Warning",
                 "The integrity check on this journal reported problems.\n\n"
                 "The journal was still opened so you can export your data, "
                 "but you should restore a recent backup from the 'backups' "
-                "folder next to the journal file as soon as possible.")
+                "folder next to the journal file as soon as possible.\n\n"
+                "Would you like to see what was found?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.show_health_check()
         # A migration that could not be applied leaves the journal on an older
         # schema — usable, but without cascading deletes or the new indexes.
         # Silent degradation is exactly what we must not do with a financial
@@ -123,9 +128,9 @@ class MainApp(QMainWindow):
                 f"This journal could not be brought fully up to date:\n\n"
                 f"{self.db.migration_report.summary()}\n\n"
                 "It has been opened on its existing schema and is safe to use, "
-                "but some integrity protections are not active. Run\n"
-                f"    python -m src.integrity \"{db_path}\"\n"
-                "for details, or use the Repair tools under Mass Operations.")
+                "but some integrity protections are not active.\n\n"
+                "Treasury \u2192 Health Check shows the details, and the Repair "
+                "tools under Mass Operations can fix most causes.")
 
         # Live general-ledger posting: member loan/savings activity posts to the
         # double-entry GL the moment it is written. Idempotent and defensive, so
@@ -217,6 +222,16 @@ class MainApp(QMainWindow):
                         self.ledger_view.refresh_ledger()
             else:
                 QMessageBox.information(self, "Redo", "Nothing to redo.")
+
+    def show_health_check(self):
+        """Open the full journal integrity report.
+
+        Reachable from the startup warning and from Treasury, so the 35 checks
+        are usable without a terminal.
+        """
+        from src.theme import ThemeManager
+        from src.views.integrity_report import IntegrityReportDialog
+        IntegrityReportDialog(self.db, ThemeManager(self.db), self).exec()
 
     def show_dashboard(self):
         self.dashboard.refresh_list()
