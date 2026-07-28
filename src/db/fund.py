@@ -89,6 +89,18 @@ class FundRepository(Repository):
             f"SELECT individual_id, MIN(date) FROM {t} WHERE batch_id=? GROUP BY individual_id",
             (batch_id,))
 
+    def gl_projection_rows(self, table):
+        """(id, date, transaction_type, amount) in posting order, for the GL."""
+        t = self._table(table)
+        return self._rows(
+            f"SELECT id, date, transaction_type, amount FROM {t} ORDER BY date, id")
+
+    def gl_projection_row(self, table, row_id):
+        """The same projection columns for one row (the live write-path hook)."""
+        t = self._table(table)
+        return self._row(
+            f"SELECT date, transaction_type, amount FROM {t} WHERE id=?", (row_id,))
+
     # -- writes ----------------------------------------------------------- #
 
     def add(self, table, member_id, date, transaction_type, amount, balance,

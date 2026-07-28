@@ -10,6 +10,7 @@ the suite stays green at every step. Repositories added so far:
 
 * :class:`~src.db.fund.FundRepository` — ``savings``, ``christmas_savings``,
   ``benevolent_ledger`` and ``benevolent_accounts``.
+* :class:`~src.db.journal.JournalRepository` — the double-entry general ledger.
 * :class:`~src.db.ledger.LedgerRepository` — the ``ledger`` subledger.
 * :class:`~src.db.loan.LoanRepository` — ``loans`` and ``loan_suspensions``.
 * :class:`~src.db.member.MemberRepository` — the ``individuals`` table.
@@ -19,10 +20,12 @@ See docs/db/repository-layer.md for the full sequencing.
 """
 from src.db.base import Repository
 from src.db.fund import FundRepository
+from src.db.journal import JournalRepository
 from src.db.ledger import LedgerRepository
 from src.db.loan import LoanRepository
 from src.db.member import MemberRepository
 from src.db.settings import SettingsRepository
 
-__all__ = ["FundRepository", "LedgerRepository", "LoanRepository",
-           "MemberRepository", "Repository", "SettingsRepository"]
+__all__ = ["FundRepository", "JournalRepository", "LedgerRepository",
+           "LoanRepository", "MemberRepository", "Repository",
+           "SettingsRepository"]

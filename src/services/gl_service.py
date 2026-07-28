@@ -64,21 +64,12 @@ class GLService:
     # ------------------------------------------------------------------ #
     def _valid_codes(self):
         if self._account_codes is None:
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT code FROM chart_of_accounts")
-            self._account_codes = {r[0] for r in cur.fetchall()}
+            self._account_codes = self.db.journal.account_codes()
         return self._account_codes
 
     def get_accounts(self, active_only=True):
         """Return the chart of accounts as a list of dicts."""
-        cur = self.db.conn.cursor()
-        q = "SELECT code, name, type, normal_balance, is_active, description FROM chart_of_accounts"
-        if active_only:
-            q += " WHERE is_active = 1"
-        q += " ORDER BY code"
-        cur.execute(q)
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return self.db.journal.accounts(active_only)
 
     # ------------------------------------------------------------------ #
     # Posting
@@ -134,19 +125,11 @@ class GLService:
         if abs(round(total_debit - total_credit, 2)) > _BALANCE_TOLERANCE:
             raise UnbalancedJournalError(total_debit, total_credit)
 
-        cur = self.db.conn.cursor()
-        cur.execute(
-            """INSERT INTO journal_entries
-                   (entry_date, memo, source, source_ref, status, created_at, created_by)
-               VALUES (?, ?, ?, ?, 'posted', ?, ?)""",
-            (entry_date, memo, source, source_ref,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by),
-        )
-        entry_id = cur.lastrowid
-        cur.executemany(
-            "INSERT INTO journal_lines (entry_id, account_code, debit, credit, line_memo) VALUES (?, ?, ?, ?, ?)",
-            [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm],
-        )
+        entry_id = self.db.journal.add_entry(
+            entry_date, memo, source, source_ref,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by)
+        self.db.journal.add_lines(
+            [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm])
         self._maybe_commit()
         return entry_id
 
@@ -156,13 +139,10 @@ class GLService:
         Corrections never edit or delete a posted entry; they post the inverse.
         Both entries remain in the ledger and net to zero.
         """
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT entry_date, memo FROM journal_entries WHERE id=?", (entry_id,))
-        head = cur.fetchone()
+        head = self.db.journal.entry_header(entry_id)
         if not head:
             raise ValueError(f"Journal entry {entry_id} not found.")
-        cur.execute("SELECT account_code, debit, credit FROM journal_lines WHERE entry_id=?", (entry_id,))
-        orig_lines = cur.fetchall()
+        orig_lines = self.db.journal.entry_lines(entry_id)
 
         rev_lines = [{'account': code, 'debit': credit, 'credit': debit}
                      for (code, debit, credit) in orig_lines]
@@ -172,25 +152,16 @@ class GLService:
             memo=memo or f"Reversal of entry #{entry_id}",
             source="reversal",
         )
-        cur.execute("UPDATE journal_entries SET status='reversed' WHERE id=?", (entry_id,))
-        cur.execute("UPDATE journal_entries SET status='reversal', reversal_of=? WHERE id=?",
-                    (entry_id, reversal_id))
+        self.db.journal.mark_reversed(entry_id)
+        self.db.journal.mark_reversal(reversal_id, entry_id)
         self.db.conn.commit()
         return reversal_id
 
     def _find_entry(self, source, source_ref):
-        cur = self.db.conn.cursor()
-        cur.execute(
-            "SELECT id FROM journal_entries WHERE source=? AND source_ref=? LIMIT 1",
-            (source, source_ref),
-        )
-        row = cur.fetchone()
-        return row[0] if row else None
+        return self.db.journal.find_by_source_ref(source, source_ref)
 
     def _entry_count(self):
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM journal_entries")
-        return cur.fetchone()[0]
+        return self.db.journal.entry_count()
 
     # ------------------------------------------------------------------ #
     # Balances & trial balance
@@ -201,20 +172,8 @@ class GLService:
         Debit-normal accounts are positive when debit-heavy; credit-normal
         accounts are positive when credit-heavy.
         """
-        cur = self.db.conn.cursor()
-        q = ("SELECT COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) "
-             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
-             "WHERE l.account_code = ?")
-        params = [account_code]
-        if as_of:
-            q += " AND e.entry_date <= ?"
-            params.append(as_of)
-        cur.execute(q, params)
-        debit_minus_credit = cur.fetchone()[0] or 0.0
-
-        cur.execute("SELECT normal_balance FROM chart_of_accounts WHERE code=?", (account_code,))
-        row = cur.fetchone()
-        normal = row[0] if row else 'debit'
+        debit_minus_credit = self.db.journal.account_net(account_code, as_of)
+        normal = self.db.journal.normal_balance(account_code) or 'debit'
         signed = debit_minus_credit if normal == 'debit' else -debit_minus_credit
         return round(signed, 2)
 
@@ -226,23 +185,10 @@ class GLService:
         and credit columns must be equal — that equality is the proof the ledger
         is internally consistent.
         """
-        cur = self.db.conn.cursor()
-        q = ("SELECT a.code, a.name, a.type, "
-             "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
-             "FROM chart_of_accounts a "
-             "LEFT JOIN journal_lines l ON l.account_code = a.code "
-             "LEFT JOIN journal_entries e ON l.entry_id = e.id")
-        params = []
-        if as_of:
-            q += " AND e.entry_date <= ?"
-            params.append(as_of)
-        q += " GROUP BY a.code, a.name, a.type ORDER BY a.code"
-        cur.execute(q, params)
-
         rows = []
         total_debit = 0.0
         total_credit = 0.0
-        for code, name, typ, net in cur.fetchall():
+        for code, name, typ, net in self.db.journal.trial_balance_rows(as_of):
             net = round(net or 0.0, 2)
             if abs(net) < 0.005:
                 continue  # skip accounts with no balance
@@ -267,25 +213,8 @@ class GLService:
         returned positive when the account sits on its normal side. Accounts
         netting to zero in the range are omitted.
         """
-        cur = self.db.conn.cursor()
-        q = ("SELECT a.code, a.name, "
-             "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
-             "FROM chart_of_accounts a "
-             "LEFT JOIN journal_lines l ON l.account_code = a.code "
-             "LEFT JOIN journal_entries e ON l.entry_id = e.id "
-             "WHERE a.type = ?")
-        params = [acct_type]
-        if start_date:
-            q += " AND e.entry_date >= ?"
-            params.append(start_date)
-        if end_date:
-            q += " AND e.entry_date <= ?"
-            params.append(end_date)
-        q += " GROUP BY a.code, a.name ORDER BY a.code"
-        cur.execute(q, params)
-
         lines = []
-        for code, name, net in cur.fetchall():
+        for code, name, net in self.db.journal.statement_rows(acct_type, start_date, end_date):
             net = round(net or 0.0, 2)
             amount = net if positive_side == 'debit' else -net
             amount = round(amount, 2)
@@ -366,33 +295,12 @@ class GLService:
         subtotals sum to the change in the cash account, so opening + net change
         == closing cash by construction.
         """
-        cur = self.db.conn.cursor()
-
-        if start_date:
-            cur.execute(
-                "SELECT COALESCE(SUM(l.debit - l.credit),0) FROM journal_lines l "
-                "JOIN journal_entries e ON l.entry_id = e.id "
-                "WHERE l.account_code = ? AND e.entry_date < ?",
-                (GL_CASH, start_date))
-            opening = round(cur.fetchone()[0] or 0.0, 2)
-        else:
-            opening = 0.0
-
-        q = ("SELECT l.account_code, a.name, l.debit, l.credit "
-             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
-             "JOIN chart_of_accounts a ON a.code = l.account_code "
-             "WHERE l.account_code != ?")
-        params = [GL_CASH]
-        if start_date:
-            q += " AND e.entry_date >= ?"
-            params.append(start_date)
-        if end_date:
-            q += " AND e.entry_date <= ?"
-            params.append(end_date)
-        cur.execute(q, params)
+        opening = (round(self.db.journal.cash_before(GL_CASH, start_date), 2)
+                   if start_date else 0.0)
 
         cats = {'Operating': {}, 'Lending to members': {}, 'Financing': {}}
-        for code, name, debit, credit in cur.fetchall():
+        for code, name, debit, credit in self.db.journal.counterpart_lines(
+                GL_CASH, start_date, end_date):
             contrib = round((credit or 0.0) - (debit or 0.0), 2)  # +ve = cash in
             if contrib == 0:
                 continue
@@ -422,37 +330,16 @@ class GLService:
     # ------------------------------------------------------------------ #
     def get_journal_entries(self, limit=200):
         """Recent journal entries with their total amount (sum of debits)."""
-        cur = self.db.conn.cursor()
-        cur.execute(
-            "SELECT e.id, e.entry_date, e.memo, e.source, e.status, "
-            "COALESCE(SUM(l.debit), 0) AS amount "
-            "FROM journal_entries e LEFT JOIN journal_lines l ON l.entry_id = e.id "
-            "GROUP BY e.id ORDER BY e.entry_date DESC, e.id DESC LIMIT ?",
-            (limit,),
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return self.db.journal.recent_entries(limit)
 
     def get_account_ledger(self, account_code, as_of=None):
         """One account's posting history with a running balance (natural sign)."""
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT normal_balance FROM chart_of_accounts WHERE code=?", (account_code,))
-        row = cur.fetchone()
-        normal = row[0] if row else 'debit'
-
-        q = ("SELECT e.id, e.entry_date, e.memo, e.source, l.debit, l.credit "
-             "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
-             "WHERE l.account_code = ?")
-        params = [account_code]
-        if as_of:
-            q += " AND e.entry_date <= ?"
-            params.append(as_of)
-        q += " ORDER BY e.entry_date, e.id, l.id"
-        cur.execute(q, params)
+        normal = self.db.journal.normal_balance(account_code) or 'debit'
 
         running = 0.0
         out = []
-        for (eid, date, memo, source, debit, credit) in cur.fetchall():
+        for (eid, date, memo, source, debit, credit) in self.db.journal.account_postings(
+                account_code, as_of):
             debit = round(debit or 0.0, 2)
             credit = round(credit or 0.0, 2)
             delta = (debit - credit) if normal == 'debit' else (credit - debit)
@@ -591,17 +478,7 @@ class GLService:
         while preserving manual and migration entries. Returns the new count.
         """
         with self._bulk():
-            cur = self.db.conn.cursor()
-            placeholders = ",".join("?" * len(self._AUTO_SOURCES))
-            cur.execute(
-                f"DELETE FROM journal_lines WHERE entry_id IN "
-                f"(SELECT id FROM journal_entries WHERE source IN ({placeholders}))",
-                self._AUTO_SOURCES,
-            )
-            cur.execute(
-                f"DELETE FROM journal_entries WHERE source IN ({placeholders})",
-                self._AUTO_SOURCES,
-            )
+            self.db.journal.delete_by_sources(self._AUTO_SOURCES)
             return self.backfill_from_subledgers(progress=progress)
 
     def sync(self, progress=None):
@@ -628,17 +505,10 @@ class GLService:
         """
         before = self._entry_count()
         with self._bulk():
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT id, date, event_type, added, deducted, "
-                        "principal_portion, interest_portion, interest_amount "
-                        "FROM ledger ORDER BY date, id")
-            ledger_rows = cur.fetchall()
-            cur.execute("SELECT id, date, transaction_type, amount FROM savings ORDER BY date, id")
-            savings_rows = cur.fetchall()
-            cur.execute("SELECT id, date, transaction_type, amount FROM christmas_savings ORDER BY date, id")
-            christmas_rows = cur.fetchall()
-            cur.execute("SELECT id, date, transaction_type, amount FROM benevolent_ledger ORDER BY date, id")
-            benevolent_rows = cur.fetchall()
+            ledger_rows = self.db.ledger.gl_projection_rows()
+            savings_rows = self.db.funds.gl_projection_rows("savings")
+            christmas_rows = self.db.funds.gl_projection_rows("christmas_savings")
+            benevolent_rows = self.db.funds.gl_projection_rows("benevolent_ledger")
 
             total = len(ledger_rows) + len(savings_rows) + len(christmas_rows) + len(benevolent_rows)
             done = 0
@@ -678,12 +548,8 @@ class GLService:
     def post_ledger_rows(self, ledger_ids):
         """Post journals for the given ledger rows (one batched transaction)."""
         with self._bulk():
-            cur = self.db.conn.cursor()
             for lid in ledger_ids:
-                cur.execute(
-                    "SELECT date, event_type, added, deducted, principal_portion, "
-                    "interest_portion, interest_amount FROM ledger WHERE id=?", (lid,))
-                row = cur.fetchone()
+                row = self.db.ledger.gl_projection_row(lid)
                 if row:
                     date, event, added, deducted, p_portion, i_portion, i_amt = row
                     self._post_ledger_event(event, date, added, deducted,
@@ -692,10 +558,8 @@ class GLService:
     def post_savings_rows(self, savings_ids):
         """Post journals for the given savings rows (one batched transaction)."""
         with self._bulk():
-            cur = self.db.conn.cursor()
             for sid in savings_ids:
-                cur.execute("SELECT date, transaction_type, amount FROM savings WHERE id=?", (sid,))
-                row = cur.fetchone()
+                row = self.db.funds.gl_projection_row("savings", sid)
                 if row:
                     date, ttype, amount = row
                     self._post_savings_event(ttype, amount, date, f"savings:{sid}")
@@ -763,9 +627,7 @@ class GLService:
         """
         before = self._entry_count()
         with self._bulk():
-            cur = self.db.conn.cursor()
-            cur.execute("SELECT id, date, category, type, amount, notes FROM general_ledger ORDER BY date, id")
-            for (gid, date, category, gtype, amount, notes) in cur.fetchall():
+            for (gid, date, category, gtype, amount, notes) in self.db.journal.legacy_rows():
                 amount = round(float(amount or 0), 2)
                 if amount <= 0:
                     continue

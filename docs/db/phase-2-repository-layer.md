@@ -15,8 +15,8 @@ repository as it lands.
 | **2d** | **done** | `FundRepository` (`savings`, both funds, enrolment) | 32 of 55 |
 | **2c-i** | **done** | `LoanRepository` (`loans`, `loan_suspensions`) | 40 of 56 |
 | **2c-ii** | **done** | `LedgerRepository` (`ledger`) | 45 of 67 |
-| 2e | next | `JournalRepository` (COA, entries, lines) | 30 |
-| 2f | pending | Raw SQL out of views/engine/services; `DatabaseService` root | 36 |
+| **2e** | **done** | `JournalRepository` (COA, entries, lines) | 30 of 30 |
+| 2f | next | Import path; `DatabaseService` root; D7/D8 cleanup | ~113 |
 
 Sequencing rationale is in [repository-layer.md](repository-layer.md).
 
@@ -362,3 +362,63 @@ and no test. `ruff` caught it, and there is now a regression test.
 ### Rollback
 
 `git revert` the 2c-ii commit. No schema or data change.
+
+---
+
+## 2e — JournalRepository
+
+All 30 of `gl_service.py`'s statements move. `GLService` keeps the accounting
+logic — posting rules, the balance assertion, statement assembly, the
+cash-flow categorisation — and now contains **no SQL at all**. It was the
+cleanest split available, because the two concerns were already separable:
+every posting helper builds a list of `{account, debit|credit}` dicts and hands
+it to one insert.
+
+The four subledger scans the GL projects from went to the repositories that own
+those tables, not into `JournalRepository`:
+`ledger.gl_projection_rows()` and `funds.gl_projection_rows(table)`. Each
+table's SQL stays in one place, which is the whole point of the phase.
+
+### A reporting bug found and preserved
+
+`get_trial_balance(as_of=…)` **silently ignores its date**:
+
+```sql
+FROM chart_of_accounts a
+LEFT JOIN journal_lines   l ON l.account_code = a.code
+LEFT JOIN journal_entries e ON l.entry_id = e.id
+  AND e.entry_date <= ?        -- a join condition, not a filter
+```
+
+A line whose entry falls after the date simply fails to match `e`, but the line
+itself survives the outer join and still contributes to `SUM(l.debit)`.
+Measured on the production journal: an as-at-2021 trial balance returns the
+same 42,453,293.19 of debits as the all-time one.
+
+`views/treasury.py` passes a date from a date picker, so **the Treasury trial
+balance shows all-time figures whatever date the user selects**. By contrast
+`get_account_balance`, the income statement, the balance sheet and the cash
+flow all put their dates in a `WHERE` and filter correctly — verified in the
+same run.
+
+Preserved verbatim, because Phase 2 must not change behaviour, and pinned by
+`test_trial_balance_as_of_does_not_filter` so the fix is a deliberate, reviewed
+change. **This is a one-line fix worth scheduling**: the predicate needs to
+exclude the *line*, so the second join has to become an inner join (or the
+filter has to move to a subquery over `journal_lines`). It changes what the
+Treasury screen reports, which is why it is not bundled into a refactor.
+
+### Verification
+
+* 365 → 380 tests (15 added). `ruff` clean.
+* **GL output differential** against the 2c-ii commit on a copy of the
+  production journal: trial balance (all 8 accounts, debits and credits), the
+  income statement all-time and for H1, the balance sheet, the cash flow with
+  all three sections, account listings, recent entries, the 1,159-row account
+  ledger for 1100 with its running balance, and four account balances — all
+  identical.
+* The 30-operation lifecycle differential also still matches.
+
+### Rollback
+
+`git revert` the 2e commit. No schema or data change.

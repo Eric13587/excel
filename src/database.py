@@ -11,8 +11,8 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import (FundRepository, LedgerRepository, LoanRepository,
-                    MemberRepository, SettingsRepository)
+from src.db import (FundRepository, JournalRepository, LedgerRepository,
+                    LoanRepository, MemberRepository, SettingsRepository)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -79,6 +79,7 @@ class DatabaseManager:
         self.funds = FundRepository(self.conn)
         self.loans = LoanRepository(self.conn)
         self.ledger = LedgerRepository(self.conn)
+        self.journal = JournalRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
