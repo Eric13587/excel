@@ -113,6 +113,39 @@ class FundRepository(Repository):
             (member_id, date, transaction_type, amount, balance, notes, batch_id))
         return cur.lastrowid
 
+    def add_imported(self, table, member_id, date, transaction_type, amount, balance,
+                     notes, batch_id):
+        """Copy a fund row from a foreign journal, balance included.
+
+        The running balance is recalculated afterwards, so the copied value is
+        only a starting point.
+        """
+        t = self._table(table)
+        self._execute(
+            f"INSERT INTO {t} (individual_id, date, transaction_type, amount, balance, "
+            f"notes, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (member_id, date, transaction_type, amount, balance, notes, batch_id))
+
+    def add_imported_savings(self, member_id, date, transaction_type, amount, balance,
+                             notes, import_id):
+        """Copy a savings row from a foreign journal, tagged with its run.
+
+        Note this carries ``import_id`` and no ``batch_id``, unlike the fund
+        tables — savings is the only subledger the importer marks for undo.
+        """
+        self._execute(
+            "INSERT INTO savings (individual_id, date, transaction_type, amount, balance, "
+            "notes, import_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (member_id, date, transaction_type, amount, balance, notes, import_id))
+
+    def replace_enrolment(self, member_id, monthly_amount, start_date, next_due_date, active):
+        """INSERT OR REPLACE an enrolment copied from a foreign journal."""
+        self._execute(
+            "INSERT OR REPLACE INTO benevolent_accounts "
+            "(individual_id, monthly_amount, start_date, next_due_date, active) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (member_id, monthly_amount, start_date, next_due_date, active))
+
     def update(self, table, row_id, date, amount, notes):
         t = self._table(table)
         self._execute(f"UPDATE {t} SET date=?, amount=?, notes=? WHERE id=?",

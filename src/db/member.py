@@ -149,6 +149,22 @@ class MemberRepository(Repository):
              status, pf_no or "", id_no or "", is_retired, retired_date))
         return cur.lastrowid
 
+    def add_imported(self, name, phone, email, default_deduction, created_at,
+                     employment_status, pf_no, id_no, is_retired, retired_date, import_id):
+        """Insert a member created by an import run.
+
+        ``import_id`` is what makes the run undoable: only rows the import
+        *created* carry one, so a member who already existed and was merged
+        into is never removed by an undo.
+        """
+        cur = self._execute(
+            "INSERT INTO individuals (name, phone, email, default_deduction, created_at, "
+            "employment_status, pf_no, id_no, is_retired, retired_date, import_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, phone, email, default_deduction, created_at, employment_status,
+             pf_no, id_no, is_retired, retired_date, import_id))
+        return cur.lastrowid
+
     def update_core(self, member_id, name, phone, email):
         self._execute("UPDATE individuals SET name=?, phone=?, email=? WHERE id=?",
                       (name, phone, email, member_id))

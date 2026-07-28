@@ -187,6 +187,20 @@ class LedgerRepository(Repository):
         """Bulk insert. Returns nothing — see :meth:`max_id` for the id range."""
         self._executemany(self._INSERT_SQL, rows)
 
+    #: Columns written by an import, which additionally carries is_edited and
+    #: the import_id that makes the run undoable.
+    IMPORT_COLUMNS = INSERT_COLUMNS[:8] + (
+        "installment_amount", "batch_id", "interest_amount", "principal_balance",
+        "interest_balance", "principal_portion", "interest_portion",
+        "previous_state", "is_edited", "import_id",
+    )
+
+    def add_imported(self, values):
+        """Insert a ledger row copied from a foreign journal."""
+        self._execute(
+            "INSERT INTO ledger (" + ", ".join(self.IMPORT_COLUMNS) + ") "
+            "VALUES (" + ", ".join("?" * len(self.IMPORT_COLUMNS)) + ")", values)
+
     def restore(self, values):
         """Re-insert a deleted row with its original id (undo)."""
         self._execute(

@@ -13,6 +13,7 @@ the suite stays green at every step. Repositories added so far:
 * :class:`~src.db.journal.JournalRepository` — the double-entry general ledger.
 * :class:`~src.db.repair.RepairRepository` — cross-table orphan queries.
 * :class:`~src.db.repair.ImportHistoryRepository` — ``import_history`` and undo.
+* :class:`~src.db.repair.AuditRepository` — the trigger-maintained ``audit_log``.
 * :class:`~src.db.source.SourceJournal` — read-only access to a foreign journal.
 * :class:`~src.db.ledger.LedgerRepository` — the ``ledger`` subledger.
 * :class:`~src.db.loan.LoanRepository` — ``loans`` and ``loan_suspensions``.
@@ -27,11 +28,12 @@ from src.db.journal import JournalRepository
 from src.db.ledger import LedgerRepository
 from src.db.loan import LoanRepository
 from src.db.member import MemberRepository
-from src.db.repair import ImportHistoryRepository, RepairRepository
+from src.db.repair import AuditRepository, ImportHistoryRepository, RepairRepository
 from src.db.settings import SettingsRepository
 from src.db.source import SourceJournal
 
-__all__ = ["FundRepository", "ImportHistoryRepository", "JournalRepository",
+__all__ = ["AuditRepository", "FundRepository", "ImportHistoryRepository",
+           "JournalRepository",
            "LedgerRepository", "LoanRepository", "MemberRepository",
            "RepairRepository", "Repository", "SettingsRepository",
            "SourceJournal"]

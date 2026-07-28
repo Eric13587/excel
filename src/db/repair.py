@@ -1,7 +1,8 @@
-"""Orphaned-row discovery and removal, and the import-run audit trail.
+"""Operational tables: orphan repair, import runs, and the audit trail.
 
-Two small surfaces that share a trait: both reach across every child table at
-once, so neither belongs to a single-table repository.
+Three small surfaces that do not belong to a single-table repository: orphan
+repair reaches across every child table at once, import runs and the audit
+trail describe activity rather than a domain entity.
 
 **Orphan repair.** Legacy journals were written without foreign-key
 enforcement, so deleting a member could leave transactions behind. Those
@@ -113,3 +114,22 @@ class ImportHistoryRepository(Repository):
         for table in self._CHILD_TABLES:
             self._execute(f"DELETE FROM {_quote(table)} WHERE import_id = ?", (import_id,))
         self._execute("DELETE FROM import_history WHERE id = ?", (import_id,))
+
+
+class AuditRepository(Repository):
+    """The trigger-maintained ``audit_log``.
+
+    Writes come from database triggers, not from here, so that every change is
+    captured regardless of the code path taken. This is the read side only.
+    """
+
+    def recent(self, limit=500, entity=None, entity_id=None):
+        """Audit entries, most recent first, optionally for one entity."""
+        sql = "SELECT ts, operation, entity, entity_id, summary FROM audit_log"
+        params = []
+        if entity is not None and entity_id is not None:
+            sql += " WHERE entity=? AND entity_id=?"
+            params = [entity, entity_id]
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return self._dicts(sql, tuple(params))

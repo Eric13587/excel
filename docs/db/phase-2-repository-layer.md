@@ -16,7 +16,8 @@ repository as it lands.
 | **2c-i** | **done** | `LoanRepository` (`loans`, `loan_suspensions`) | 40 of 56 |
 | **2c-ii** | **done** | `LedgerRepository` (`ledger`) | 45 of 67 |
 | **2e** | **done** | `JournalRepository` (COA, entries, lines) | 30 of 30 |
-| 2f | next | Import path; `DatabaseService` root; D7/D8 cleanup | ~113 |
+| **2f-i** | **done** | Repair, import history, `SourceJournal` | 24 |
+| **2f-ii** | **done** | Import path, audit read, composition root | 33 |
 
 Sequencing rationale is in [repository-layer.md](repository-layer.md).
 
@@ -477,3 +478,91 @@ Two consequences worth recording:
   have done regardless.
 
 381 tests, `ruff` clean.
+
+---
+
+## 2f — the import path, and the composition root
+
+### 2f-i — repair, import history, and the source reader
+
+`RepairRepository` (cross-table orphan queries) and `ImportHistoryRepository`
+(`import_history` and the undo that keys off `import_id`) went into
+`src/db/repair.py`; neither belongs to a single-table repository.
+
+`src/db/source.py` — **`SourceJournal`** — closes a finding from the
+architecture review. The import path used to interpolate table names taken from
+the *source's own* `sqlite_master` into statements, so a crafted file could
+steer a read at a table the importer never intended to touch. Reads now come
+from a fixed allowlist, and the connection opens `mode=ro` so a source journal
+cannot be modified even by accident. Both are asserted by tests.
+
+Finding **D8** is documented rather than fixed: the conflict scan matches names
+with `LIKE` (which treats `%` and `_` in the supplied name as wildcards) while
+`name_exists` uses `LOWER(name) = LOWER(?)`. Converging them changes which rows
+the importer flags as conflicts, so it is not a refactor-phase change. Both now
+sit in `MemberRepository` with the divergence noted.
+
+### 2f-ii — `import_selected_data`
+
+The 456-line method keeps its structure and loses its SQL. Every statement now
+goes through a repository or `SourceJournal`; the savepoint choreography,
+progress callbacks and error strings are untouched.
+
+**The savepoint policy is preserved, not invented.** Each phase takes a
+savepoint on success, and phase 2 rolls back to `individuals_imported` on
+failure so members survive a loan failure. Phase 3 does **not** roll back: a
+savings failure leaves whatever rows it wrote and relies on the user undoing
+the whole run. The original code says as much in a comment (*"This is tricky
+without explicit savepoint management… Let's skip complex rollback logic"*).
+Deciding what a partial savings import should do is a business call, so the gap
+is now stated in the method's docstring instead of buried in a comment, and
+left for a later phase.
+
+**One latent bug fixed.** `original_isolation` was assigned *inside* the `try`,
+but the outer handler restores it — so a failure while opening the source
+raised `NameError` from the handler and masked the real error. It is now bound
+before the `try`.
+
+### Why there is no separate `DatabaseService` class
+
+The Phase 2 design proposed one. Building it would have been ceremony:
+`DatabaseManager` already owns the connection, already provides the transaction
+boundary, and now exposes exactly one repository per aggregate. A second class
+beside it would duplicate that for a name, and renaming this one would touch
+every call site for no functional gain — against the brief's own "avoid
+unnecessary renaming". The class docstring now states the role explicitly and
+lists the repositories.
+
+### Where the SQL ended up
+
+| Location | Statements |
+|---|---|
+| `src/db/` repositories | 158 |
+| `src/database.py` — schema DDL in `create_tables` | 52 |
+| `src/database.py` — data statements | **3** |
+| `src/integrity.py` — read-only verification tooling | 26 |
+| `src/migrations/` | 3 |
+| services, views, engine, reports | **0** |
+
+The three data statements left in `database.py` are all inside
+`create_tables`: the loan-suspension back-fill, the chart-of-accounts seed, and
+the `is_edited` normalisation. They are schema-migration logic, and they leave
+when `schema.sql` plus the migration runner take over table creation.
+
+### Verification
+
+* 396 tests, `ruff` clean.
+* **Two import differentials** against the previous commit, each on freshly
+  built source and destination journals:
+  1. validation of good/missing/garbage files, preview, conflict scan, full
+     import, history, orphan repair, undo;
+  2. a harder run — loan-ref collisions (`L-001-Import`, `L-001-Import-1`),
+     a PF number preserved on merge, a date range excluding an out-of-window
+     ledger row, a `skip` decision, funds, benevolent enrolments, a suspension
+     span, then undo — compared by per-table content hash.
+
+  Both identical. The 30-operation lifecycle differential also still matches.
+
+### Rollback
+
+`git revert` the 2f-i and 2f-ii commits. No schema or data change.

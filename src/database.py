@@ -11,9 +11,10 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import (FundRepository, ImportHistoryRepository, JournalRepository,
-                    LedgerRepository, LoanRepository, MemberRepository,
-                    RepairRepository, SettingsRepository, SourceJournal)
+from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
+                    JournalRepository, LedgerRepository, LoanRepository,
+                    MemberRepository, RepairRepository, SettingsRepository,
+                    SourceJournal)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -47,7 +48,39 @@ JOURNAL_MODE_ENV = "LOANMASTER_JOURNAL_MODE"
 
 
 class DatabaseManager:
-    """Handles all SQLite database operations."""
+    """Owns the connection and composes the repository layer.
+
+    This is the composition root the Phase 2 design called ``DatabaseService``.
+    It was not introduced as a separate class: ``DatabaseManager`` already owns
+    the connection, already provides the transaction boundary, and after Phase 2
+    exposes exactly one repository per aggregate. A second class beside it would
+    have duplicated that for a name, and renaming this one would have touched
+    every call site for no functional gain.
+
+    Repositories (each owns every statement touching its tables)::
+
+        db.members    individuals
+        db.loans      loans, loan_suspensions
+        db.ledger     ledger
+        db.funds      savings, christmas_savings, benevolent_ledger,
+                      benevolent_accounts
+        db.journal    chart_of_accounts, journal_entries, journal_lines,
+                      general_ledger
+        db.settings   settings
+        db.imports    import_history
+        db.audit      audit_log
+        db.repair     cross-table orphan queries
+
+    ``SourceJournal`` wraps a *foreign* journal read-only during an import.
+
+    The methods on this class are the API the rest of the application uses;
+    each one now delegates to a repository and supplies the transaction. The
+    remaining SQL here is schema DDL in ``create_tables``, which
+    ``schema.sql`` plus the migration runner will take over.
+
+    Repositories never commit — the caller owns the transaction — so a
+    multi-statement operation is atomic.
+    """
 
     def __init__(self, db_name="loan_master.db", auto_backup=False):
         self.db_name = db_name
@@ -83,6 +116,7 @@ class DatabaseManager:
         self.journal = JournalRepository(self.conn)
         self.repair = RepairRepository(self.conn)
         self.imports = ImportHistoryRepository(self.conn)
+        self.audit = AuditRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -936,17 +970,7 @@ class DatabaseManager:
 
     def get_audit_log(self, limit=500, entity=None, entity_id=None):
         """Recent audit entries (most recent first)."""
-        cur = self.conn.cursor()
-        q = "SELECT ts, operation, entity, entity_id, summary FROM audit_log"
-        params = []
-        if entity is not None and entity_id is not None:
-            q += " WHERE entity=? AND entity_id=?"
-            params = [entity, entity_id]
-        q += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        cur.execute(q, params)
-        return [dict(zip(["ts", "operation", "entity", "entity_id", "summary"], r))
-                for r in cur.fetchall()]
+        return self.audit.recent(limit, entity, entity_id)
 
     # ------------------------------------------------------------------
     # Individual operations — delegated to MemberRepository (Phase 2b).
@@ -1464,58 +1488,31 @@ class DatabaseManager:
         """
         Import individuals (empty shells) from another SQLite database.
         Skips individuals that already exist (by Name).
-        Returns the number of imported records.
+        Returns the number of imported records, or -1 when the source has no
+        usable individuals table.
         """
         try:
-            # Connect to Source
-            import sqlite3
-            src_conn = sqlite3.connect(source_db_path)
-            src_cursor = src_conn.cursor()
-            
-            # Check source table exists
-            try:
-                src_cursor.execute("SELECT name, phone, email, default_deduction FROM individuals")
-                rows = src_cursor.fetchall()
-            except sqlite3.OperationalError:
-                src_conn.close()
-                return -1 # Error: No individuals table
-            
-            src_conn.close()
-            
-            # Get Current Individuals (to Check Duplicates)
-            current_names = set()
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT name FROM individuals")
-            for r in cursor.fetchall():
-                current_names.add(r[0])
-            
-            imported_count = 0
-            
-            for row in rows:
-                name, phone, email, def_ded = row
-                if name not in current_names:
-                    # Insert
-                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Handle None/Null values
-                    phone = phone if phone else ""
-                    email = email if email else ""
-                    def_ded = def_ded if def_ded else 0
-                    
-                    cursor.execute("""
-                        INSERT INTO individuals (name, phone, email, default_deduction, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (name, phone, email, def_ded, created_at))
-                    imported_count += 1
-            
-            self.conn.commit()
-            return imported_count
-            
+            with SourceJournal(source_db_path) as src:
+                try:
+                    rows = src.basic_members()
+                except sqlite3.OperationalError:
+                    return -1
 
+            existing = set(self.members.names_to_ids())
+            imported = 0
+            with self.transaction():
+                for row in rows:
+                    name = row["name"]
+                    if name in existing:
+                        continue
+                    self.members.add(name, row["phone"] or "", row["email"] or "",
+                                     row["default_deduction"] or 0)
+                    existing.add(name)
+                    imported += 1
+            return imported
         except Exception:
             logger.exception("Import error")
             return 0
-
 
     def get_import_preview(self, source_db_path):
         """
@@ -1626,58 +1623,30 @@ class DatabaseManager:
             # IDs that are either real conflicts OR auto-merged
             processed_ids = {c['src']['id'] for c in real_conflicts}.union(auto_merged_ids)
             
-            # 3. Connect Dest to get existing LOAN REFS for collision detection
-            dest_conn = sqlite3.connect(self.db_name)
-            dest_conn.row_factory = sqlite3.Row
-            dest_cur = dest_conn.cursor()
-            dest_cur.execute("SELECT ref FROM loans")
-            existing_loan_refs = {row['ref'] for row in dest_cur.fetchall()}
-            dest_conn.close()
+            # 3. Existing loan refs, for collision detection
+            existing_loan_refs = self.loans.all_refs()
 
-            # 4. Connect Source to get details for remaining New Individuals AND Loans
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            # Get all selected source individuals to check against processed_ids
-            placeholders = ','.join(['?'] * len(selected_ids))
-            src_cur.execute(f"SELECT id, name FROM individuals WHERE id IN ({placeholders})", selected_ids)
-            src_inds = src_cur.fetchall()
-            
-            for src_ind in src_inds:
-                sid = src_ind['id']
-                name = src_ind['name']
-                
-                # Count Related Data (Loans/Ledger/Savings) for ALL selected
-                if options.get("import_loans"):
-                    # Check for collisions while counting
-                    src_cur.execute("SELECT ref FROM loans WHERE individual_id=?", (sid,))
-                    loans = src_cur.fetchall()
-                    preview["summary"]["loans"] += len(loans)
-                    
-                    for loan in loans:
-                        if loan['ref'] in existing_loan_refs:
-                            preview["summary"]["loans_renamed"] += 1
-                            if len(preview["details"]["loan_renames"]) < 10: # Limit detail list
-                                preview["details"]["loan_renames"].append(loan['ref'])
+            # 4. Source details for the remaining new individuals and their loans
+            with SourceJournal(source_db_path) as src:
+                for sid, name in src.member_names(selected_ids):
+                    # Count related data for every selected member
+                    if options.get("import_loans"):
+                        refs = src.loan_refs(sid)
+                        preview["summary"]["loans"] += len(refs)
+                        for ref in refs:
+                            if ref in existing_loan_refs:
+                                preview["summary"]["loans_renamed"] += 1
+                                if len(preview["details"]["loan_renames"]) < 10:
+                                    preview["details"]["loan_renames"].append(ref)
+                        preview["summary"]["ledger"] += src.count("ledger", sid)
 
-                    src_cur.execute("SELECT count(*) FROM ledger WHERE individual_id=?", (sid,))
-                    preview["summary"]["ledger"] += src_cur.fetchone()[0]
-                    
-                if options.get("import_savings"):
-                     try:
-                         src_cur.execute("SELECT count(*) FROM savings WHERE individual_id=?", (sid,))
-                         preview["summary"]["savings"] += src_cur.fetchone()[0]
-                     except sqlite3.OperationalError:
-                         pass
+                    if options.get("import_savings"):
+                        preview["summary"]["savings"] += src.count("savings", sid)
 
-                # Categorize as New if not processed
-                if sid not in processed_ids:
-                    preview["summary"]["individuals_new"] += 1
-                    preview["details"]["new_names"].append(name)
-            
-            src_conn.close()
-            # Dest conn closed above
+                    # Categorize as New if not processed
+                    if sid not in processed_ids:
+                        preview["summary"]["individuals_new"] += 1
+                        preview["details"]["new_names"].append(name)
             
         except Exception:
             logger.exception("Import preview error")
@@ -1685,227 +1654,181 @@ class DatabaseManager:
             
         return preview
 
-    def _import_aux_tables(self, src_cur, dest_cur, id_map, loan_id_map, import_id, options):
+    def _import_aux_tables(self, src, id_map, loan_id_map, options):
         """Import Christmas/Benevolent funds and loan suspensions for the members
-        already mapped in id_map. Uses dest_cur only (no commit), so it composes
-        with the caller's manual import transaction. Returns a stats dict.
+        already mapped in id_map. Writes through the repositories on the shared
+        connection and never commits, so it composes with the caller's manual
+        import transaction. Returns a stats dict.
         """
         stats = {"christmas": 0, "benevolent": 0, "benevolent_accounts": 0, "suspensions": 0}
         if not id_map:
             return stats
 
-        def has(name):
-            src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
-            return src_cur.fetchone() is not None
-
-        def recalc(table, ind):
-            running = 0.0
-            for rid, ttype, amount in dest_cur.execute(
-                    f"SELECT id, transaction_type, amount FROM {table} WHERE individual_id=? "
-                    f"ORDER BY date, id", (ind,)).fetchall():
-                running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
-                dest_cur.execute(f"UPDATE {table} SET balance=? WHERE id=?", (running, rid))
-
         if options.get("import_funds", False):
-            for table, key in (("christmas_savings", "christmas"), ("benevolent_ledger", "benevolent")):
-                if not has(table):
+            for table, key in (("christmas_savings", "christmas"),
+                               ("benevolent_ledger", "benevolent")):
+                if not src.has_table(table):
                     continue
-                src_cur.execute(f"SELECT * FROM {table}")
-                cols = [d[0] for d in src_cur.description]
+                cols, rows = src.all_rows(table)
                 affected = set()
-                for tup in src_cur.fetchall():
+                for tup in rows:
                     row = dict(zip(cols, tup))
-                    new = id_map.get(row.get('individual_id'))
-                    if new is None:
+                    new_id = id_map.get(row.get('individual_id'))
+                    if new_id is None:
                         continue
-                    dest_cur.execute(
-                        f"INSERT INTO {table} (individual_id, date, transaction_type, amount, "
-                        f"balance, notes, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (new, row.get('date'), row.get('transaction_type'), row.get('amount'),
-                         row.get('balance'), row.get('notes'), row.get('batch_id')))
-                    affected.add(new)
+                    self.funds.add_imported(
+                        table, new_id, row.get('date'), row.get('transaction_type'),
+                        row.get('amount'), row.get('balance'), row.get('notes'),
+                        row.get('batch_id'))
+                    affected.add(new_id)
                     stats[key] += 1
-                for ind in affected:
-                    recalc(table, ind)
+                for member_id in affected:
+                    self.funds.recalc_fund(table, member_id)
 
-            if has("benevolent_accounts"):
-                src_cur.execute("SELECT * FROM benevolent_accounts")
-                cols = [d[0] for d in src_cur.description]
-                for tup in src_cur.fetchall():
+            if src.has_table("benevolent_accounts"):
+                cols, rows = src.all_rows("benevolent_accounts")
+                for tup in rows:
                     row = dict(zip(cols, tup))
-                    new = id_map.get(row.get('individual_id'))
-                    if new is None:
+                    new_id = id_map.get(row.get('individual_id'))
+                    if new_id is None:
                         continue
-                    dest_cur.execute(
-                        "INSERT OR REPLACE INTO benevolent_accounts "
-                        "(individual_id, monthly_amount, start_date, next_due_date, active) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (new, row.get('monthly_amount', 0) or 0, row.get('start_date'),
-                         row.get('next_due_date'), row.get('active', 1)))
+                    self.funds.replace_enrolment(
+                        new_id, row.get('monthly_amount', 0) or 0, row.get('start_date'),
+                        row.get('next_due_date'), row.get('active', 1))
                     stats["benevolent_accounts"] += 1
 
-        if options.get("import_loans", False) and has("loan_suspensions"):
-            src_cur.execute("SELECT * FROM loan_suspensions")
-            cols = [d[0] for d in src_cur.description]
-            for tup in src_cur.fetchall():
+        if options.get("import_loans", False) and src.has_table("loan_suspensions"):
+            cols, rows = src.all_rows("loan_suspensions")
+            for tup in rows:
                 row = dict(zip(cols, tup))
-                new = id_map.get(row.get('individual_id'))
-                if new is None:
+                new_id = id_map.get(row.get('individual_id'))
+                if new_id is None:
                     continue
                 old_ref = row.get('loan_ref')
                 new_ref = (loan_id_map.get(old_ref, old_ref) if old_ref else old_ref)
-                new_loan_id = None
-                if new_ref:
-                    r = dest_cur.execute("SELECT id FROM loans WHERE individual_id=? AND ref=?",
-                                         (new, new_ref)).fetchone()
-                    new_loan_id = r[0] if r else None
-                dest_cur.execute(
-                    "INSERT INTO loan_suspensions (loan_id, individual_id, loan_ref, start_date, "
-                    "suspend_until, resumed_date, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (new_loan_id, new, new_ref, row.get('start_date'), row.get('suspend_until'),
-                     row.get('resumed_date'), row.get('status', 'active'), row.get('created_at')))
+                new_loan_id = self.loans.id_for_ref(new_id, new_ref) if new_ref else None
+                self.loans.add_suspension(
+                    new_loan_id, new_id, new_ref, row.get('start_date'),
+                    row.get('suspend_until'), row.get('resumed_date'),
+                    row.get('status', 'active'), created_at=row.get('created_at'))
                 stats["suspensions"] += 1
 
         return stats
 
-    def import_selected_data(self, source_db_path, selected_ids, options, progress_callback=None, decision_map=None):
+    def import_selected_data(self, source_db_path, selected_ids, options,
+                             progress_callback=None, decision_map=None):
         """
         Import ONLY selected individuals from external database with granular checkpoints.
-        
+
         Args:
             source_db_path: Path to source DB
             selected_ids: List of individual IDs to import
             options: Dict with import options
             progress_callback: Callable(current, total, message)
             decision_map: Dict {src_id: "new" | "skip" | int(dest_id)}
-            
+
         Returns a dict:
         {
             "status": "success" | "partial" | "failed",
             "stats": { "individuals": 0, "loans": 0, ... },
             "errors": ["Error message 1", ...]
         }
+
+        NOTE ON THE SAVEPOINT POLICY. Each phase takes a savepoint on success,
+        and phase 2 rolls back to ``individuals_imported`` on failure so members
+        survive a loan failure. Phase 3 does **not** roll back: a savings
+        failure leaves whatever rows it managed to write, and relies on the user
+        undoing the whole run instead. That gap is inherited, is documented in
+        the code it replaced, and is preserved here — deciding what a partial
+        savings import should do is a business call, not a refactoring one.
         """
-        import sqlite3
-        
-        # summary stats
         stats = {"individuals": 0, "loans": 0, "ledger": 0, "savings": 0}
         errors = []
         status = "success"
-        src_conn = None
-        
+        # Bound before the try: the original assigned it *inside*, so a failure
+        # while opening the source raised NameError from the handler and masked
+        # the real error.
+        original_isolation = self.conn.isolation_level
+        src = None
+
         try:
-            # Connect to Source
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            # Pre-check tables existence/creation to avoid DDL inside transaction
+            src = SourceJournal(source_db_path)
+
+            # Pre-check table creation to avoid DDL inside the transaction
             if options.get("import_savings", False):
                 self.create_savings_table()
 
             # --- PHASE 1: INDIVIDUALS ---
+            if not selected_ids:
+                return {"status": "success", "stats": stats, "errors": []}
             try:
-                # Filter by selected_ids
-                if not selected_ids:
-                    return {"status": "success", "stats": stats, "errors": []}
-                    
-                placeholders = ','.join(['?'] * len(selected_ids))
-                query = f"SELECT * FROM individuals WHERE id IN ({placeholders})"
-                src_cur.execute(query, selected_ids)
-                src_inds = src_cur.fetchall()
+                src_inds = src.members(selected_ids)
             except sqlite3.OperationalError as e:
-                if src_conn: src_conn.close()
+                src.close()
                 return {"status": "failed", "stats": stats, "errors": [f"Source DB Error: {e}"]}
-            
-            # Start Manual Transaction
-            original_isolation = self.conn.isolation_level
-            self.conn.isolation_level = None 
-            
-            dest_cur = self.conn.cursor()
-            dest_cur.execute("BEGIN") # Start transaction explicitly
-            dest_cur.execute("SAVEPOINT import_start")
-            
-            # Create Import History Record
-            import_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            dest_cur.execute("INSERT INTO import_history (timestamp, source_file, details, item_count) VALUES (?, ?, ?, ?)",
-                             (import_timestamp, source_db_path, "Started", 0))
-            import_id = dest_cur.lastrowid
-            
-            # Map Source ID -> Dest ID
-            id_map = {}
-            loan_id_map = {}  # Source Loan Ref -> Dest Loan Ref (set in the loans phase)
-            
-            # Get current individuals for fallback matching
-            dest_cur.execute("SELECT name, id FROM individuals")
-            existing_inds = {row[0]: row[1] for row in dest_cur.fetchall()}
 
+            # Start Manual Transaction
+            self.conn.isolation_level = None
+            dest_cur = self.conn.cursor()
+            dest_cur.execute("BEGIN")
+            dest_cur.execute("SAVEPOINT import_start")
+
+            import_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            import_id = self.imports.start(import_timestamp, source_db_path)
+
+            id_map = {}        # Source member id -> destination member id
+            loan_id_map = {}   # Source loan ref  -> destination loan ref
+
+            existing_inds = self.members.names_to_ids()
             # Track PF/ID numbers already in use so an imported member with a
             # colliding number doesn't violate the unique indexes (we drop the
             # clashing field for that member instead of failing the whole import).
-            dest_cur.execute("SELECT pf_no FROM individuals WHERE pf_no IS NOT NULL AND pf_no != ''")
-            existing_pf = {r[0] for r in dest_cur.fetchall()}
-            dest_cur.execute("SELECT id_no FROM individuals WHERE id_no IS NOT NULL AND id_no != ''")
-            existing_id = {r[0] for r in dest_cur.fetchall()}
-            
-            # Estimate Total Steps
-            
-            # Let's query counts first for better progress bar
-            loan_count = 0
-            ledger_count = 0
-            savings_count = 0
-            
+            existing_pf = self.members.used_pf_numbers()
+            existing_id = self.members.used_id_numbers()
+
+            # Estimate total steps for the progress bar
+            loan_count = ledger_count = savings_count = 0
             if options.get("import_loans", False):
-                try:
-                    src_cur.execute("SELECT COUNT(*) FROM loans")
-                    loan_count = src_cur.fetchone()[0]
-                    src_cur.execute("SELECT COUNT(*) FROM ledger")
-                    ledger_count = src_cur.fetchone()[0]
-                except Exception: pass
-            
+                loan_count = src.count("loans")
+                ledger_count = src.count("ledger")
             if options.get("import_savings", False):
-                 try:
-                    src_cur.execute("SELECT COUNT(*) FROM savings")
-                    savings_count = src_cur.fetchone()[0]
-                 except Exception: pass
+                savings_count = src.count("savings")
 
             total_operations = len(src_inds) + loan_count + ledger_count + savings_count
             current_op = 0
-            
+
             try:
-                for i, src_ind in enumerate(src_inds):
+                for src_ind in src_inds:
                     if progress_callback:
-                        progress_callback(current_op, total_operations, f"Importing Individual: {src_ind['name']}")
-                    
+                        progress_callback(current_op, total_operations,
+                                          f"Importing Individual: {src_ind['name']}")
+
                     name = src_ind['name']
                     src_id = src_ind['id']
-                    
+
                     # Determine Action
                     action = "new"
                     if decision_map and src_id in decision_map:
                         action = decision_map[src_id]
                     elif name in existing_inds:
-                        # Fallback: Merge by exact name
-                        action = existing_inds[name]
-                    
+                        action = existing_inds[name]        # merge by exact name
+
                     if action == "skip":
                         current_op += 1
                         continue
-                        
+
                     if isinstance(action, int):
-                        # Merge with existing
-                        id_map[src_id] = action
-                        # stats["individuals"] += 1 # Count merged as imported? Maybe no.
+                        id_map[src_id] = action             # merge with existing
                     else:
-                        # Create new
-                        phone = src_ind['phone'] if src_ind['phone'] else ""
-                        email = src_ind['email'] if src_ind['email'] else ""
                         keys = src_ind.keys()
+
                         def sval(col, default='', src_ind=src_ind, keys=keys):
                             return src_ind[col] if col in keys and src_ind[col] is not None else default
-                        def_ded = src_ind['default_deduction'] if 'default_deduction' in keys and src_ind['default_deduction'] else 0
-                        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+                        phone = src_ind['phone'] if src_ind['phone'] else ""
+                        email = src_ind['email'] if src_ind['email'] else ""
+                        def_ded = (src_ind['default_deduction']
+                                   if 'default_deduction' in keys and src_ind['default_deduction'] else 0)
                         # New individual fields (graceful if the source is an older schema)
                         emp_status = (sval('employment_status', 'Active') or 'Active')
                         pf_no = (sval('pf_no', '') or '').strip()
@@ -1921,47 +1844,32 @@ class DatabaseManager:
                             errors.append(f"ID '{id_no}' ({name}) already in use — imported without ID No.")
                             id_no = ''
 
-                        dest_cur.execute("""
-                            INSERT INTO individuals (name, phone, email, default_deduction, created_at,
-                                                     employment_status, pf_no, id_no, is_retired, retired_date, import_id)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (name, phone, email, def_ded, created_at,
-                              emp_status, pf_no, id_no, is_retired, retired_date, import_id))
-                        new_id = dest_cur.lastrowid
+                        new_id = self.members.add_imported(
+                            name, phone, email, def_ded,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            emp_status, pf_no, id_no, is_retired, retired_date, import_id)
                         id_map[src_id] = new_id
                         if pf_no:
                             existing_pf.add(pf_no)
                         if id_no:
                             existing_id.add(id_no)
                         stats["individuals"] += 1
-                    
+
                     current_op += 1
-                
-                # Checkpoint: Individuals Imported Successfully
+
                 dest_cur.execute("SAVEPOINT individuals_imported")
-                
+
             except Exception:
                 dest_cur.execute("ROLLBACK TO import_start")
-                self.conn.commit() # Nothing happened effectively
+                self.conn.commit()      # Nothing happened effectively
+
             # --- PHASE 2: LOANS & LEDGER ---
             if options.get("import_loans", False):
                 try:
-                    loan_id_map = {} # Source Loan Ref -> Dest Loan Ref (Used for Ledger linking)
-                    
-                    # Get existing loan refs to prevent collision
-                    dest_cur.execute("SELECT ref FROM loans")
-                    existing_loan_refs = {row[0] for row in dest_cur.fetchall()}
-                    
-                    # --- Loans ---
-                    # Only import loans for individuals we are importing/merging
-                    placeholders = ','.join(['?'] * len(id_map))
-                    if id_map:
-                        src_cur.execute(f"SELECT * FROM loans WHERE individual_id IN ({placeholders})", list(id_map.keys()))
-                        src_loans = src_cur.fetchall()
-                    else:
-                        src_loans = []
-                    
-                    for ln in src_loans:
+                    loan_id_map = {}
+                    existing_loan_refs = self.loans.all_refs()
+
+                    for ln in src.loans(list(id_map.keys())):
                         if progress_callback:
                             current_op += 1
                             if current_op % 5 == 0:
@@ -1969,125 +1877,78 @@ class DatabaseManager:
 
                         src_ind_id = ln['individual_id']
                         if src_ind_id not in id_map:
-                            continue # Should match query, but safety check
-                            
+                            continue
                         dest_ind_id = id_map[src_ind_id]
-                        
-                        # Handle Ref Collision
+
+                        # Handle ref collision by auto-renaming
                         original_ref = ln['ref']
                         new_ref = original_ref
-                        
                         if new_ref in existing_loan_refs:
-                            # Collision detected - Auto-rename
                             suffix_idx = 0
                             base_suffix = "-Import"
                             while new_ref in existing_loan_refs:
                                 suffix = base_suffix if suffix_idx == 0 else f"{base_suffix}-{suffix_idx}"
                                 new_ref = f"{original_ref}{suffix}"
                                 suffix_idx += 1
-                        
-                        existing_loan_refs.add(new_ref) # Mark as used
+                        existing_loan_refs.add(new_ref)
                         loan_id_map[original_ref] = new_ref
 
-                        # Insert Loan with new_ref
                         keys = ln.keys()
-                        # Default values for missing cols
                         monthly_int = ln['monthly_interest'] if 'monthly_interest' in keys and ln['monthly_interest'] else 0
                         unearned_int = ln['unearned_interest'] if 'unearned_interest' in keys and ln['unearned_interest'] else 0
                         int_bal = ln['interest_balance'] if 'interest_balance' in keys and ln['interest_balance'] else 0
-                        
-                        dest_cur.execute("""
-                            INSERT INTO loans (
-                                individual_id, ref, principal, total_amount, balance, installment, 
-                                start_date, next_due_date, status, monthly_interest, 
-                                unearned_interest, interest_balance, import_id
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            dest_ind_id, new_ref, ln['principal'], ln['total_amount'], ln['balance'], 
-                            ln['installment'], ln['start_date'], ln['next_due_date'], ln['status'], 
-                            monthly_int, unearned_int, int_bal, import_id
-                        ))
+
+                        self.loans.add_imported(
+                            dest_ind_id, new_ref, ln['principal'], ln['total_amount'],
+                            ln['balance'], ln['installment'], ln['start_date'],
+                            ln['next_due_date'], ln['status'], monthly_int, unearned_int,
+                            int_bal, import_id)
                         stats["loans"] += 1
-                        
+
                     # --- Ledger ---
                     try:
-                        # Fetch source ledger entries for selected individuals
-                        placeholders = ','.join(['?'] * len(id_map))
-                        if id_map:
-                            params = list(id_map.keys())
-                            date_filter_clause = ""
-                            if options.get("date_range"):
-                                start_date, end_date = options["date_range"]
-                                date_filter_clause = " AND date >= ? AND date <= ?"
-                                params.extend([start_date, end_date])
-                                
-                            src_cur.execute(f"SELECT * FROM ledger WHERE individual_id IN ({placeholders}){date_filter_clause}", params)
-                            src_entries = src_cur.fetchall()
-                        else:
-                            src_entries = []
-                        
-                        cols = [d[0] for d in src_cur.description]
-                        
+                        cols, src_entries = src.ledger(list(id_map.keys()),
+                                                       options.get("date_range"))
                         for entry_tuple in src_entries:
                             if progress_callback:
                                 current_op += 1
                                 if current_op % 10 == 0:
-                                     progress_callback(current_op, total_operations, "Importing Ledger...")
-                                     
-                            # Convert tuple to dict for safe access
+                                    progress_callback(current_op, total_operations, "Importing Ledger...")
+
                             entry = dict(zip(cols, entry_tuple))
-                                 
                             src_ind_id = entry['individual_id']
                             if src_ind_id not in id_map:
                                 continue
-                            
                             dest_ind_id = id_map[src_ind_id]
-                            
-                            # Handle Loan Ref mapping
-                            # Ledger 'loan_id' column actually stores the Loan Reference string
+
+                            # `loan_id` holds the loan REFERENCE string, so it is
+                            # remapped alongside any rename above.
                             old_ref = entry['loan_id']
-                            new_ref = old_ref
-                            
-                            if old_ref and old_ref in loan_id_map:
-                                new_ref = loan_id_map[old_ref]
-                            
-                            # Safe Getters
-                            inst_amt = entry.get('installment_amount', 0) or 0
-                            batch_id = entry.get('batch_id')
-                            int_amt = entry.get('interest_amount', 0) or 0
-                            p_bal = entry.get('principal_balance', 0) or 0
-                            i_bal = entry.get('interest_balance', 0) or 0
-                            p_port = entry.get('principal_portion', 0) or 0
-                            i_port = entry.get('interest_portion', 0) or 0
-                            prev_state = entry.get('previous_state')
-                            is_edited = entry.get('is_edited', 0) or 0
-                            
-                            dest_cur.execute("""
-                                INSERT INTO ledger (
-                                    individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-                                    installment_amount, batch_id, interest_amount,
-                                    principal_balance, interest_balance, principal_portion, interest_portion, 
-                                    previous_state, is_edited, import_id
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                dest_ind_id, entry['date'], entry['event_type'], new_ref, 
+                            new_ref = loan_id_map.get(old_ref, old_ref) if old_ref else old_ref
+
+                            self.ledger.add_imported((
+                                dest_ind_id, entry['date'], entry['event_type'], new_ref,
                                 entry['added'], entry['deducted'], entry['balance'], entry['notes'],
-                                inst_amt, batch_id, int_amt,
-                                p_bal, i_bal, p_port, i_port, 
-                                prev_state, is_edited, import_id
-                            ))
+                                entry.get('installment_amount', 0) or 0,
+                                entry.get('batch_id'),
+                                entry.get('interest_amount', 0) or 0,
+                                entry.get('principal_balance', 0) or 0,
+                                entry.get('interest_balance', 0) or 0,
+                                entry.get('principal_portion', 0) or 0,
+                                entry.get('interest_portion', 0) or 0,
+                                entry.get('previous_state'),
+                                entry.get('is_edited', 0) or 0,
+                                import_id))
                             stats["ledger"] += 1
 
                     except sqlite3.OperationalError:
-                        pass # Ledger might be missing or different schema in very old backups
+                        pass    # Ledger may be missing or differently shaped in very old backups
 
-                    # Checkpoint: Loans & Ledger Imported
                     dest_cur.execute("SAVEPOINT loans_imported")
-                        
+
                 except Exception as e:
-                    # Partial Failure: Rollback loans but KEEP individuals
-                    dest_cur.execute("ROLLBACK TO individuals_imported") 
+                    # Partial failure: roll back loans but KEEP individuals
+                    dest_cur.execute("ROLLBACK TO individuals_imported")
                     status = "partial"
                     errors.append(f"Failed to import loans/ledger: {e}")
                     stats["loans"] = 0
@@ -2096,124 +1957,71 @@ class DatabaseManager:
 
             # --- PHASE 3: SAVINGS ---
             if options.get("import_savings", False):
-                # self.create_savings_table() # MOVED TO START
                 try:
                     savings_affected_ids = set()
-                    
-                    # Check for savings table
-                    src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='savings'")
-                    if src_cur.fetchone():
-                        # Get column names to safely access data
-                        src_cur.execute("SELECT * FROM savings LIMIT 0")
-                        cols = [d[0] for d in src_cur.description]
-                        
-                        date_filter_clause = ""
-                        params = []
-                        if options.get("date_range"):
-                            start_date, end_date = options["date_range"]
-                            date_filter_clause = " WHERE date >= ? AND date <= ?"
-                            params = [start_date, end_date]
-                        
-                        src_cur.execute(f"SELECT * FROM savings{date_filter_clause}", params)
-                        src_savings = src_cur.fetchall()
-                        
+                    if src.has_table("savings"):
+                        cols, src_savings = src.savings(options.get("date_range"))
                         for sav_tuple in src_savings:
                             if progress_callback:
                                 current_op += 1
                                 if current_op % 5 == 0:
-                                     progress_callback(current_op, total_operations, "Importing Savings...")
-                            
+                                    progress_callback(current_op, total_operations, "Importing Savings...")
+
                             sav = dict(zip(cols, sav_tuple))
-                                 
                             old_ind_id = sav['individual_id']
                             if old_ind_id not in id_map:
                                 continue
                             new_ind_id = id_map[old_ind_id]
-                            
-                            dest_cur.execute("""
-                                INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes, import_id)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, (new_ind_id, sav['date'], sav['transaction_type'], sav['amount'], sav['balance'], sav['notes'], import_id))
-                            
+
+                            self.funds.add_imported_savings(
+                                new_ind_id, sav['date'], sav['transaction_type'],
+                                sav['amount'], sav['balance'], sav['notes'], import_id)
                             savings_affected_ids.add(new_ind_id)
                             stats["savings"] += 1
-                        
-                        # Recalculate Balances for affected individuals
+
                         if savings_affected_ids:
-                             if progress_callback:
-                                 progress_callback(current_op, total_operations, "Recalculating Savings Balances...")
-                             
-                             # We need to COMMIT or at least ensure data is visible to recalculate_savings_balance
-                             # recalculate_savings_balance uses a separate cursor on the SAME connection (self.conn).
-                             # Since we are in a transaction (isolation_level=None + manually managed), 
-                             # `self.conn.cursor()` should see the uncommitted changes from `dest_cur`.
-                             
-                             for ind_id in savings_affected_ids:
-                                 self.recalculate_savings_balance(ind_id, cursor=dest_cur)
-                        
-                        # Checkpoint: Savings Imported
+                            if progress_callback:
+                                progress_callback(current_op, total_operations,
+                                                  "Recalculating Savings Balances...")
+                            # Same connection, so the recalculation sees the rows
+                            # written above even though nothing is committed yet.
+                            for ind_id in savings_affected_ids:
+                                self.recalculate_savings_balance(ind_id, cursor=dest_cur)
 
                         dest_cur.execute("SAVEPOINT savings_imported")
-                        
+
                 except Exception as e:
-                    # Partial Failure for Savings
-                    # If we fail here, and loans were imported (or not requested), we retain what we have.
-                    # If loans were imported, we have 'loans_imported' savepoint.
-                    # If loans were NOT imported, we have 'individuals_imported'.
-                    # Let's just rollback to previous stable point.
-                    
-                    # Logic: 
-                    # If loans success -> rollback to loans_imported.
-                    # If loans skipped -> rollback to individuals_imported.
-                    # Actually, we can just catch, log, and NOT rollback everything?
-                    # But we want atomic savings import?
-                    # Let's say: rollback to 'loans_imported' if it exists, else 'individuals_imported'.
-                    
-                    # Simpler: Just log error and set status partial. The partial data (loans/inds) is already safe?
-                    # Wait, if we are in this block, we haven't committed yet.
-                    # We need to explicitly ROLLBACK TO the last good savepoint.
-                    
-                    # For now, let's assume we rollback to 'loans_imported' if we passed it.
-                    # But if we didn't import loans...
-                    # This is tricky without explicit savepoint management for valid previous state.
-                    # Let's skip complex rollback logic for this specific syntax fix and rely on the fact that 
-                    # users can now UNDO imports if they act weird.
+                    # No rollback here — see the savepoint-policy note in the
+                    # docstring. Whatever was written stays, and the user is
+                    # expected to undo the whole run if the result looks wrong.
                     status = "partial"
                     errors.append(f"Failed to import savings: {e}")
                     stats["savings"] = 0
                     logger.exception("Import error (savings)")
-                    pass
 
             # --- PHASE 4: FUNDS & SUSPENSIONS (best-effort) ---
             try:
                 if progress_callback:
                     progress_callback(current_op, total_operations, "Importing funds & suspensions...")
-                aux = self._import_aux_tables(src_cur, dest_cur, id_map, loan_id_map, import_id, options)
-                stats.update(aux)
+                stats.update(self._import_aux_tables(src, id_map, loan_id_map, options))
                 dest_cur.execute("SAVEPOINT aux_imported")
             except Exception as e:
                 status = "partial"
                 errors.append(f"Failed to import funds/suspensions: {e}")
                 logger.exception("Import error (aux tables)")
 
-            # Update Import History with final stats
-            import_details = json.dumps(stats)
-            dest_cur.execute("UPDATE import_history SET details = ?, item_count = ? WHERE id = ?", 
-                             (import_details, total_operations, import_id))
-            
-            # Final Commit - Release the initial savepoint and commit the transaction
+            self.imports.finish(import_id, json.dumps(stats), total_operations)
+
+            # Final commit — release the initial savepoint and commit
             dest_cur.execute("RELEASE import_start")
             self.conn.commit()
-            
-            if src_conn:
-                src_conn.close()
-            # Restore isolation level
+            src.close()
             self.conn.isolation_level = original_isolation
-            
+
         except Exception as e:
-            if src_conn:
-                src_conn.close()
-            self.conn.rollback() # Rollback everything if critical error
+            if src:
+                src.close()
+            self.conn.rollback()
             self.conn.isolation_level = original_isolation
             logger.exception("Critical import error")
             return {"status": "failed", "stats": stats, "errors": [str(e)]}

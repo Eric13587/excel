@@ -96,6 +96,32 @@ class LoanRepository(Repository):
              start_date, next_due_date, unearned_interest))
         return cur.lastrowid
 
+    def add_imported(self, member_id, ref, principal, total_amount, balance, installment,
+                     start_date, next_due_date, status, monthly_interest,
+                     unearned_interest, interest_balance, import_id):
+        """Insert a loan copied from a foreign journal, tagged with its run."""
+        cur = self._execute(
+            "INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+            "installment, start_date, next_due_date, status, monthly_interest, "
+            "unearned_interest, interest_balance, import_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (member_id, ref, principal, total_amount, balance, installment, start_date,
+             next_due_date, status, monthly_interest, unearned_interest,
+             interest_balance, import_id))
+        return cur.lastrowid
+
+    def all_refs(self):
+        """Every loan ref in the journal, for import collision detection.
+
+        Refs are unique per member, so this over-collects deliberately: the
+        importer renames on any collision rather than reasoning per member.
+        """
+        return {r[0] for r in self._rows("SELECT ref FROM loans")}
+
+    def id_for_ref(self, member_id, ref):
+        return self._scalar("SELECT id FROM loans WHERE individual_id=? AND ref=?",
+                            (member_id, ref))
+
     def set_status(self, loan_id, balance, next_due_date, status,
                    interest_balance=None, unearned_interest=None):
         """Post-deduction state. The two optional columns are only written when
@@ -230,12 +256,14 @@ class LoanRepository(Repository):
                       (until_date, suspension_id))
 
     def add_suspension(self, loan_id, member_id, loan_ref, start_date, suspend_until,
-                       resumed_date=None, status="active"):
+                       resumed_date=None, status="active", created_at=None):
+        """``created_at`` is supplied only by the importer, which preserves the
+        source journal's stamp rather than restamping the copy."""
         self._execute(
             "INSERT INTO loan_suspensions (loan_id, individual_id, loan_ref, start_date, "
             "suspend_until, resumed_date, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (loan_id, member_id, loan_ref, start_date, suspend_until, resumed_date, status,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+             created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     def close_open_suspension(self, loan_id, resumed_date):
         self._execute(
