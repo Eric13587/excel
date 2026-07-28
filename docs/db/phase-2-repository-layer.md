@@ -14,8 +14,8 @@ repository as it lands.
 | **2b** | **done** | `MemberRepository` (`individuals`) | 21 of 53 |
 | **2d** | **done** | `FundRepository` (`savings`, both funds, enrolment) | 32 of 55 |
 | **2c-i** | **done** | `LoanRepository` (`loans`, `loan_suspensions`) | 40 of 56 |
-| 2c-ii | next | `LedgerRepository` (`ledger`) | 67 |
-| 2e | pending | `JournalRepository` (COA, entries, lines) | 42 |
+| **2c-ii** | **done** | `LedgerRepository` (`ledger`) | 45 of 67 |
+| 2e | next | `JournalRepository` (COA, entries, lines) | 30 |
 | 2f | pending | Raw SQL out of views/engine/services; `DatabaseService` root | 36 |
 
 Sequencing rationale is in [repository-layer.md](repository-layer.md).
@@ -283,3 +283,82 @@ recorded here rather than changed, because fixing it changes numbers.
 ### Rollback
 
 `git revert` the 2c-i commit. No schema or data change.
+
+---
+
+## 2c-ii — LedgerRepository
+
+45 of the 67 `ledger` statements move. The remainder are the import path and
+the `is_edited` normalisation in `create_tables` (migrations), plus two
+deliberate exclusions below.
+
+Raw SQL removed from six more modules: `balance_calculator` (six writes inside
+the smart-replay loop), `loan_service` (six probes and a scoped delete),
+`engine` (four heal probes and the unbounded lock clear),
+`transaction_manager` (the rate-change rewrite), `undo_manager` (delete and
+restore) and `views/ledger.py` (a date edit).
+
+### The interest edit-lock now has one owner (finding D4)
+
+Three statements with three different scopes became one method:
+
+| Caller | Scope | Now |
+|---|---|---|
+| `unlock_future_interest` | clear, `date > ?` | `set_interest_lock(..., locked=False, from_date=d)` |
+| loan-heal | clear, **unbounded** | `set_interest_lock(..., locked=False)` |
+| rate change | set, `date >= ?` | `set_accrual_from_date(...)` |
+
+Each caller keeps its own scope — changing them changes which rows a
+recalculation may overwrite — but there is now one statement to reason about,
+and four tests pin the boundaries, including that an unbounded clear discards
+*every* lock (safe only on loans with no legitimate interest edits, which is
+why the heal tool checks that first).
+
+### Two things deliberately left outside the repository
+
+* **`create_tables`'s `is_edited` normalisation** belongs to migrations, not
+  data access.
+* **`DeleteTransactionCommand`** in `undo_manager.py` still holds raw SQL. It
+  is dead — exported but never instantiated — and its `INSERT` targets
+  `ledger.principal_amount` and `ledger.linked_trans_id`, columns that have
+  never existed in any schema generation, so the path raises
+  `OperationalError` if reached. Migrating it would make the repository
+  advertise columns that do not exist. It should be **deleted**, which is a
+  one-line change to `src/services/__init__.py` plus the class — held back
+  because removing a public name is not a refactor-phase decision.
+
+### Preserved quirks, now pinned by tests
+
+* `update_core`'s `mark_edited` writes the payment **amount** into `is_edited`
+  rather than 1 — the "hysteresis fix" that keeps the user's intended figure
+  across a recalculation. `create_tables` normalises it back to 0/1 on the next
+  open. `count_edited` therefore tests for *nonzero*, not equality with 1.
+* The principal/interest portions are written as a pair or not at all; a single
+  portion is silently ignored.
+* `earliest_date_*` covers only `ledger` and `savings`, so a member whose whole
+  history is Christmas or benevolent has no earliest date (finding D7).
+
+### A coverage gap this exposed
+
+Removing a cursor left a dangling `row[0]` in `ReportGenerator.get_recent_quarters`,
+and **the whole suite still passed** — the method has two dashboard call sites
+and no test. `ruff` caught it, and there is now a regression test.
+
+### Verification
+
+* 342 → 365 tests (23 added). `ruff` clean.
+* **Two differential comparisons** against the 2c-i commit, via a git worktree,
+  both on a copy of the production journal:
+  1. the 30-operation lifecycle sequence — all twelve tables hash identically;
+  2. a sequence targeting exactly what this phase touched — catch-up, a manual
+     repayment edit (rate rewrite + lock), smart replay, date-bounded unlock,
+     delete/undo/redo, the heal probe, and a full schedule rebuild — identical
+     line for line, including the resulting `ledger` and `loans` hashes.
+
+  The second run initially reported "IDENTICAL" while both sides were throwing
+  the same `TypeError`. The harness now fails loudly on a traceback; a
+  differential that compares two failures is worthless.
+
+### Rollback
+
+`git revert` the 2c-ii commit. No schema or data change.

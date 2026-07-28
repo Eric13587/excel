@@ -147,12 +147,8 @@ class LoanService:
 
     def has_loan_restructure_events(self, individual_id, loan_ref):
         """True if the loan has top-ups or buy-offs (a plain rebuild is unsafe)."""
-        cursor = self.db.conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-            "AND event_type IN ('Loan Top-Up', 'Loan Buyoff')",
-            (individual_id, loan_ref))
-        return cursor.fetchone()[0] > 0
+        return self.db.ledger.count_events(
+            individual_id, loan_ref, ("Loan Top-Up", "Loan Buyoff")) > 0
 
     def rebuild_loan_schedule(self, individual_id, loan_ref, target_date=None):
         """Re-derive a loan's repayment schedule from issue, applying suspensions.
@@ -171,24 +167,19 @@ class LoanService:
             raise ValueError(
                 "Cannot auto-rebuild a loan with top-ups or buy-offs; adjust it manually.")
 
-        cursor = self.db.conn.cursor()
         # Rebuild up to the latest existing deduction (or an explicit target).
-        cursor.execute("SELECT MAX(date) FROM ledger WHERE individual_id=? AND loan_id=? "
-                       "AND event_type='Repayment'", (individual_id, loan_ref))
-        last = cursor.fetchone()[0]
+        last = self.db.ledger.max_date(individual_id, loan_ref, "Repayment")
         limit = target_date or last or datetime.now().strftime("%Y-%m-%d")
 
         # Wipe auto rows (keep the Loan Issued record).
-        cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=? "
-                       "AND event_type IN ('Repayment', 'Interest Earned')",
-                       (individual_id, loan_ref))
+        self.db.ledger.delete_events(individual_id, loan_ref,
+                                     ("Repayment", "Interest Earned"))
 
         # Reset to issued state: full principal outstanding, all interest unearned.
         principal = float(loan.get('principal') or 0)
         unearned = round(principal * DEFAULT_INTEREST_RATE, 2)
-        cursor.execute("SELECT MIN(date) FROM ledger WHERE individual_id=? AND loan_id=? "
-                       "AND event_type='Loan Issued'", (individual_id, loan_ref))
-        issue = cursor.fetchone()[0] or loan.get('start_date')
+        issue = (self.db.ledger.min_date(individual_id, loan_ref, "Loan Issued")
+                 or loan.get('start_date'))
         deduct_same = self.db.settings.deduct_same_month
         issue_dt = datetime.strptime(str(issue)[:10], "%Y-%m-%d")
         next_due = (issue_dt if deduct_same else issue_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
@@ -483,13 +474,10 @@ class LoanService:
         if not batch_id: return False
         
         # 1. Identify affected individuals
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT DISTINCT individual_id FROM ledger WHERE batch_id=?", (batch_id,))
-        affected_ids = [row[0] for row in cursor.fetchall()]
-        
+        affected_ids = self.db.ledger.members_in_batch(batch_id)
+
         # 2. Identify affected loans to restore state
-        cursor.execute("SELECT DISTINCT loan_id, individual_id FROM ledger WHERE batch_id=?", (batch_id,))
-        affected_loans = cursor.fetchall() # List of (loan_id, ind_id)
+        affected_loans = self.db.ledger.loans_in_batch(batch_id)  # (loan_ref, member_id)
 
         # 3. Restore previous states for each transaction in reverse order?
         # Since we use `previous_state` JSON in ledger, we can restore loan state from the FIRST transaction for each loan in the batch?

@@ -65,15 +65,13 @@ class ReportGenerator:
             
         fy_start_idx = self.get_fy_start_month_index()
         
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT MIN(date) FROM (SELECT date FROM ledger UNION ALL SELECT date FROM savings)")
-        row = cursor.fetchone()
-        
+        earliest = self.db.ledger.earliest_date_overall()
+
         start_year = ref_date.year
-        if row and row[0]:
+        if earliest:
             try:
                 # Expecting YYYY-MM-DD
-                earliest_date = datetime.strptime(row[0][:10], "%Y-%m-%d")
+                earliest_date = datetime.strptime(earliest[:10], "%Y-%m-%d")
                 start_year = earliest_date.year
             except ValueError:
                 pass

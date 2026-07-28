@@ -11,8 +11,8 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import (FundRepository, LoanRepository, MemberRepository,
-                    SettingsRepository)
+from src.db import (FundRepository, LedgerRepository, LoanRepository,
+                    MemberRepository, SettingsRepository)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -78,6 +78,7 @@ class DatabaseManager:
         self.members = MemberRepository(self.conn)
         self.funds = FundRepository(self.conn)
         self.loans = LoanRepository(self.conn)
+        self.ledger = LedgerRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -1065,78 +1066,29 @@ class DatabaseManager:
 
     def get_earliest_record_date(self, individual_id):
         """Get the earliest transaction date for an individual across ledger and savings."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT MIN(date) FROM (
-                SELECT MIN(date) AS date FROM ledger WHERE individual_id = ?
-                UNION ALL
-                SELECT MIN(date) AS date FROM savings WHERE individual_id = ?
-            )
-        """, (individual_id, individual_id))
-        row = cursor.fetchone()
-        return row[0] if row and row[0] else None
+        return self.ledger.earliest_date_for_members([individual_id])
 
     def get_earliest_record_date_for_ids(self, individual_ids):
-        """Get the earliest transaction date across multiple individuals.
-        
-        Uses a single query with IN clause for efficiency.
-        """
-        if not individual_ids:
-            return None
-        placeholders = ','.join('?' * len(individual_ids))
-        cursor = self.conn.cursor()
-        cursor.execute(f"""
-            SELECT MIN(date) FROM (
-                SELECT MIN(date) AS date FROM ledger WHERE individual_id IN ({placeholders})
-                UNION ALL
-                SELECT MIN(date) AS date FROM savings WHERE individual_id IN ({placeholders})
-            )
-        """, list(individual_ids) + list(individual_ids))
-        row = cursor.fetchone()
-        return row[0] if row and row[0] else None
+        """Get the earliest transaction date across multiple individuals."""
+        return self.ledger.earliest_date_for_members(list(individual_ids))
 
     # Ledger operations
     def get_ledger(self, individual_id, start_date=None, end_date=None):
-        query = "SELECT * FROM ledger WHERE individual_id = ?"
-        params = [individual_id]
-        
-        if start_date:
-            query += " AND date >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND date <= ?"
-            params.append(end_date)
-            
-        query += " ORDER BY date, id"
-            
-        return pd.read_sql_query(query, self.conn, params=tuple(params))
+        return self.ledger.for_member(individual_id, start_date, end_date)
 
     def get_transaction(self, trans_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM ledger WHERE id=?", (trans_id,))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
-        return None
+        return self.ledger.get(trans_id)
 
-    def add_transaction(self, individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
-                       installment_amount=0, interest_amount=0, batch_id=None, 
+    def add_transaction(self, individual_id, date, event_type, loan_id, added, deducted, balance, notes,
+                       installment_amount=0, interest_amount=0, batch_id=None,
                        principal_balance=0, interest_balance=0, principal_portion=0, interest_portion=0,
                        previous_state=None):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO ledger (
-                individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
+        with self.transaction():
+            new_id = self.ledger.add((
+                individual_id, date, event_type, loan_id, added, deducted, balance, notes,
                 installment_amount, interest_amount, batch_id,
-                principal_balance, interest_balance, principal_portion, interest_portion, previous_state
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-              installment_amount, interest_amount, batch_id,
-              principal_balance, interest_balance, principal_portion, interest_portion, previous_state))
-        new_id = cursor.lastrowid
-        self.conn.commit()
+                principal_balance, interest_balance, principal_portion, interest_portion,
+                previous_state))
         self._fire_post_hook(self.ledger_post_hook, [new_id])
         return new_id
 
@@ -1144,103 +1096,44 @@ class DatabaseManager:
         """Bulk insert multiple transactions into the ledger."""
         if not transactions:
             return
-            
-        cursor = self.conn.cursor()
-        
-        vals = []
-        for tx in transactions:
-            vals.append((
-                tx.get('individual_id'),
-                tx.get('date'),
-                tx.get('event_type'),
-                tx.get('loan_id'),
-                tx.get('added', 0),
-                tx.get('deducted', 0),
-                tx.get('balance', 0),
-                tx.get('notes', ""),
-                tx.get('installment_amount', 0),
-                tx.get('interest_amount', 0),
-                tx.get('batch_id'),
-                tx.get('principal_balance', 0),
-                tx.get('interest_balance', 0),
-                tx.get('principal_portion', 0),
-                tx.get('interest_portion', 0),
-                tx.get('previous_state', None)
-            ))
-            
+
+        rows = [tuple(tx.get(col, default) for col, default in (
+            ("individual_id", None), ("date", None), ("event_type", None), ("loan_id", None),
+            ("added", 0), ("deducted", 0), ("balance", 0), ("notes", ""),
+            ("installment_amount", 0), ("interest_amount", 0), ("batch_id", None),
+            ("principal_balance", 0), ("interest_balance", 0),
+            ("principal_portion", 0), ("interest_portion", 0), ("previous_state", None)))
+            for tx in transactions]
+
         # lastrowid is unreliable after executemany; if a GL hook is registered,
         # snapshot the max id first and read back the new rows afterwards.
-        prev_max = None
-        if self.ledger_post_hook:
-            cursor.execute("SELECT COALESCE(MAX(id), 0) FROM ledger")
-            prev_max = cursor.fetchone()[0]
+        prev_max = self.ledger.max_id() if self.ledger_post_hook else None
 
-        cursor.executemany("""
-            INSERT INTO ledger (
-                individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-                installment_amount, interest_amount, batch_id,
-                principal_balance, interest_balance, principal_portion, interest_portion, previous_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, vals)
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.add_many(rows)
 
-        if self.ledger_post_hook and prev_max is not None:
-            cursor.execute("SELECT id FROM ledger WHERE id > ? ORDER BY id", (prev_max,))
-            new_ids = [r[0] for r in cursor.fetchall()]
-            self._fire_post_hook(self.ledger_post_hook, new_ids)
+        if prev_max is not None:
+            self._fire_post_hook(self.ledger_post_hook, self.ledger.ids_above(prev_max))
 
-    def update_transaction(self, id, date, added, deducted, notes, principal_portion=None, interest_portion=None, mark_edited=False, interest_amount=None):
+    def update_transaction(self, id, date, added, deducted, notes, principal_portion=None,
+                           interest_portion=None, mark_edited=False, interest_amount=None):
         """Update a transaction with parameterized queries (SQL injection safe)."""
-        cursor = self.conn.cursor()
-        id = int(id)  # Ensure native int for SQLite compatibility
-        
-        # Build query dynamically using parameterized approach
-        set_clauses = ["date=?", "added=?", "deducted=?", "notes=?"]
-        params = [date, added, deducted, notes]
-        
-        # Add optional columns
-        if principal_portion is not None and interest_portion is not None:
-            set_clauses.extend(["principal_portion=?", "interest_portion=?"])
-            params.extend([principal_portion, interest_portion])
-        
-        # Hysteresis Fix: Store the Target Amount in `is_edited` to preserve user intent
-        if mark_edited:
-            # Use the value of deducted as the "Anchor Value".
-            val = deducted if deducted > 1 else 1
-            set_clauses.append("is_edited=?")
-            params.append(val)
-        
-        # Rate Storage Logic
-        if interest_amount is not None:
-            set_clauses.append("interest_amount=?")
-            params.append(interest_amount)
-        
-        # Add id at the end for WHERE clause
-        params.append(id)
-        
-        query = f"UPDATE ledger SET {', '.join(set_clauses)} WHERE id=?"
-        cursor.execute(query, tuple(params))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.update_core(id, date, added, deducted, notes, principal_portion,
+                                    interest_portion, mark_edited, interest_amount)
 
     def update_balance(self, id, balance):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE ledger SET balance=? WHERE id=?", (balance, id))
-        self.conn.commit()
-    
+        with self.transaction():
+            self.ledger.set_balance(id, balance)
+
     def update_ledger_balances(self, id, balance, principal_bal, interest_bal, gross_bal=0):
         """Update all three balance types for a ledger entry."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE ledger 
-            SET balance=?, principal_balance=?, interest_balance=?, gross_balance=? 
-            WHERE id=?
-        """, (balance, principal_bal, interest_bal, gross_bal, id))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.set_running_balances(id, balance, principal_bal, interest_bal, gross_bal)
 
     def delete_transaction(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE id=?", (id,))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.delete(id)
 
     # Loan operations
     def add_loan_record(self, individual_id, ref, principal, total, balance, installment,
@@ -1281,13 +1174,9 @@ class DatabaseManager:
 
         Scoped to one member — loan refs (L-001) are not unique across individuals.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE ledger
-            SET is_edited = 0
-            WHERE individual_id = ? AND loan_id = ? AND event_type = 'Interest Earned' AND date > ?
-        """, (individual_id, loan_ref, date_str))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.set_interest_lock(individual_id, loan_ref, locked=False,
+                                          from_date=date_str)
 
     def update_loan_details(self, loan_id, total_amount, balance, installment, monthly_interest,
                             next_due_date, unearned_interest=None, principal_update=None,
@@ -1393,14 +1282,8 @@ class DatabaseManager:
         Used to warn before recording a 'no-deductions' suspension over a window
         that already has deductions (which would contradict the statement).
         """
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-            "AND event_type IN ('Repayment', 'Loan Buyoff') "
-            "AND date >= ? AND date <= ?",
-            (individual_id, loan_ref, start_date, end_date),
-        )
-        return cursor.fetchone()[0]
+        return self.ledger.count_events(individual_id, loan_ref,
+                                       ("Repayment", "Loan Buyoff"), start_date, end_date)
 
     # ========== RETIREMENT OPERATIONS ==========
 
@@ -1425,9 +1308,8 @@ class DatabaseManager:
 
     def delete_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from ledger."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.delete_batch(batch_id)
 
     def delete_savings_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from savings."""

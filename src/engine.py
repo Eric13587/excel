@@ -131,27 +131,20 @@ class LoanEngine:
         with a parseable 'Loan Issued' note.
         """
         import re
-        cur = self.db.conn.cursor()
         lr = self.db.loans.terms(individual_id, loan_ref)
         if not lr:
             return {"healable": False, "reason": "loan not found"}
         lid, cur_total, cur_inst, cur_mi = lr
 
-        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type IN ('Loan Top-Up','Loan Buyoff')", (individual_id, loan_ref))
-        if cur.fetchone()[0] > 0:
+        if self.db.ledger.count_events(individual_id, loan_ref,
+                                       ("Loan Top-Up", "Loan Buyoff")) > 0:
             return {"healable": False, "reason": "has top-up/buy-off", "loan_id": lid}
         # Any nonzero is_edited means the repayment was edited/restructured. Some
         # legacy rows store the amount there instead of 1, so test != 0, not = 1.
-        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Repayment' AND is_edited<>0", (individual_id, loan_ref))
-        if cur.fetchone()[0] > 0:
+        if self.db.ledger.count_edited(individual_id, loan_ref, "Repayment") > 0:
             return {"healable": False, "reason": "has edited repayments", "loan_id": lid}
 
-        cur.execute("SELECT notes FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Loan Issued' ORDER BY date, id LIMIT 1", (individual_id, loan_ref))
-        row = cur.fetchone()
-        note = row[0] if row else ""
+        note = self.db.ledger.first_note(individual_id, loan_ref, "Loan Issued") or ""
         mp = re.search(r"Principal:\s*([\d.]+)", note or "")
         mi = re.search(r"Total Interest:\s*([\d.]+)", note or "")
         md = re.search(r"Duration:\s*(\d+)", note or "")
@@ -173,9 +166,8 @@ class LoanEngine:
         if int(cur_mi or 0) != monthly_interest:
             changes["monthly_interest"] = (cur_mi, monthly_interest)
 
-        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Interest Earned' AND is_edited=1", (individual_id, loan_ref))
-        contaminated = cur.fetchone()[0]
+        contaminated = self.db.ledger.count_edited(individual_id, loan_ref,
+                                                  "Interest Earned", flag=1)
 
         # monthly_interest is re-derived dynamically by recalc (and legitimately
         # drifts from the static note formula), so it is NOT a heal trigger on its
@@ -216,13 +208,11 @@ class LoanEngine:
             return {**plan, "applied": False}  # already healthy (static terms OK)
 
         d = plan["derived"]
-        cur = self.db.conn.cursor()
         self.db.loans.set_healed_terms(plan["loan_id"], d["total_amount"], d["installment"],
                                        d["monthly_interest"], d["unearned_interest"])
         # Clear edit-locks the old cross-member bug set on accruals so recalc
         # re-derives them (safe: simple loans have no legitimate interest edits).
-        cur.execute("UPDATE ledger SET is_edited=0 WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Interest Earned'", (individual_id, loan_ref))
+        self.db.ledger.set_interest_lock(individual_id, loan_ref, locked=False)
         self.db.conn.commit()
 
         self.balance_recalculator.recalculate_loan_history(individual_id, loan_ref)

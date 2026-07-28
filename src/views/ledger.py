@@ -1329,7 +1329,6 @@ class LedgerView(QWidget):
                         # Adding this difference to another date applies the same relative shift (e.g. +1 month).
                         
                         # Batch Update
-                        cursor = self.engine.db.conn.cursor()
                         
                         for i in range(row, total_rows):
                             r_id = table.item(i, 2).data(Qt.ItemDataRole.UserRole)
@@ -1345,7 +1344,7 @@ class LedgerView(QWidget):
                             n_date_obj = r_old + shift_delta
                             n_date_str = n_date_obj.strftime("%Y-%m-%d")
                             
-                            cursor.execute("UPDATE ledger SET date = ? WHERE id = ?", (n_date_str, r_id))
+                            self.db.ledger.set_date(r_id, n_date_str)
                         
                         self.engine.db.conn.commit()
                         self.engine.recalculate_balances(self.current_individual_id)

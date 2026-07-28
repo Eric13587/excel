@@ -356,22 +356,14 @@ class TransactionManager:
                     # === INSTANT ACCRUAL UPDATE ===
                     # Update concurrent & future accruals to reflect new rate immediately.
                     try:
-                        cursor = self.db.conn.cursor()
                         # Scope to this member — loan refs (L-001) are not unique
                         # across individuals.
-                        cursor.execute("""
-                            UPDATE ledger
-                            SET added = ?, is_edited = 1
-                            WHERE individual_id = ? AND loan_id = ? AND event_type = 'Interest Earned' AND date >= ?
-                        """, (new_monthly_interest, individual_id, loan_ref, current_date))
-                        
+                        self.db.ledger.set_accrual_from_date(
+                            individual_id, loan_ref, current_date, new_monthly_interest)
+
                         # Also persist the New Rate in the Repayment Transaction itself
-                        cursor.execute("""
-                            UPDATE ledger
-                            SET interest_amount = ? 
-                            WHERE id = ?
-                        """, (new_monthly_interest, int(trans_id)))
-                        
+                        self.db.ledger.set_interest_amount(int(trans_id), new_monthly_interest)
+
                         self.db.conn.commit()
                         
                         # Recalculate Balances again after direct SQL update

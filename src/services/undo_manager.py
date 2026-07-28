@@ -214,10 +214,9 @@ class UndoTransactionCommand(UndoableCommand):
             self.transaction_manager.delete_transaction(self.individual_id, self.trans_id)
         else:
             # Fallback for tests or legacy calls (though we should avoid this path)
-            cursor = self.db.conn.cursor()
             if self.sibling_id:
-                cursor.execute("DELETE FROM ledger WHERE id = ?", (self.sibling_id,))
-            cursor.execute("DELETE FROM ledger WHERE id = ?", (self.trans_id,))
+                self.db.ledger.delete(self.sibling_id)
+            self.db.ledger.delete(self.trans_id)
             self.db.conn.commit()
             
             # Recalculate balances (TransactionManager handles this internally if called)
@@ -234,7 +233,6 @@ class UndoTransactionCommand(UndoableCommand):
         if not self.tx_snapshots:
             return False
         
-        cursor = self.db.conn.cursor()
         
         # Restore loan state FIRST (before transactions)
         if self.loan_snapshot:
@@ -255,30 +253,12 @@ class UndoTransactionCommand(UndoableCommand):
         sorted_snapshots = sorted(self.tx_snapshots, key=lambda s: s.id)
         
         for snapshot in sorted_snapshots:
-            cursor.execute("""
-                INSERT INTO ledger (
-                    id, individual_id, date, event_type, added, deducted, 
-                    balance, loan_id, notes, interest_amount, 
-                    principal_balance, interest_balance, principal_portion, interest_portion, is_edited
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                snapshot.id,
-                snapshot.individual_id,
-                snapshot.date,
-                snapshot.event_type,
-                snapshot.added,
-                snapshot.deducted,
-                snapshot.balance,
-                snapshot.loan_id,
-                snapshot.notes,
-                snapshot.interest_amount,
-                snapshot.principal_balance,
-                snapshot.interest_balance,
-                snapshot.principal_portion,
-                snapshot.interest_portion,
-                snapshot.is_edited
-            ))
+            self.db.ledger.restore((
+                snapshot.id, snapshot.individual_id, snapshot.date, snapshot.event_type,
+                snapshot.added, snapshot.deducted, snapshot.balance, snapshot.loan_id,
+                snapshot.notes, snapshot.interest_amount, snapshot.principal_balance,
+                snapshot.interest_balance, snapshot.principal_portion,
+                snapshot.interest_portion, snapshot.is_edited))
         
         self.db.conn.commit()
         
@@ -307,9 +287,8 @@ class UndoTransactionCommand(UndoableCommand):
                 self.loan_snapshot = self._capture_loan_snapshot(loan)
         
         # Delete the transaction(s) again
-        cursor = self.db.conn.cursor()
         for snapshot in self.tx_snapshots:
-            cursor.execute("DELETE FROM ledger WHERE id = ?", (snapshot.id,))
+            self.db.ledger.delete(snapshot.id)
         self.db.conn.commit()
         
         # Recalculate balances
