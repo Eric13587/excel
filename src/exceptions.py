@@ -156,3 +156,35 @@ class ImmutableEntryError(LoanMasterError):
             f"Journal entry #{entry_id} cannot be altered: {reason}",
             {'entry_id': entry_id, 'reason': reason},
         )
+
+
+class PeriodClosedError(LoanMasterError):
+    """Raised when a write lands in a fiscal period that has been closed.
+
+    A closed period means the figures published for it are the figures. The
+    correction for a mistake found afterwards is an entry in an open period,
+    not a change to a settled one.
+    """
+
+    def __init__(self, date: str, period_label: str, what: str = "This entry"):
+        super().__init__(
+            f"{what} is dated {date}, which falls in {period_label} — a closed "
+            f"fiscal period. Post the correction in an open period instead.",
+            {'date': date, 'period': period_label},
+        )
+
+
+class PeriodNotClosableError(LoanMasterError):
+    """Raised when a period is not in a state where closing it is meaningful.
+
+    Closing freezes the figures, so it is refused while they are still moving
+    (unposted subledger changes, an earlier period still open) or still wrong
+    (the trial balance does not balance as at the period end).
+    """
+
+    def __init__(self, period: dict, blockers: list):
+        label = period.get('label', 'This period') if period else 'This period'
+        super().__init__(
+            f"{label} cannot be closed:\n  - " + "\n  - ".join(blockers),
+            {'period': label, 'blockers': blockers},
+        )

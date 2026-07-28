@@ -50,8 +50,8 @@ def test_fresh_journal_has_no_failures(journal):
 
 def test_report_covers_every_category(journal):
     categories = {c.category for c in integrity.verify(journal).checks}
-    assert categories == {"structural", "schema", "referential",
-                          "accounting", "projection", "phase 4 readiness"}
+    assert categories == {"structural", "schema", "referential", "accounting",
+                          "projection", "fiscal periods", "phase 4 readiness"}
 
 
 def test_live_connection_enforcement_is_reported(journal):
@@ -314,3 +314,22 @@ def test_inserting_activity_is_not_a_money_change(journal):
     journal.conn.commit()
     journal.add_savings_transaction(ind, "2026-03-01", "Deposit", 100, "")
     assert journal.audit.money_change_count() == 0
+
+
+def test_period_checks_report_an_empty_register(journal):
+    """How migration 008 ships: nothing declared, so nothing is frozen."""
+    check = _check(integrity.verify(journal), "periods declared")
+    assert check.status == integrity.PASS and check.count == 0
+
+
+def test_period_checks_report_what_is_settled(journal):
+    from src.services.period_service import FiscalPeriodService
+    from src.services.gl_service import GLService
+    GLService(journal).sync()
+    svc = FiscalPeriodService(journal)
+    pid = svc.create("Q1", "2026-01-01", "2026-03-31")
+    svc.close(pid)
+
+    report = integrity.verify(journal)
+    assert _check(report, "books settled through").detail == "2026-03-31"
+    assert _check(report, "no edits inside a closed period").status == integrity.PASS

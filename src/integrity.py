@@ -306,6 +306,43 @@ def _check_projection(conn, report):
                f"{stale} entry/entries outlived their subledger row", stale)
 
 
+def _check_periods(conn, report):
+    """The fiscal-period register, once migration 008 has created it.
+
+    Nothing here is a failure. An empty register is the normal state for a
+    journal that has not started closing periods, and is exactly how 008 ships.
+    """
+    if not _table_exists(conn, "fiscal_periods"):
+        return
+    cat = "fiscal periods"
+
+    rows = conn.execute(
+        "SELECT status, COUNT(*) FROM fiscal_periods GROUP BY status").fetchall()
+    counts = dict(rows)
+    total = sum(counts.values())
+    report.add("periods declared", cat, PASS,
+               "none — nothing is frozen" if not total else
+               f"{total} ({counts.get('closed', 0)} closed, {counts.get('open', 0)} open)",
+               total)
+
+    settled = _scalar(conn, "SELECT MAX(end_date) FROM fiscal_periods WHERE status='closed'")
+    if settled:
+        report.add("books settled through", cat, PASS, str(settled))
+
+        # Activity dated inside a closed period that was written after the
+        # close. Migration 009 makes this impossible; until then it is the
+        # measurement that says whether turning the lock on is safe.
+        n = _scalar(conn,
+            "SELECT COUNT(*) FROM audit_log a JOIN fiscal_periods p "
+            "  ON p.status='closed' "
+            "WHERE a.entity IN ('ledger','savings','christmas_savings','benevolent_ledger') "
+            "  AND a.ts > p.closed_at "
+            "  AND json_extract(a.before_image, '$.date') BETWEEN p.start_date AND p.end_date")
+        report.add("no edits inside a closed period", cat, PASS if not n else WARN,
+                   "none recorded" if not n else
+                   f"{n} money row(s) changed after their period was closed", n)
+
+
 def _control(conn, report, label, code, side, subledger_sql, subledger_name):
     """Compare a GL control account against the subledger it summarises."""
     expr = ("SUM(debit)-SUM(credit)") if side == "debit" else ("SUM(credit)-SUM(debit)")
@@ -392,6 +429,7 @@ def verify(target, quick=False):
     _check_referential(conn, report)
     _check_accounting(conn, report)
     _check_projection(conn, report)
+    _check_periods(conn, report)
     _check_phase4_readiness(conn, report)
     return report
 
