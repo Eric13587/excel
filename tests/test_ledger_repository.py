@@ -346,3 +346,55 @@ def test_count_edited_treats_any_nonzero_as_locked(journal):
 
     assert journal.ledger.count_edited(ind, "L-001", "Repayment") == 1
     assert journal.ledger.count_edited(ind, "L-001", "Repayment", flag=1) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3b — one position accessor
+# --------------------------------------------------------------------------- #
+
+def test_position_from_frame_reads_the_last_row(journal):
+    ind = _member(journal)
+    _row(journal, ind, "2026-01-01", "Loan Issued", added=1000, balance=1000,
+         principal_balance=1000, interest_balance=0)
+    _row(journal, ind, "2026-02-01", "Interest Earned", added=13, balance=1013,
+         principal_balance=1000, interest_balance=13)
+
+    from src.db import position_from_frame
+    pos = position_from_frame(journal.get_ledger(ind))
+    assert (pos.balance, pos.principal_balance, pos.interest_balance) == (1013, 1000, 13)
+
+
+def test_position_of_an_empty_frame_is_all_zero(journal):
+    from src.db import position_from_frame
+    ind = _member(journal)
+    pos = position_from_frame(journal.get_ledger(ind))
+    assert (pos.balance, pos.principal_balance, pos.interest_balance) == (0.0, 0.0, 0.0)
+    assert position_from_frame(None).balance == 0.0
+
+
+def test_position_tolerates_a_frame_without_the_split_columns():
+    """A frame read from an older journal may not carry the split columns; the
+    guard the six call sites each carried is kept in one place."""
+    import pandas as pd
+
+    from src.db import position_from_frame
+    df = pd.DataFrame([{"balance": 500.0}])
+    pos = position_from_frame(df)
+    assert (pos.balance, pos.principal_balance, pos.interest_balance) == (500.0, 0.0, 0.0)
+
+
+def test_current_position_matches_the_frame_reader(journal):
+    from src.db import position_from_frame
+    ind = _member(journal)
+    _row(journal, ind, "2026-01-01", "Loan Issued", added=1000, balance=1000,
+         principal_balance=1000)
+    _row(journal, ind, "2026-03-01", "Repayment", deducted=100, balance=900,
+         principal_balance=900)
+    # A back-dated row must not become "current" just because it was inserted last.
+    _row(journal, ind, "2026-02-01", "Interest Earned", added=13, balance=1013,
+         principal_balance=1000, interest_balance=13)
+
+    from_db = journal.ledger.current_position(ind)
+    from_frame = position_from_frame(journal.get_ledger(ind))
+    assert from_db == from_frame
+    assert from_db.balance == 900          # the 2026-03-01 row, not the one inserted last

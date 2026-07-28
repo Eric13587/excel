@@ -25,7 +25,7 @@ See docs/db/repository-layer.md for the full sequencing.
 from src.db.base import Repository
 from src.db.fund import FundRepository
 from src.db.journal import JournalRepository
-from src.db.ledger import LedgerRepository
+from src.db.ledger import LedgerPosition, LedgerRepository, position_from_frame
 from src.db.loan import LoanRepository
 from src.db.member import MemberRepository
 from src.db.repair import AuditRepository, ImportHistoryRepository, RepairRepository
@@ -33,7 +33,7 @@ from src.db.settings import SettingsRepository
 from src.db.source import SourceJournal
 
 __all__ = ["AuditRepository", "FundRepository", "ImportHistoryRepository",
-           "JournalRepository",
+           "JournalRepository", "LedgerPosition", "position_from_frame",
            "LedgerRepository", "LoanRepository", "MemberRepository",
            "RepairRepository", "Repository", "SettingsRepository",
            "SourceJournal"]

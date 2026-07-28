@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 from src.exceptions import LoanNotFoundError, LoanInactiveError, LoanSuspendedError
 from src.config import DEFAULT_INTEREST_RATE
+from src.db import position_from_frame
 
 
 class LoanService:
@@ -68,8 +69,8 @@ class LoanService:
         unearned_interest = interest_total
         
         df = self.get_ledger_df(individual_id)
-        current_balance = df["balance"].iloc[-1] if not df.empty else 0.0
-        prev_principal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+        pos = position_from_frame(df)
+        current_balance, prev_principal = pos.balance, pos.principal_balance
         
         # Determine next loan ID
         all_loans = self.db.get_loans(individual_id)
@@ -261,9 +262,9 @@ class LoanService:
         
         # We need current balances to start simulation
         df = self.get_ledger_df(individual_id)
-        current_balance = df["balance"].iloc[-1] if not df.empty else 0.0
-        current_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        current_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        current_balance, current_p_bal, current_i_bal = (
+            pos.balance, pos.principal_balance, pos.interest_balance)
         
         # We modify 'loan' dict in place as we simulate
         # Important: 'loan' from get_loan_by_ref might not have all fields if they are calc from ledger?
@@ -560,9 +561,8 @@ class LoanService:
         new_interest_bal = current_interest_bal + accrual_amount
         
         df = self.get_ledger_df(individual_id)
-        last_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         if accrual_amount > 0:
             accrual_tx_bal = last_bal + accrual_amount
@@ -673,9 +673,8 @@ class LoanService:
         new_monthly_interest = math.ceil(new_unearned / new_duration)
         
         df = self.get_ledger_df(individual_id)
-        last_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         new_tx_bal = last_bal + top_up_amount
         new_ledger_p_bal = last_p_bal + top_up_amount
@@ -801,9 +800,9 @@ class LoanService:
         # Let's trust loan dict for 'principal_balance' concept if it maps to 'balance'.
         
         # Ledger way:
-        current_tx_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        current_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        current_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        current_tx_bal, current_p_bal, current_i_bal = (
+            pos.balance, pos.principal_balance, pos.interest_balance)
         
         if current_p_bal <= 0 and current_i_bal <= 0:
             # Already paid?

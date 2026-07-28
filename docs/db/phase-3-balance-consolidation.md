@@ -7,7 +7,7 @@ some of them were wrong.
 | Sub-phase | Status | Scope |
 |---|---|---|
 | **3a** | **done** | Savings and fund balances (finding D1) |
-| 3b | next | Loan and interest balances — the `df[...].iloc[-1]` pattern, 17 sites |
+| **3b** | **done** | Loan and interest balances — the `df[...].iloc[-1]` pattern |
 
 ---
 
@@ -97,25 +97,68 @@ values, restore the pre-change backup named in the commit message.
 
 ---
 
-## 3b — loan and interest balances (next)
+## 3b — loan and interest balances
 
-The same shape of problem on the lending side: 17 sites read a member's current
-position with
+### The duplication
+
+Six call sites across the loan lifecycle — issue, catch-up, single deduct,
+top-up, buyoff, and the engine's rate refresh — each re-derived the member's
+current position from a DataFrame:
 
 ```python
-df["balance"].iloc[-1] if not df.empty else 0.0
-df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+last_bal   = df["balance"].iloc[-1] if not df.empty else 0.0
+last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
 ```
 
-each re-deriving "the latest running balance" from a DataFrame, with its own
-empty-frame and missing-column handling. Two known consequences are already
-documented and pinned:
+Now one `LedgerPosition` and one `position_from_frame(df)`, plus
+`LedgerRepository.current_position(member_id)` for callers that do not already
+hold the frame. The column guards are kept rather than dropped: a frame read
+from an older journal genuinely may not carry the split columns.
 
-* `loans.balance` drifting from the ledger it is derived from (the Repair Loans
-  tool exists for this);
-* `restructure_loan` followed by `buyoff_loan` returning 0.00 and leaving the
-  loan `Active`, because the buyoff reads the ledger while `loans.balance` still
-  carries the amount.
+Behaviour-identical — both differentials (the 30-operation lifecycle and the
+edit/undo/replay sequence) match the previous commit exactly.
 
-Both need one accessor for "this member's current principal/interest position",
-and both change numbers, so 3b wants the same measure-then-apply treatment.
+---
+
+## The finding 3b uncovered — measured, not acted on
+
+Consolidating the *reads* does not make them current. All six read a **stored**
+running total, which is only as fresh as the last recalculation. Running the
+application's own `recalculate_balances()` across every member on a copy of the
+production journal moves real numbers:
+
+```
+ledger rows changed : 146 of 2,192
+  balance             146 rows
+  interest_balance    146 rows
+  deducted / added / portions   0 rows   <- no payment amount moves
+members affected    : 12 of 84
+loans rows changed  : 12  (interest_balance only; balance and status unchanged)
+GL 1100             : 8,513,734.18, unchanged
+sum(loans.balance)  : 8,513,734.18, unchanged
+```
+
+So twelve members carry stale accrued-interest figures. Nothing is lost — no
+amount, no principal, and the control account still reconciles — but their
+displayed interest is out of date.
+
+**Not applied.** Some of the corrected loan-level values are *negative* accrued
+interest (−7,696.05, −5,429.45, −1,008.00), which means more interest was
+allocated in repayments than was ever accrued on those loans. That is a
+data-quality question underneath the staleness, and mass-recalculating would
+bury it rather than answer it. Recommended sequence: investigate the negative
+accruals first, then recalculate.
+
+### A note on measuring
+
+The first two attempts to size this were wrong, in ways worth recording. The
+initial probe ordered by `date, id DESC` — which is not "the last row" — and
+replayed `added − deducted` **per member**. Both were wrong:
+`BalanceRecalculator` groups by `loan_id` and runs a separate balance per loan,
+and it decrements by `principal_portion`/`interest_portion`, not by `deducted`.
+Those mistakes reported 1,131 stale rows across 36 members. Running the
+application's own recalculator and diffing gives 146 across 12.
+
+The lesson generalises: on a financial journal, measure with the code that owns
+the definition, not with a reconstruction of it.

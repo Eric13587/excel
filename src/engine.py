@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 from dateutil.relativedelta import relativedelta
 
 from src.config import DEFAULT_INTEREST_RATE
+from src.db import position_from_frame
 
 from src.services import (LoanService, SavingsService, ChristmasService, BenevolentService,
                           BalanceRecalculator, TransactionManager)
@@ -293,9 +294,8 @@ class LoanEngine:
         
         # Need ledger context for running balances
         df = self.get_ledger_df(individual_id)
-        last_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df)
+        last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         # Load current loan state into variables to track simulation
         curr_loan_p_bal = loan['balance']

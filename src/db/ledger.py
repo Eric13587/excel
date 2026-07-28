@@ -20,6 +20,7 @@ Two column names are historical and load-bearing:
 Repositories do not commit; the caller owns the transaction.
 """
 import logging
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -43,6 +44,43 @@ RESTORE_COLUMNS = (
 )
 
 
+@dataclass(frozen=True)
+class LedgerPosition:
+    """A member's running position as at their most recent ledger row.
+
+    ``balance`` is total outstanding debt; ``principal_balance`` and
+    ``interest_balance`` are its two components. All three are read from the
+    stored running columns rather than recomputed, which is what every caller
+    did individually before — see :func:`position_from_frame`.
+    """
+    balance: float = 0.0
+    principal_balance: float = 0.0
+    interest_balance: float = 0.0
+
+
+def position_from_frame(df):
+    """The position carried on the last row of a ledger DataFrame.
+
+    Six call sites across the loan lifecycle repeated this, each with its own
+    empty-frame and missing-column handling::
+
+        df["balance"].iloc[-1] if not df.empty else 0.0
+        df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
+
+    The column guards are not defensive padding: a DataFrame read from an older
+    journal genuinely may not carry the split columns, which is why they are
+    kept here rather than dropped.
+
+    Note this reads a *stored* running total. It is only as current as the last
+    recalculation — see docs/db/phase-3-balance-consolidation.md §3b.
+    """
+    if df is None or df.empty:
+        return LedgerPosition()
+    def last(column):
+        return float(df[column].iloc[-1]) if column in df else 0.0
+    return LedgerPosition(last("balance"), last("principal_balance"), last("interest_balance"))
+
+
 class LedgerRepository(Repository):
     """Every statement that touches ``ledger``."""
 
@@ -64,6 +102,13 @@ class LedgerRepository(Repository):
 
     def get(self, row_id):
         return self._dict("SELECT * FROM ledger WHERE id=?", (row_id,))
+
+    def current_position(self, member_id):
+        """:class:`LedgerPosition` from the member's most recent row."""
+        row = self._row(
+            "SELECT balance, principal_balance, interest_balance FROM ledger "
+            "WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1", (member_id,))
+        return LedgerPosition(*(float(v or 0.0) for v in row)) if row else LedgerPosition()
 
     def count_events(self, member_id, loan_ref, event_types, start_date=None, end_date=None):
         """Rows of the given event types for one member's loan, optionally dated."""
