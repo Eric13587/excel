@@ -193,10 +193,7 @@ class LoanService:
         issue_dt = datetime.strptime(str(issue)[:10], "%Y-%m-%d")
         next_due = (issue_dt if deduct_same else issue_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
 
-        cursor.execute(
-            "UPDATE loans SET balance=?, interest_balance=0, unearned_interest=?, "
-            "next_due_date=?, status='Active' WHERE id=?",
-            (principal, unearned, next_due, loan['id']))
+        self.db.loans.reset_to_issued(loan['id'], principal, unearned, next_due)
         self.db.conn.commit()
 
         self.balance_recalculator.recalculate_balances(individual_id)
@@ -246,9 +243,7 @@ class LoanService:
                 
                 if months_skipped > 0:
                     # Advance next_due_date on the loan record (extending term)
-                    cursor = self.db.conn.cursor()
-                    cursor.execute("UPDATE loans SET next_due_date=? WHERE id=?", 
-                                   (due_date.strftime("%Y-%m-%d"), loan['id']))
+                    self.db.loans.set_next_due(loan['id'], due_date.strftime("%Y-%m-%d"))
                     self.db.conn.commit()
                 
                 # If suspension period has now passed, auto-resume and re-fetch
@@ -413,20 +408,11 @@ class LoanService:
             
             # Update Loan Record to final state
             # We need to update existing loan record with new balances and next due date
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                UPDATE loans 
-                SET balance=?, interest_balance=?, unearned_interest=?, next_due_date=?, status=? 
-                WHERE id=? AND individual_id=?
-            """, (
-                sim_loan['balance'], 
-                sim_loan['interest_balance'], 
-                sim_loan['unearned_interest'], 
-                sim_loan['next_due_date'], 
-                sim_loan['status'],
-                loan['id'], # Need internal ID? get_loan_by_ref returns dict with 'id' usually?
-                individual_id
-            ))
+            self.db.loans.set_catch_up_state(
+                loan['id'], individual_id,
+                sim_loan['balance'], sim_loan['interest_balance'],
+                sim_loan['unearned_interest'], sim_loan['next_due_date'],
+                sim_loan['status'])
             # get_loan_by_ref returns joined data? Let's check keys.
             # Assuming 'id' is present. If row factory used, yes.
             
@@ -437,9 +423,8 @@ class LoanService:
         elif skipped_count > 0:
             # The catch-up window fell entirely inside a suspension: no
             # deductions, but the term still advances — persist the new due date.
-            cursor = self.db.conn.cursor()
-            cursor.execute("UPDATE loans SET next_due_date=? WHERE id=? AND individual_id=?",
-                           (sim_loan['next_due_date'], loan['id'], individual_id))
+            self.db.loans.set_next_due(loan['id'], sim_loan['next_due_date'],
+                                       member_id=individual_id)
             self.db.conn.commit()
 
         return count
@@ -571,9 +556,7 @@ class LoanService:
                     break
                 due = due + relativedelta(months=1)
             loan['next_due_date'] = due.strftime("%Y-%m-%d")
-            cursor = self.db.conn.cursor()
-            cursor.execute("UPDATE loans SET next_due_date=? WHERE id=?",
-                           (loan['next_due_date'], loan['id']))
+            self.db.loans.set_next_due(loan['id'], loan['next_due_date'])
             self.db.conn.commit()
 
         previous_state_json = json.dumps(self._capture_loan_state(loan))

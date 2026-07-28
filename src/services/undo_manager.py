@@ -238,24 +238,17 @@ class UndoTransactionCommand(UndoableCommand):
         
         # Restore loan state FIRST (before transactions)
         if self.loan_snapshot:
-            cursor.execute("""
-                UPDATE loans SET
-                    principal = ?, total_amount = ?, balance = ?, installment = ?,
-                    interest_balance = ?, unearned_interest = ?, monthly_interest = ?,
-                    next_due_date = ?, status = ?
-                WHERE id = ?
-            """, (
-                self.loan_snapshot.principal,
-                self.loan_snapshot.total_amount,
-                self.loan_snapshot.balance,
-                self.loan_snapshot.installment,
-                self.loan_snapshot.interest_balance,
-                self.loan_snapshot.unearned_interest,
-                self.loan_snapshot.monthly_interest,
-                self.loan_snapshot.next_due_date,
-                self.loan_snapshot.status,
-                self.loan_snapshot.id
-            ))
+            self.db.loans.restore(
+                self.loan_snapshot.id,
+                principal=self.loan_snapshot.principal,
+                total_amount=self.loan_snapshot.total_amount,
+                balance=self.loan_snapshot.balance,
+                installment=self.loan_snapshot.installment,
+                interest_balance=self.loan_snapshot.interest_balance,
+                unearned_interest=self.loan_snapshot.unearned_interest,
+                monthly_interest=self.loan_snapshot.monthly_interest,
+                next_due_date=self.loan_snapshot.next_due_date,
+                status=self.loan_snapshot.status)
         
         # Restore transactions (in correct order - sibling/Interest first, then main)
         # Sort by ID to ensure proper order (Interest Earned typically has lower ID)

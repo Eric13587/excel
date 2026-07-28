@@ -11,7 +11,8 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import FundRepository, MemberRepository, SettingsRepository
+from src.db import (FundRepository, LoanRepository, MemberRepository,
+                    SettingsRepository)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -76,6 +77,7 @@ class DatabaseManager:
         self.settings = SettingsRepository(self.conn)
         self.members = MemberRepository(self.conn)
         self.funds = FundRepository(self.conn)
+        self.loans = LoanRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -1241,81 +1243,38 @@ class DatabaseManager:
         self.conn.commit()
 
     # Loan operations
-    def add_loan_record(self, individual_id, ref, principal, total, balance, installment, monthly_interest, start_date, next_due_date, unearned_interest=0):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO loans (
-                individual_id, ref, principal, total_amount, balance, installment, 
-                monthly_interest, start_date, next_due_date, unearned_interest, interest_balance, status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Active')
-        """, (individual_id, ref, principal, total, balance, installment, monthly_interest, start_date, next_due_date, unearned_interest))
-        self.conn.commit()
+    def add_loan_record(self, individual_id, ref, principal, total, balance, installment,
+                        monthly_interest, start_date, next_due_date, unearned_interest=0):
+        with self.transaction():
+            self.loans.add(individual_id, ref, principal, total, balance, installment,
+                           monthly_interest, start_date, next_due_date, unearned_interest)
 
     def get_active_loans(self, individual_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE individual_id=? AND status='Active'", (individual_id,))
-        cols = [description[0] for description in cursor.description]
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        return self.loans.active_for_member(individual_id)
 
     def get_loans(self, individual_id):
         """Get ALL loans (Active and Paid) for an individual."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE individual_id=?", (individual_id,))
-        cols = [description[0] for description in cursor.description]
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        return self.loans.for_member(individual_id)
 
     def get_all_active_loans(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE status='Active'")
-        cols = [description[0] for description in cursor.description]
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        return self.loans.all_active()
 
     def get_overdue_count(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM loans WHERE status='Active' AND next_due_date < ?", (today,))
-        return cursor.fetchone()[0]
+        return self.loans.overdue_count(datetime.now().strftime("%Y-%m-%d"))
 
     def get_loan_by_ref(self, individual_id, ref):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE individual_id=? AND ref=?", (individual_id, ref))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
-        return None
+        return self.loans.by_ref(individual_id, ref)
 
-    def update_loan_status(self, loan_id, balance, next_due_date, status, interest_balance=None, unearned_interest=None):
-        cursor = self.conn.cursor()
-        
-        # Build query dynamically based on provided args
-        query = "UPDATE loans SET balance=?, next_due_date=?, status=?"
-        params = [balance, next_due_date, status]
-        
-        if interest_balance is not None:
-            query += ", interest_balance=?"
-            params.append(interest_balance)
-            
-        if unearned_interest is not None:
-            query += ", unearned_interest=?"
-            params.append(unearned_interest)
-            
-        query += " WHERE id=?"
-        params.append(loan_id)
-        
-        cursor.execute(query, tuple(params))
-        self.conn.commit()
+    def update_loan_status(self, loan_id, balance, next_due_date, status,
+                           interest_balance=None, unearned_interest=None):
+        with self.transaction():
+            self.loans.set_status(loan_id, balance, next_due_date, status,
+                                  interest_balance, unearned_interest)
 
     def update_loan_recalc_state(self, loan_id, monthly_interest, unearned_interest):
         """Update loan terms derived from history replay."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE loans 
-            SET monthly_interest = ?, unearned_interest = ?
-            WHERE id = ?
-        """, (monthly_interest, unearned_interest, loan_id))
-        self.conn.commit()
+        with self.transaction():
+            self.loans.set_recalc_state(loan_id, monthly_interest, unearned_interest)
 
     def unlock_future_interest(self, individual_id, loan_ref, date_str):
         """Reset is_edited flag for future interest rows, allowing re-simulation.
@@ -1330,31 +1289,13 @@ class DatabaseManager:
         """, (individual_id, loan_ref, date_str))
         self.conn.commit()
 
-    def update_loan_details(self, loan_id, total_amount, balance, installment, monthly_interest, next_due_date, unearned_interest=None, principal_update=None, interest_balance=None):
-        cursor = self.conn.cursor()
-        
-        query = """UPDATE loans 
-                   SET total_amount=?, balance=?, installment=?, monthly_interest=?, next_due_date=?"""
-        params = [total_amount, balance, installment, monthly_interest, next_due_date]
-        
-        if unearned_interest is not None:
-            query += ", unearned_interest=?"
-            params.append(unearned_interest)
-            
-        if principal_update is not None:
-            query += ", principal=?"
-            params.append(principal_update)
-            
-        if interest_balance is not None:
-            query += ", interest_balance=?"
-            params.append(interest_balance)
-            
-        query += " WHERE id=?"
-        params.append(loan_id)
-        
-        # print(f"DB DEBUG: Executing UPDATE loans: {query} with {params}") 
-        cursor.execute(query, tuple(params))
-        self.conn.commit()
+    def update_loan_details(self, loan_id, total_amount, balance, installment, monthly_interest,
+                            next_due_date, unearned_interest=None, principal_update=None,
+                            interest_balance=None):
+        with self.transaction():
+            self.loans.set_details(loan_id, total_amount, balance, installment, monthly_interest,
+                                   next_due_date, unearned_interest, principal_update,
+                                   interest_balance)
 
     def delete_loan(self, individual_id, loan_ref):
         """Delete a loan and its transactions as a single atomic operation.
@@ -1367,11 +1308,7 @@ class DatabaseManager:
         per member only.
         """
         with self.transaction():
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=?",
-                           (individual_id, loan_ref))
-            cursor.execute("DELETE FROM loans WHERE individual_id=? AND ref=?",
-                           (individual_id, loan_ref))
+            self.loans.delete_with_ledger(individual_id, loan_ref)
 
     # ========== LOAN SUSPENSION OPERATIONS ==========
 
@@ -1384,41 +1321,21 @@ class DatabaseManager:
             start_date: Optional YYYY-MM-DD date the suspension takes effect.
                 Defaults to today.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE loans SET is_suspended=1, suspend_until=? WHERE id=?", (until_date, loan_id))
-
         if start_date is None:
             start_date = datetime.now().strftime("%Y-%m-%d")
-
-        # Resolve loan_ref / individual_id for the audit record.
-        cursor.execute("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
-        row = cursor.fetchone()
-        loan_ref = row[0] if row else None
-        individual_id = row[1] if row else None
-
-        # If an open span already exists (re-suspending an already-suspended loan,
-        # or extending it), update it in place rather than creating a duplicate.
-        # Only the intended resume date moves; the original start_date is
-        # preserved so the recorded span still covers the full skipped period.
-        cursor.execute(
-            "SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL AND status='active' ORDER BY id DESC LIMIT 1",
-            (loan_id,),
-        )
-        existing = cursor.fetchone()
-        if existing:
-            cursor.execute(
-                "UPDATE loan_suspensions SET suspend_until=? WHERE id=?",
-                (until_date, existing[0]),
-            )
-        else:
-            cursor.execute(
-                """INSERT INTO loan_suspensions
-                       (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, NULL, 'active', ?)""",
-                (loan_id, individual_id, loan_ref, start_date, until_date,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
-        self.conn.commit()
+        with self.transaction():
+            self.loans.set_suspended(loan_id, until_date)
+            loan_ref, individual_id = self.loans.identity(loan_id)
+            # Re-suspending or extending an already-suspended loan updates the
+            # open span in place rather than creating a duplicate. Only the
+            # intended resume date moves; the original start_date is preserved
+            # so the recorded span still covers the full skipped period.
+            existing = self.loans.open_suspension_id(loan_id)
+            if existing:
+                self.loans.extend_suspension(existing, until_date)
+            else:
+                self.loans.add_suspension(loan_id, individual_id, loan_ref,
+                                          start_date, until_date)
 
     def resume_loan(self, loan_id, resumed_date=None):
         """Resume deductions for a suspended loan and close its suspension span.
@@ -1430,20 +1347,11 @@ class DatabaseManager:
                 intended ``suspend_until`` boundary so the recorded span reflects
                 the real skipped period rather than when the job happened to run.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE loans SET is_suspended=0, suspend_until=NULL WHERE id=?", (loan_id,))
-
         if resumed_date is None:
             resumed_date = datetime.now().strftime("%Y-%m-%d")
-
-        # Close the most recent open suspension span for this loan.
-        cursor.execute(
-            "UPDATE loan_suspensions SET resumed_date=?, status='resumed' "
-            "WHERE id = (SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL "
-            "ORDER BY id DESC LIMIT 1)",
-            (resumed_date, loan_id),
-        )
-        self.conn.commit()
+        with self.transaction():
+            self.loans.clear_suspended(loan_id)
+            self.loans.close_open_suspension(loan_id, resumed_date)
 
     def get_loan_suspensions(self, individual_id):
         """Return all recorded suspension spans for an individual.
@@ -1452,14 +1360,7 @@ class DatabaseManager:
             List of dicts with keys: id, loan_id, individual_id, loan_ref,
             start_date, suspend_until, resumed_date, status.
         """
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT id, loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status "
-            "FROM loan_suspensions WHERE individual_id=? ORDER BY start_date, id",
-            (individual_id,),
-        )
-        cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, r)) for r in cursor.fetchall()]
+        return self.loans.suspensions_for_member(individual_id)
 
     def record_suspension(self, loan_id, start_date, end_date, today=None):
         """Record a suspension span anywhere in time (past, present or future).
@@ -1476,19 +1377,10 @@ class DatabaseManager:
             today = datetime.now().strftime("%Y-%m-%d")
 
         if end_date and end_date <= today:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
-            row = cursor.fetchone()
-            loan_ref = row[0] if row else None
-            individual_id = row[1] if row else None
-            cursor.execute(
-                """INSERT INTO loan_suspensions
-                       (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'resumed', ?)""",
-                (loan_id, individual_id, loan_ref, start_date, end_date, end_date,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
-            self.conn.commit()
+            with self.transaction():
+                loan_ref, individual_id = self.loans.identity(loan_id)
+                self.loans.add_suspension(loan_id, individual_id, loan_ref, start_date,
+                                          end_date, resumed_date=end_date, status='resumed')
             return 'historical'
 
         self.suspend_loan(loan_id, until_date=end_date, start_date=start_date)
@@ -1529,9 +1421,7 @@ class DatabaseManager:
 
     def has_outstanding_loans(self, ind_id):
         """Check if an individual has any active (outstanding) loans."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM loans WHERE individual_id=? AND status='Active'", (ind_id,))
-        return cursor.fetchone()[0] > 0
+        return self.loans.has_active(ind_id)
 
     def delete_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from ledger."""

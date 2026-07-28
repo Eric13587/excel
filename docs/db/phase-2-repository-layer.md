@@ -13,7 +13,8 @@ repository as it lands.
 | **2a** | **done** | `Repository` base, `SettingsRepository`, wiring | 3 |
 | **2b** | **done** | `MemberRepository` (`individuals`) | 21 of 53 |
 | **2d** | **done** | `FundRepository` (`savings`, both funds, enrolment) | 32 of 55 |
-| 2c | next | `LoanRepository` + `LedgerRepository` | 113 |
+| **2c-i** | **done** | `LoanRepository` (`loans`, `loan_suspensions`) | 40 of 56 |
+| 2c-ii | next | `LedgerRepository` (`ledger`) | 67 |
 | 2e | pending | `JournalRepository` (COA, entries, lines) | 42 |
 | 2f | pending | Raw SQL out of views/engine/services; `DatabaseService` root | 36 |
 
@@ -219,3 +220,66 @@ with tests pinning them, which is what the next phases need.
 ### Rollback
 
 `git revert` the 2d commit. No schema or data change.
+
+---
+
+## 2c-i — LoanRepository
+
+40 of the 56 `loans`/`loan_suspensions` statements move. The rest are the
+import path and the `create_tables` back-fill, both 2f.
+
+Raw SQL removed from three more modules: `engine.py` (the loan-heal probe and
+term refresh), `loan_service.py` (five schedule/state updates) and
+`undo_manager.py` (the nine-field loan snapshot restore).
+
+### Member scoping is now in the signatures
+
+`ref` (`L-001`) is unique **per member only**. Every repository method that
+takes a ref also takes the member id — `by_ref(member_id, ref)`,
+`terms(member_id, ref)`, `set_schedule_by_ref(member_id, ref, ...)` — so the
+rule in `CLAUDE.md` is enforced by the type signature rather than by
+remembering. `test_set_schedule_by_ref_touches_only_that_member` is a
+regression guard for the original bug, where a query keyed on `ref` alone
+updated other members' loans.
+
+### Three update keys, now named rather than scattered
+
+Finding **D5**: loans are updated by `id`, by `(id, individual_id)` and by
+`(ref, individual_id)` depending on the caller. All three survive, because
+changing which rows a statement can reach is a behavioural change. They are now
+distinct, documented methods — `set_status`, `set_catch_up_state`,
+`set_schedule_by_ref` — so the divergence is visible in one file and can be
+consolidated deliberately later.
+
+### The optional-column contract
+
+`set_status` and `set_details` build their SET list dynamically: a `None`
+argument means "leave that column alone", while `0` is a real value that gets
+written. Three tests pin this, because it is exactly the kind of contract a
+refactor silently inverts.
+
+### Verification
+
+* 324 → 342 tests (18 added). `ruff` clean.
+* **Differential state comparison.** A 30-operation sequence — member create /
+  rename / retire / reinstate, two loans, catch-up, suspend, extend, resume,
+  historical suspension, top-up, single deduct, buyoff, savings, Christmas,
+  benevolent enrolment and catch-up, both savings recalculators, three mass
+  runs with reverts, GL sync — was run against a copy of the production journal
+  on the Phase 2d commit and on this one. All twelve tables hash **identically**.
+* That comparison also settled a question the smoke test raised: a
+  restructure-then-buyoff leaves the loan `Active` with a 0.00 buyoff. It does
+  so on both commits, so it is pre-existing, not a regression — see below.
+
+### A latent bug this surfaced (not fixed here)
+
+`restructure_loan` followed by `buyoff_loan` returns 0.00 and leaves the loan
+`Active` with `balance` 40,000. The restructure leaves the ledger's
+`principal_balance` at 0 while `loans.balance` still carries the amount, so
+`buyoff_loan` — which reads the ledger — concludes there is nothing to settle.
+Another instance of the cache-versus-ledger divergence that Phase 3 addresses;
+recorded here rather than changed, because fixing it changes numbers.
+
+### Rollback
+
+`git revert` the 2c-i commit. No schema or data change.

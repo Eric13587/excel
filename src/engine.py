@@ -132,9 +132,7 @@ class LoanEngine:
         """
         import re
         cur = self.db.conn.cursor()
-        cur.execute("SELECT id, total_amount, installment, monthly_interest FROM loans "
-                    "WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
-        lr = cur.fetchone()
+        lr = self.db.loans.terms(individual_id, loan_ref)
         if not lr:
             return {"healable": False, "reason": "loan not found"}
         lid, cur_total, cur_inst, cur_mi = lr
@@ -197,9 +195,7 @@ class LoanEngine:
         Read-only.
         """
         out = []
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT individual_id, ref FROM loans WHERE status='Active' ORDER BY individual_id, ref")
-        for ind, ref in cur.fetchall():
+        for ind, ref in self.db.loans.active_refs():
             plan = self._loan_heal_plan(ind, ref)
             if plan.get("healable") and plan.get("needs_heal"):
                 out.append({"individual_id": ind, "name": self.db.get_individual_name(ind),
@@ -221,10 +217,8 @@ class LoanEngine:
 
         d = plan["derived"]
         cur = self.db.conn.cursor()
-        cur.execute("UPDATE loans SET total_amount=?, installment=?, monthly_interest=?, "
-                    "unearned_interest=? WHERE id=?",
-                    (d["total_amount"], d["installment"], d["monthly_interest"],
-                     d["unearned_interest"], plan["loan_id"]))
+        self.db.loans.set_healed_terms(plan["loan_id"], d["total_amount"], d["installment"],
+                                       d["monthly_interest"], d["unearned_interest"])
         # Clear edit-locks the old cross-member bug set on accruals so recalc
         # re-derives them (safe: simple loans have no legitimate interest edits).
         cur.execute("UPDATE ledger SET is_edited=0 WHERE individual_id=? AND loan_id=? "
@@ -751,9 +745,8 @@ class LoanEngine:
                     
                     # Update Loan Record (scope to this member — loan refs like
                     # L-001 are NOT unique across individuals).
-                    cursor = self.db.conn.cursor()
-                    cursor.execute("UPDATE loans SET installment = ?, monthly_interest = ? WHERE ref = ? AND individual_id = ?",
-                                   (new_installment, new_monthly_interest, loan_ref, individual_id))
+                    self.db.loans.set_schedule_by_ref(individual_id, loan_ref,
+                                                      new_installment, new_monthly_interest)
                     self.db.conn.commit()
                 else:
                     logger.warning("Transaction ID %s not found in ledger dataframe", trans_id)
