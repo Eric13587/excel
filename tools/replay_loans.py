@@ -142,22 +142,46 @@ def compare(loan, derived, rows):
     return findings
 
 
+def deduction_gaps(rows):
+    """Months between deductions where none was taken. Returns the count.
+
+    A gap means the loan sat outstanding with nothing collected — and, because
+    accrual happens inside the deduction loop, no interest was charged either.
+    """
+    from datetime import datetime as _dt
+
+    months = [r[1][:7] for r in rows if r[2] in ("Repayment", "Loan Buyoff")]
+    missed = 0
+    for a, b in zip(months, months[1:]):
+        da, db = _dt.strptime(a, "%Y-%m"), _dt.strptime(b, "%Y-%m")
+        missed += max(0, (db.year - da.year) * 12 + db.month - da.month - 1)
+    return missed
+
+
 def classify(loan, rows, findings):
-    """Why a loan diverged, in terms someone can act on."""
+    """Why a loan diverged, judged from the evidence rather than the event type.
+
+    An earlier version classified by which event kinds were present, which put
+    top-ups and buy-offs in separate buckets. They are the same finding: both
+    rewrite the loan's terms, and the terms are stored without history, so a
+    replay reading the *current* values applies them to months they never
+    governed. The give-away is accruals of several different amounts within one
+    loan — a single monthly_interest cannot have produced them.
+    """
     kinds = {r[2] for r in rows}
     if not any(k in kinds for k in ("Loan Issued", "Loan Top-Up")):
         return "no disbursement recorded"
-    if "Loan Top-Up" in kinds:
-        return "has a top-up (terms changed mid-life, not stored)"
-    if "Loan Buyoff" in kinds:
-        return "has a buy-off"
+
+    accruals = {round(r[3] or 0, 2) for r in rows if r[2] == "Interest Earned"}
+    stored_mi = loan[8] or 0
+    if len(accruals) > 1 or (accruals and round(stored_mi, 2) not in accruals):
+        return "terms changed mid-life (no history stored)"
+
+    if deduction_gaps(rows):
+        return "gap in deductions (no interest charged for those months)"
     if any(r[7] for r in rows):
         return "has a manually edited entry"
-    if any(f[0] == "accrual count" for f in findings):
-        return "accrual schedule differs"
     return "other"
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("journal")

@@ -252,6 +252,42 @@ def _check_accounting(conn, report):
     # Migration 003 gave loans their own duration and rate; before that a
     # duration existed only inside the issue note's prose.
     if "duration_months" in {r[1] for r in conn.execute("PRAGMA table_info(loans)")}:
+        # A month with no deduction is also a month with no interest, because
+        # accrual happens inside the deduction loop rather than on a calendar.
+        # So a gap is not merely a missed payment: it is interest the member was
+        # never charged. A recorded suspension is the legitimate reason for one;
+        # without it, either payroll stopped and nobody said so, or catch-up was
+        # not run. Found by replaying loans against their own terms.
+        gaps = []
+        for lid, ref, name, ind, mi in conn.execute(
+                "SELECT l.id, l.ref, i.name, l.individual_id, l.monthly_interest "
+                "FROM loans l JOIN individuals i ON i.id = l.individual_id"):
+            months = [r[0][:7] for r in conn.execute(
+                "SELECT date FROM ledger WHERE individual_id=? AND loan_id=? "
+                "AND event_type IN ('Repayment','Loan Buyoff') ORDER BY date",
+                (ind, ref))]
+            missed = 0
+            for a, b in zip(months, months[1:]):
+                try:
+                    ya, ma = int(a[:4]), int(a[5:7])
+                    yb, mb = int(b[:4]), int(b[5:7])
+                except ValueError:
+                    continue
+                missed += max(0, (yb - ya) * 12 + mb - ma - 1)
+            if not missed:
+                continue
+            covered = _scalar(conn, "SELECT COUNT(*) FROM loan_suspensions "
+                                    "WHERE individual_id=? AND loan_ref=?", (ind, ref))
+            if not covered:
+                gaps.append((lid, ref, name, missed, missed * (mi or 0)))
+        uncharged = sum(g[4] for g in gaps)
+        report.add("deductions run without unexplained gaps", "accounting",
+                   PASS if not gaps else WARN,
+                   "no gaps" if not gaps else
+                   f"{len(gaps)} loan(s) skipped {sum(g[3] for g in gaps)} month(s) with "
+                   f"no suspension recorded — about {uncharged:,.0f} of interest was "
+                   f"not charged (first: {gaps[0][1]} for {gaps[0][2]})", len(gaps))
+
         # Why a loan ends up "Paid" with a negative balance. The check above
         # reports the symptom; these two name the cause, because the balance is
         # derived from the ledger and only two things drive it below zero.

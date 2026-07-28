@@ -442,3 +442,57 @@ def test_the_checks_are_scoped_per_member(journal):
     check = _check(integrity.verify(journal), "loans record their disbursement")
     assert check.count == 1, "the other member's issue row must not cover this one"
     assert "No Issue Row" in check.detail
+
+
+def test_a_gap_in_deductions_is_reported_with_the_interest_not_charged(journal):
+    """Accrual happens inside the deduction loop, not on a calendar, so a month
+    with no deduction is also a month with no interest. A gap is therefore
+    money, not just a missed payment."""
+    ind = journal.add_individual("Gappy", "07", "g@x")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, monthly_interest, status, start_date) VALUES "
+                "(?, 'L-001', 100000, 115000, 60000, 5750, 750, 'Active', '2025-01-01')",
+                (ind,))
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                "deducted, balance, principal_portion, interest_portion) "
+                "VALUES (?, '2025-01-01', 'Loan Issued', 'L-001', 100000, 0, 100000, 0, 0)",
+                (ind,))
+    for date in ("2025-02-01", "2025-03-01", "2025-07-01"):     # Apr, May, Jun missing
+        cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                    "deducted, balance, principal_portion, interest_portion) "
+                    "VALUES (?, ?, 'Repayment', 'L-001', 0, 5750, 0, 5000, 750)",
+                    (ind, date))
+    journal.conn.commit()
+
+    check = _check(integrity.verify(journal), "deductions run without unexplained gaps")
+    assert check.status == integrity.WARN and check.count == 1
+    assert "3 month(s)" in check.detail
+    assert "2,250" in check.detail, "3 months x 750 of interest never charged"
+
+
+def test_a_gap_covered_by_a_suspension_is_not_reported(journal):
+    """A recorded suspension is the legitimate reason for a gap."""
+    ind = journal.add_individual("Suspended", "07", "s@x")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, monthly_interest, status, start_date) VALUES "
+                "(?, 'L-001', 100000, 115000, 60000, 5750, 750, 'Active', '2025-01-01')",
+                (ind,))
+    loan_id = cur.lastrowid
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                "deducted, balance, principal_portion, interest_portion) "
+                "VALUES (?, '2025-01-01', 'Loan Issued', 'L-001', 100000, 0, 100000, 0, 0)",
+                (ind,))
+    for date in ("2025-02-01", "2025-07-01"):
+        cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                    "deducted, balance, principal_portion, interest_portion) "
+                    "VALUES (?, ?, 'Repayment', 'L-001', 0, 5750, 0, 5000, 750)",
+                    (ind, date))
+    cur.execute("INSERT INTO loan_suspensions (loan_id, individual_id, loan_ref, start_date, "
+                "suspend_until, resumed_date, status) VALUES (?, ?, 'L-001', '2025-03-01', "
+                "'2025-07-01', '2025-07-01', 'resumed')", (loan_id, ind))
+    journal.conn.commit()
+
+    assert _check(integrity.verify(journal),
+                  "deductions run without unexplained gaps").status == integrity.PASS

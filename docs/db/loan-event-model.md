@@ -59,30 +59,61 @@ Replaying 113 loan(s)
   diverged           :   30
 
 why they diverged:
-    13  has a top-up (terms changed mid-life, not stored)
-     7  has a manually edited entry
-     6  has a buy-off
-     3  accrual schedule differs
+    26  terms changed mid-life (no history stored)
+     3  gap in deductions (no interest charged for those months)
      1  no disbursement recorded
 ```
 
-**73% replay exactly from events alone**, with no stored intermediate state —
-no cached balance, no `next_due_date`, no running totals. That is the evidence
-the model is sound.
+**73% replay exactly from events alone** — no cached balance, no
+`next_due_date`, no running totals. That is the evidence the model is sound.
 
-The divergences are the interesting part, because they are not random:
+The 30 divergences were first bucketed by event type, which put top-ups and
+buy-offs in separate piles and left nine cases unexplained. Investigating those
+nine collapsed the picture:
 
-* **13 top-ups and 7 manual edits — 20 of the 30 — are the two things the
-  model adds.** The harness has to read terms from the *current* `loans` row,
-  since no history exists; a loan whose installment changed at a top-up is
-  therefore expected to diverge here and would not diverge under the real
-  model. Same for a manual amount, which becomes an asserted `PaymentReceived`.
-* **1 is loan 483** (no disbursement recorded), already known.
-* **6 buy-offs and 3 accrual differences** are genuinely unexplained and are
-  where the next investigation should go.
+### 26 of 30 are one finding
 
-So the harness does what it was built for: it separates "the model is wrong"
-from "this loan's history does not add up".
+Top-ups and buy-offs both **rewrite the loan's terms**, and the terms are stored
+without history. The harness must read `loans.monthly_interest` as it stands
+today and apply it to months it never governed. The give-away is that a single
+loan's accruals are not all the same amount:
+
+```
+loan 425   loans.monthly_interest = 1,251   actual accruals = [250, 1251, 1326]
+loan 463   loans.monthly_interest =   832   actual accruals = [250,  832, 1326]
+loan 603   loans.monthly_interest = 1,875   actual accruals = [250, 1326, 1875]
+```
+
+One `monthly_interest` column cannot have produced three different accruals.
+That is the proposal's central claim, visible in the data: **the current schema
+cannot represent these loans' own histories.** Under the event model each
+carries a `TermsChanged` and replays exactly.
+
+### 3 are a real finding, and they are money
+
+Three loans have a gap in their deduction history with **no suspension
+recorded**:
+
+| Loan | Member | Months missed | Interest not charged |
+|---|---|---|---|
+| 573 | GRACE MBURU | 3 | ~5,625 |
+| 546 | JOYCE MORAA | 1 | ~1,251 |
+| 547 | JOSPHINE KIONGI | 1 | ~1,305 |
+| | | **5** | **~8,181** |
+
+This matters because **accrual happens inside the deduction loop, not on a
+calendar.** A month with no deduction is also a month with no interest. So a
+gap is not a missed payment that catches up later — it is interest the member
+was never charged, permanently.
+
+Either payroll stopped and nobody recorded a suspension, or catch-up was not
+run for those months. `src.integrity` now checks for this
+("deductions run without unexplained gaps"), so a recurrence is caught rather
+than discovered by a replay.
+
+### 1 is loan 483
+
+Already known: no disbursement recorded. See `outstanding.md` A1.
 
 ## What this would fix, concretely
 
