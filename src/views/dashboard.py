@@ -197,8 +197,12 @@ class ReportWorker(QThread):
             if db_manager and hasattr(db_manager, 'conn'):
                 try:
                     db_manager.conn.close()
-                except Exception:
-                    pass
+                except Exception:       # noqa: BLE001 - worker teardown
+                    # Nothing useful can be done about a connection that will
+                    # not close on a worker thread, but it must not vanish
+                    # either: it is how a leaked handle gets noticed.
+                    logger.warning("Report worker could not close its connection",
+                                   exc_info=True)
 
 
 class Dashboard(QWidget):
@@ -583,8 +587,11 @@ class Dashboard(QWidget):
              c = QColor(t.get_color("shadow"))
              self.search_shadow.setColor(c)
              self.actions_shadow.setColor(c)
-        except Exception:
-             pass
+        except Exception:       # noqa: BLE001 - cosmetic only
+             # A theme without a parseable shadow colour must not stop the
+             # dashboard painting; debug rather than warning, since the only
+             # consequence is a flat card edge.
+             logger.debug("Could not apply the shadow colour", exc_info=True)
 
         # Results Label
         self.results_label.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {t.get_color('text_secondary')}; letter-spacing: 0.3px; text-transform: uppercase;")
@@ -1445,9 +1452,6 @@ class Dashboard(QWidget):
         from PyQt6.QtCore import QDate, Qt
         from dateutil.relativedelta import relativedelta
         from datetime import datetime
-        import platform
-        import subprocess
-        import os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
 
@@ -1638,16 +1642,8 @@ class Dashboard(QWidget):
             success, msg = generator.generate_fund_report(fund, path, start, end, columns=chosen_columns)
 
         if success:
-            QMessageBox.information(self, "Success", f"Report saved to:\n{path}")
-            try:
-                if platform.system() == 'Windows':
-                    os.startfile(path)
-                elif platform.system() == 'Darwin':
-                    subprocess.Popen(['open', path])
-                else:
-                    subprocess.Popen(['xdg-open', path])
-            except Exception:
-                pass
+            from .file_actions import report_saved
+            report_saved(self, "Success", path)
         else:
             QMessageBox.critical(self, "Error", f"Failed to generate report:\n{msg}")
 
@@ -2053,9 +2049,6 @@ class Dashboard(QWidget):
         from ..reports import ReportGenerator
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialogButtonBox, QFileDialog,
                                      QProgressDialog)
-        import platform
-        import subprocess
-        import os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
         default_on = {"name", "pf_no", "id_no", "phone", "employment_status"}
@@ -2123,16 +2116,8 @@ class Dashboard(QWidget):
         progress.close()
 
         if success:
-            QMessageBox.information(self, "Members List", f"Saved to:\n{path}")
-            try:
-                if platform.system() == 'Windows':
-                    os.startfile(path)
-                elif platform.system() == 'Darwin':
-                    subprocess.Popen(['open', path])
-                else:
-                    subprocess.Popen(['xdg-open', path])
-            except Exception:
-                pass
+            from .file_actions import report_saved
+            report_saved(self, "Members List", path, what="members list")
         else:
             QMessageBox.critical(self, "Members List", f"Export failed:\n{msg}")
 
@@ -2221,7 +2206,6 @@ class Dashboard(QWidget):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
                                      QHeaderView, QDialogButtonBox, QProgressDialog)
-        from datetime import datetime
 
         healable = self.engine.scan_healable_loans()
         dlg = QDialog(self)
@@ -2279,7 +2263,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    self.db.backup_to(f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.snapshot("repair-loans")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return
@@ -2383,7 +2367,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    self.db.backup_to(f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.snapshot("orphan-clean")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return

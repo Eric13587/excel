@@ -171,13 +171,23 @@ rest are recorded rather than done.
 
 **Still open:**
 
-* **Undo remains narrow.** It covers mass catch-ups and imports. Deleting a
-  member or loan is now *recoverable* (a snapshot) but not *undoable* (no
-  in-app restore). `retire_individual`, `rebuild_loan_schedule` and
-  `delete_orphaned_rows` have neither.
-* **Four swallowed exceptions** in `src/views/dashboard.py` (lines ~200, 576,
-  1639, 2124) do `except Exception: pass`. One is the "open the exported file"
-  path, so a failed export looks like a successful one.
+* ~~**Four swallowed exceptions.**~~ Fixed. Two were the "open the exported
+  file" path; the earlier note that "a failed export looks like a successful
+  one" was **wrong** — the success message fires before the attempt and the
+  file really is written, so only the *opening* failed silently. Treasury's
+  copy of the same block had no handling at all and would have raised into the
+  GUI. All three now go through `src/views/file_actions.py`, which reports the
+  path and says it could not be opened. The other two now log.
+
+* **Undo remains narrow**, though less so. It covers mass catch-ups and
+  imports. Deleting a member or loan is now recoverable *and* restorable via
+  Mass Operations → Restore From Backup, as are the repair tools, whose
+  backups previously landed beside the journal as `.bak` files where the
+  restore screen could not see them. `retire_individual` needs nothing —
+  `reinstate_individual` is reachable in the UI — and `rebuild_loan_schedule`
+  is only reachable from the suspend dialog, which already snapshots. What is
+  still missing is a true in-app *undo* (a step back without replacing the
+  whole journal) for anything outside mass operations.
 * ~~**No in-app restore.**~~ Done. Mass Operations → **Restore From Backup**
   lists every backup beside the journal with what is *in* each one (members,
   loans, ledger entries), refuses a file that is damaged or is not a journal,

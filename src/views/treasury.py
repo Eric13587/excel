@@ -743,9 +743,6 @@ class TreasuryDialog(QDialog):
         from PyQt6.QtWidgets import QFileDialog
         from src.reports import ReportGenerator
         from datetime import datetime
-        import platform
-        import subprocess
-        import os
 
         from src import branding
         org = branding.get_org_name(self.db)
@@ -770,12 +767,13 @@ class TreasuryDialog(QDialog):
                 progress_callback=progress))
 
         if success:
-            QMessageBox.information(self, "Success", msg + f"\nSaved to: {path}")
-            if platform.system() == 'Windows':
-                os.startfile(path)
-            elif platform.system() == 'Linux':
-                subprocess.Popen(['xdg-open', path])
-            elif platform.system() == 'Darwin':
-                subprocess.Popen(['open', path])
+            # This had no error handling at all, so a desktop without a PDF
+            # handler raised into the GUI *after* the file had been written.
+            from src.views.file_actions import open_in_default_app
+            problem = open_in_default_app(path)
+            QMessageBox.information(
+                self, "Success", msg + f"\nSaved to: {path}"
+                + (f"\n\nIt could not be opened automatically ({problem})."
+                   if problem else ""))
         else:
             QMessageBox.critical(self, "Error", msg)
