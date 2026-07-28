@@ -44,29 +44,66 @@ ledger updates), visible under Mass Operations → Activity Log, and the journal
 was snapshotted first to
 `backups/loan_master.pre-fix-defective-loans-20260728-210245.db`.
 
-### A2. Three loans with no recoverable duration
+### A2. Loans without a recoverable duration — **fixed 2026-07-28**
 
-Migration 003 backfilled `duration_months` and `interest_rate` by parsing the
-issue note. Three loans have notes that do not parse; **one is still Active** —
-loan id 221, ROBERT MUTISYA NDOLO.
+Both were derived from each loan's own issue note rather than guessed:
+`(principal + total interest) / first installment`. Both landed on exact whole
+months, which is what makes the method credible rather than a fit:
 
-The other two are settled and matter less. For 221, the schedule cannot be
-projected forward until someone supplies the original term.
+```
+loan 193  BRIAN ODHIAMBO        (100,000 + 15,000.00) / 6,389 = 18.000 -> 18 months
+loan 221  ROBERT MUTISYA NDOLO  ( 62,504 +  9,375.60) / 2,995 = 24.000 -> 24 months
+```
 
-### A3. Twelve members with stale accrued interest
+Both imply a 15% rate, consistent with each other and with the rest of the book.
 
-146 ledger rows across 12 members disagree with what `BalanceRecalculator`
-computes today. **Some of the corrected values are negative accrued interest**,
-which is not a thing that should exist — so applying the recalculation blindly
-would replace one wrong number with another.
+### A3. Deduction gaps — **recorded 2026-07-28**
 
-This needs a person to look at a handful of the members and decide what the
-correct accrual actually was. Measured with the application's own recalculator,
-not a reimplementation: an earlier estimate of "1,131 rows across 36 members"
-came from replaying `added − deducted` per member, which is not how the
-recalculator groups.
+Three loans had months with no deduction and no suspension on record. Because
+accrual happens inside the deduction loop, those were also months with no
+interest — about 8,181 never charged.
 
----
+Suspensions were recorded retrospectively for each gap:
+
+```
+loan 573  GRACE MBURU       2026-01-28 -> 2026-04-28  (3 months)
+loan 546  JOYCE MORAA       2025-08-28 -> 2025-09-28  (1 month)
+loan 547  JOSPHINE KIONGI   2025-10-28 -> 2025-11-28  (1 month)
+```
+
+**This records that collection paused; it does not assert the pause was
+authorised**, because that is not knowable from the journal. Each carries a note
+saying so. If any of these months should in fact be collected, remove the
+suspension from the loan's **Suspensions** button and run catch-up — which will
+then charge the interest that was missed.
+
+### A4. Eighteen loans have `total_amount = 0` — **open, needs a decision**
+
+Found while deriving the terms above. Eighteen loans carry a total repayable of
+zero, eleven of them Active with substantial balances:
+
+```
+  loan 675  COLLINS MUGITA     principal 375,065   balance 387,495
+  loan 637  PETER MWORIA       principal 330,017   balance 276,676
+  loan 520  SIMON KIAMA        principal 236,137   balance 196,184
+  loan 300  JOHN MARANGA       principal  50,000   balance 144,904
+  ... 14 more
+```
+
+On the same loans `principal` is often *below* `balance`, which cannot be true
+of a loan that has only been repaid — so both fields look stale on loans that
+were topped up, while `balance` (the field the GL reconciles against) is
+correct.
+
+**No money is wrong**: the books balance, every control account reconciles, and
+all 111 loans replay exactly. What is broken is the *stated terms* — a
+statement showing "total repayable" would print 0, and any paid-so-far
+progress figure is meaningless.
+
+Fixing it means deciding what `total_amount` should mean after a top-up:
+the original total plus the top-up's, or the outstanding at top-up plus the new
+interest. The two differ, and the answer is a lending-policy question rather
+than a data question. `principal` needs the same decision.
 
 ## B. Schema work identified but not built
 
