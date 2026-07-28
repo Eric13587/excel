@@ -17,6 +17,13 @@
 -- preserved; a cents/INTEGER migration is a separate project (see CLAUDE.md).
 -- Dates are TEXT in 'YYYY-MM-DD' (timestamps 'YYYY-MM-DD HH:MM:SS').
 --
+-- SCOPE: this is the *annotated* reference for the data model as it was
+-- reverse-engineered, and it explains why each constraint exists. It is not
+-- the source of truth and does not include everything migrations 004-010 add
+-- (gl_outbox, fiscal_periods, account_snapshots, and 38 further triggers).
+-- For what a new journal actually gets, see docs/db/schema-current.sql, which
+-- is generated from a freshly-migrated journal and guarded by a test.
+--
 -- Apply with:  sqlite3 new.db < schema.sql
 -- Migrate an existing journal with: migrations/001_initial_schema.sql
 -- =============================================================================

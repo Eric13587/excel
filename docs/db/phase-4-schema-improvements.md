@@ -153,7 +153,9 @@ It is also already self-defeating: `create_tables` normalises anything outside
 restarts. Two parts of the codebase disagree about what the column means.
 Resolving it means splitting the two jobs into `is_edited` plus an
 `edited_amount` column — a schema change with a behavioural decision attached,
-so it is **migration 005**, not a rider on this one. The integrity report now
+so it is **a migration of its own**, not a rider on this one. (It was
+originally earmarked as 005; that number went to the GL change queue, and the
+split is still unbuilt — see docs/db/outstanding.md.) The integrity report now
 counts the rows carrying an anchor so the change can be sized.
 
 ### Test fallout
