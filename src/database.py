@@ -15,7 +15,7 @@ from src.db import import_rules
 from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
                     JournalRepository, LedgerRepository, LoanRepository,
                     MemberRepository, PeriodRepository, RepairRepository,
-                    SettingsRepository, SourceJournal)
+                    SettingsRepository, SnapshotRepository, SourceJournal)
 from src.exceptions import (PERIOD_LOCK_MARKER, PeriodClosedError,
                             TransactionError)
 from src.data_structures import StatementData
@@ -120,6 +120,7 @@ class DatabaseManager:
         self.imports = ImportHistoryRepository(self.conn)
         self.audit = AuditRepository(self.conn)
         self.periods = PeriodRepository(self.conn)
+        self.snapshots = SnapshotRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is

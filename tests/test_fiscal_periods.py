@@ -366,3 +366,150 @@ def test_assert_open_is_the_same_rule_before_the_write(locked):
     s.assert_open("2026-06-01")                       # open — no raise
     with pytest.raises(PeriodClosedError):
         s.assert_open("2026-02-01", what="This repayment")
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 — period-end snapshots (migration 010)
+# --------------------------------------------------------------------------- #
+
+def _tb(gl, as_of=None):
+    rows, balanced = gl.get_trial_balance(as_of=as_of)
+    assert balanced
+    return {r['code']: (r['debit'], r['credit']) for r in rows}
+
+
+def test_closing_a_period_records_its_figures(svc):
+    s, db = svc
+    _seed_balanced_books(db)
+    gl = GLService(db)
+    expected = {code: round(d - c, 2)
+                for code, d, c in db.journal.cumulative_totals("2026-03-31")}
+
+    pid = _q1(s)
+    s.close(pid)
+
+    assert db.snapshots.count() == len(expected)
+    assert db.snapshots.dates() == ["2026-03-31"]
+    stored = {code: round(d - c, 2)
+              for code, (d, c) in db.snapshots.balances_at("2026-03-31").items()}
+    assert stored == expected
+    assert gl.snapshot_discrepancies() == []
+
+
+def test_an_open_period_is_never_snapshotted(svc):
+    """Its figures can still move, so anything stored would need invalidating —
+    which is the problem this design avoids rather than solves."""
+    s, db = svc
+    _seed_balanced_books(db)
+    s.create("FY 2026 Q1", "2026-01-01", "2026-03-31")
+    assert db.snapshots.count() == 0
+
+
+def test_reading_through_a_snapshot_matches_recomputation(svc):
+    """The equivalence the whole read path rests on."""
+    s, db = svc
+    ind = _seed_balanced_books(db)
+    gl = GLService(db)
+
+    before_q1 = _tb(gl, "2026-03-31")
+    before_later = _tb(gl, "2026-12-31")
+    before_balance = gl.get_account_balance("1100", as_of="2026-12-31")
+
+    pid = _q1(s)
+    s.close(pid)                       # snapshot now exists and will be used
+
+    assert _tb(gl, "2026-03-31") == before_q1, "at the snapshot date itself"
+    assert _tb(gl, "2026-12-31") == before_later, "snapshot + movement since"
+    assert gl.get_account_balance("1100", as_of="2026-12-31") == before_balance
+
+    # Activity after the closed period must still show up.
+    db.add_savings_transaction(ind, "2026-06-01", "Deposit", 750, "later")
+    gl.sync()
+    assert _tb(gl, "2026-12-31") != before_later
+    assert _tb(gl, "2026-03-31") == before_q1, "the settled period is unmoved"
+    assert ind
+
+
+def test_a_date_before_any_snapshot_falls_back(svc):
+    s, db = svc
+    _seed_balanced_books(db)
+    gl = GLService(db)
+    expected = _tb(gl, "2026-01-31")
+    s.close(_q1(s))
+    assert _tb(gl, "2026-01-31") == expected
+
+
+def test_reopening_discards_the_snapshot(svc):
+    s, db = svc
+    _seed_balanced_books(db)
+    gl = GLService(db)
+    pid = _q1(s)
+    s.close(pid)
+    assert db.snapshots.count() > 0
+
+    s.reopen(pid, reason="restating", reopened_by="auditor")
+    assert db.snapshots.count() == 0
+    # Reads still work, straight from journal_lines.
+    assert _tb(gl, "2026-03-31")
+
+
+def test_reopening_discards_later_snapshots_too(svc):
+    """The totals are cumulative, so a change inside the reopened period moves
+    every figure that includes it."""
+    s, db = svc
+    _seed_balanced_books(db)
+    q1 = _q1(s)
+    q2 = s.create("FY 2026 Q2", "2026-04-01", "2026-06-30")
+    s.close(q1)
+    s.close(q2)
+    assert db.snapshots.dates() == ["2026-03-31", "2026-06-30"]
+
+    s.reopen(q1, reason="restating January", reopened_by="auditor")
+    assert db.snapshots.dates() == [], "Q2's totals included Q1"
+
+
+def test_rebuild_snapshots_restores_every_closed_period(svc):
+    s, db = svc
+    _seed_balanced_books(db)
+    gl = GLService(db)
+    q1 = _q1(s)
+    q2 = s.create("FY 2026 Q2", "2026-04-01", "2026-06-30")
+    s.close(q1)
+    s.close(q2)
+    s.reopen(q1, reason="x", reopened_by="a")
+    s.close(q1)                       # only Q1's snapshot comes back
+    assert db.snapshots.dates() == ["2026-03-31"]
+
+    assert gl.rebuild_snapshots() == 2
+    assert db.snapshots.dates() == ["2026-03-31", "2026-06-30"]
+    assert gl.snapshot_discrepancies() == []
+
+
+def test_a_tampered_snapshot_is_detected(svc):
+    """The guarantee behind reading stored figures instead of computing them."""
+    s, db = svc
+    _seed_balanced_books(db)
+    gl = GLService(db)
+    s.close(_q1(s))
+
+    db.conn.execute("UPDATE account_snapshots SET closing_balance = closing_balance + 100, "
+                    "debit_total = debit_total + 100 WHERE account_code='1100'")
+    db.conn.commit()
+
+    bad = gl.snapshot_discrepancies()
+    assert len(bad) == 1
+    as_of, code, stored, recomputed = bad[0]
+    assert (as_of, code) == ("2026-03-31", "1100")
+    assert round(stored - recomputed, 2) == 100.0
+
+
+def test_snapshots_go_when_their_period_does(svc):
+    s, db = svc
+    _seed_balanced_books(db)
+    pid = _q1(s)
+    s.close(pid)
+    assert db.snapshots.count() > 0
+
+    db.conn.execute("DELETE FROM fiscal_periods WHERE id=?", (pid,))
+    db.conn.commit()
+    assert db.snapshots.count() == 0, "ON DELETE CASCADE from fiscal_periods"

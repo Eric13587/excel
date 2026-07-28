@@ -19,6 +19,7 @@ the suite stays green at every step. Repositories added so far:
 * :class:`~src.db.loan.LoanRepository` — ``loans`` and ``loan_suspensions``.
 * :class:`~src.db.member.MemberRepository` — the ``individuals`` table.
 * :class:`~src.db.period.PeriodRepository` — the ``fiscal_periods`` register.
+* :class:`~src.db.period.SnapshotRepository` — period-end ``account_snapshots``.
 * :class:`~src.db.settings.SettingsRepository` — the ``settings`` table.
 
 See docs/db/repository-layer.md for the full sequencing.
@@ -29,7 +30,7 @@ from src.db.journal import JournalRepository
 from src.db.ledger import LedgerPosition, LedgerRepository, position_from_frame
 from src.db.loan import LoanRepository
 from src.db.member import MemberRepository
-from src.db.period import PeriodRepository
+from src.db.period import PeriodRepository, SnapshotRepository
 from src.db.repair import AuditRepository, ImportHistoryRepository, RepairRepository
 from src.db.settings import SettingsRepository
 from src.db.source import SourceJournal
@@ -37,5 +38,5 @@ from src.db.source import SourceJournal
 __all__ = ["AuditRepository", "FundRepository", "ImportHistoryRepository",
            "JournalRepository", "LedgerPosition", "position_from_frame",
            "LedgerRepository", "LoanRepository", "MemberRepository",
-           "PeriodRepository", "RepairRepository", "Repository", "SettingsRepository",
+           "PeriodRepository", "RepairRepository", "SnapshotRepository", "Repository", "SettingsRepository",
            "SourceJournal"]

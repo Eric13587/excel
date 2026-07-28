@@ -79,3 +79,66 @@ class PeriodRepository(Repository):
         rows = dict(self._rows(
             "SELECT status, COUNT(*) FROM fiscal_periods GROUP BY status"))
         return {OPEN: rows.get(OPEN, 0), CLOSED: rows.get(CLOSED, 0)}
+
+
+class SnapshotRepository(Repository):
+    """Period-end account snapshots (``account_snapshots``, migration 010).
+
+    A snapshot holds *cumulative* totals from the beginning of the journal to a
+    closed period's end date. Only closed periods are snapshotted, so nothing
+    here ever needs invalidating — see the migration for why that distinction
+    is what makes this a record rather than a cache.
+    """
+
+    def write(self, period_id, as_of, rows):
+        """Replace this period's snapshot.
+
+        ``rows`` is an iterable of ``(account_code, debit_total, credit_total)``.
+        Replacing rather than inserting means re-snapshotting a period is
+        idempotent.
+        """
+        self._execute("DELETE FROM account_snapshots WHERE period_id=?", (period_id,))
+        self._executemany(
+            "INSERT INTO account_snapshots (period_id, account_code, as_of, "
+            "debit_total, credit_total, closing_balance) VALUES (?, ?, ?, ?, ?, ?)",
+            [(period_id, code, as_of, round(d, 2), round(c, 2), round(d - c, 2))
+             for code, d, c in rows])
+
+    def latest_at_or_before(self, as_of):
+        """The most recent snapshot date at or before ``as_of``, or None.
+
+        This is the baseline a reader starts from; everything after it is
+        summed from journal_lines.
+        """
+        return self._scalar(
+            "SELECT MAX(as_of) FROM account_snapshots WHERE as_of <= ?", (as_of,))
+
+    def balances_at(self, as_of):
+        """``{account_code: (debit_total, credit_total)}`` for a snapshot date."""
+        return {code: (d, c) for code, d, c in self._rows(
+            "SELECT account_code, debit_total, credit_total FROM account_snapshots "
+            "WHERE as_of = ?", (as_of,))}
+
+    def balance_at(self, account_code, as_of):
+        """One account's cumulative ``(debit, credit)`` at a snapshot date."""
+        return self._row(
+            "SELECT debit_total, credit_total FROM account_snapshots "
+            "WHERE as_of = ? AND account_code = ?", (as_of, account_code))
+
+    def discard_from(self, as_of):
+        """Drop every snapshot dated on or after ``as_of``. Returns the count.
+
+        Reopening a period invalidates its own snapshot *and every later one*,
+        because the totals are cumulative: a change inside the reopened period
+        moves every figure that includes it.
+        """
+        return self._execute(
+            "DELETE FROM account_snapshots WHERE as_of >= ?", (as_of,)).rowcount
+
+    def dates(self):
+        """Every snapshot date held, earliest first."""
+        return [r[0] for r in self._rows(
+            "SELECT DISTINCT as_of FROM account_snapshots ORDER BY as_of")]
+
+    def count(self):
+        return self._scalar("SELECT COUNT(*) FROM account_snapshots", (), 0)

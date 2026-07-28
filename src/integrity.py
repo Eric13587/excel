@@ -325,6 +325,27 @@ def _check_periods(conn, report):
                f"{total} ({counts.get('closed', 0)} closed, {counts.get('open', 0)} open)",
                total)
 
+    if _table_exists(conn, "account_snapshots"):
+        # Stored figures are only trustworthy if they still match the journal
+        # they were taken from. Recomputing is O(journal), but this is the tool
+        # you run to find out whether anything is wrong.
+        bad = conn.execute(
+            "SELECT s.as_of, s.account_code, s.closing_balance, "
+            "       COALESCE((SELECT SUM(l.debit) - SUM(l.credit) "
+            "                   FROM journal_lines l "
+            "                   JOIN journal_entries e ON e.id = l.entry_id "
+            "                  WHERE l.account_code = s.account_code "
+            "                    AND e.entry_date <= s.as_of), 0) "
+            "FROM account_snapshots s").fetchall()
+        drift = [r for r in bad if abs(round(r[2] - r[3], 2)) > TOLERANCE]
+        report.add("period snapshots match the journal", cat,
+                   PASS if not drift else FAIL,
+                   f"{len(bad)} snapshot row(s) verified" if not drift else
+                   f"{len(drift)} of {len(bad)} disagree "
+                   f"(first: {drift[0][1]} at {drift[0][0]}, "
+                   f"{drift[0][2]:,.2f} vs {drift[0][3]:,.2f})",
+                   len(drift))
+
     settled = _scalar(conn, "SELECT MAX(end_date) FROM fiscal_periods WHERE status='closed'")
     if settled:
         report.add("books settled through", cat, PASS, str(settled))

@@ -233,6 +233,48 @@ class JournalRepository(Repository):
             params.append(as_of)
         return self._scalar(sql, tuple(params), 0.0) or 0.0
 
+    def cumulative_totals(self, as_of):
+        """``(account_code, debit_total, credit_total)`` for everything posted
+        up to and including ``as_of``.
+
+        The snapshot source. Cumulative from the beginning of the journal
+        rather than for the period alone, because a reader asks "what was the
+        balance at this date" and a cumulative figure answers it directly.
+        """
+        return self._rows(
+            "SELECT l.account_code, COALESCE(SUM(l.debit), 0), COALESCE(SUM(l.credit), 0) "
+            "FROM journal_lines l JOIN journal_entries e ON e.id = l.entry_id "
+            "WHERE e.entry_date <= ? GROUP BY l.account_code", (as_of,))
+
+    def account_net_between(self, account_code, after, up_to):
+        """One account's ``SUM(debit) - SUM(credit)`` for a date range.
+
+        ``after`` is exclusive so it pairs exactly with a snapshot taken on
+        that date.
+        """
+        return self._scalar(
+            "SELECT COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) "
+            "FROM journal_lines l JOIN journal_entries e ON e.id = l.entry_id "
+            "WHERE l.account_code = ? AND e.entry_date > ? AND e.entry_date <= ?",
+            (account_code, after, up_to), 0.0) or 0.0
+
+    def accounts_with_names(self):
+        """``(code, name, type)`` for every account — the trial-balance skeleton."""
+        return self._rows(
+            "SELECT code, name, type FROM chart_of_accounts ORDER BY code")
+
+    def movements_between(self, after, up_to):
+        """``(account_code, debit, credit)`` posted after ``after``, through ``up_to``.
+
+        The delta a reader adds to a snapshot. ``after`` is exclusive so it
+        pairs exactly with a snapshot taken at that date.
+        """
+        return self._rows(
+            "SELECT l.account_code, COALESCE(SUM(l.debit), 0), COALESCE(SUM(l.credit), 0) "
+            "FROM journal_lines l JOIN journal_entries e ON e.id = l.entry_id "
+            "WHERE e.entry_date > ? AND e.entry_date <= ? "
+            "GROUP BY l.account_code", (after, up_to))
+
     def trial_balance_rows(self, as_of=None):
         """(code, name, type, net) for every account, optionally as at a date.
 

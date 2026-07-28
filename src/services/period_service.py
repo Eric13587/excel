@@ -204,6 +204,9 @@ class FiscalPeriodService:
                 closed_by=closed_by)
             if note:
                 self.db.periods.set_note(period_id, note)
+        # Only now is the period settled, so only now can its figures be
+        # recorded as fact rather than cached as a guess.
+        self.gl.snapshot_period(self.db.periods.get(period_id))
         return self.db.periods.get(period_id)
 
     def reopen(self, period_id, reason, reopened_by=None):
@@ -224,9 +227,16 @@ class FiscalPeriodService:
                  f"[reopened {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
                  f"by {reopened_by or 'unknown'}, closed {period['closed_at']}: "
                  f"{reason.strip()}]").strip()
+        # Discard first: the snapshots are only valid while the period is
+        # closed, and this one's totals are cumulative, so every later snapshot
+        # depends on it too.
+        discarded = self.gl.discard_snapshots_from(period["start_date"])
         with self.db.transaction():
             self.db.periods.set_status(period_id, OPEN, closed_at=None, closed_by=None)
             self.db.periods.set_note(period_id, trail)
+        if discarded:
+            logger.info("Discarded %d snapshot row(s) from %s onward",
+                        discarded, period["start_date"])
         logger.warning("Fiscal period %s reopened: %s", period["label"], reason.strip())
         return self.db.periods.get(period_id)
 

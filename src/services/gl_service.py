@@ -197,15 +197,118 @@ class GLService:
         return self.db.journal.entry_count()
 
     # ------------------------------------------------------------------ #
+    # Period-end snapshots (migration 010)
+    # ------------------------------------------------------------------ #
+    def snapshot_period(self, period):
+        """Record every account's cumulative position at a period's end date.
+
+        Called when a period closes. What makes this a record rather than a
+        cache is that a closed period cannot change — migration 009 refuses
+        every write into one — so the figures stored here are settled by
+        definition and never need invalidating.
+
+        Returns the number of accounts written.
+        """
+        as_of = period["end_date"]
+        rows = self.db.journal.cumulative_totals(as_of)
+        with self._bulk():
+            self.db.snapshots.write(period["id"], as_of, rows)
+        return len(rows)
+
+    def discard_snapshots_from(self, as_of):
+        """Drop snapshots dated on or after ``as_of``. Returns the count.
+
+        Reopening a period invalidates its own snapshot *and every later one*:
+        the totals are cumulative, so a change inside the reopened period moves
+        every figure that includes it.
+        """
+        with self._bulk():
+            return self.db.snapshots.discard_from(as_of)
+
+    def rebuild_snapshots(self):
+        """Re-derive the snapshot of every closed period, earliest first.
+
+        The counterpart of ``sync(full=True)``. Needed after a period is
+        reopened and re-closed, since the later snapshots discarded at reopen
+        are not restored by closing one period.
+        """
+        written = 0
+        with self._bulk():
+            self.db.snapshots.discard_from("0000-00-00")
+            for period in self.db.periods.all():
+                if period["status"] == "closed":
+                    as_of = period["end_date"]
+                    self.db.snapshots.write(
+                        period["id"], as_of, self.db.journal.cumulative_totals(as_of))
+                    written += 1
+        return written
+
+    def snapshot_discrepancies(self):
+        """Snapshots that disagree with a fresh computation.
+
+        The guarantee behind the read path. Returns
+        ``[(as_of, account_code, stored, recomputed)]`` — empty when every
+        snapshot still reflects the journal it was taken from.
+        """
+        out = []
+        for as_of in self.db.snapshots.dates():
+            stored = self.db.snapshots.balances_at(as_of)
+            fresh = {code: (d, c)
+                     for code, d, c in self.db.journal.cumulative_totals(as_of)}
+            for code in set(stored) | set(fresh):
+                s = stored.get(code, (0.0, 0.0))
+                f = fresh.get(code, (0.0, 0.0))
+                if abs(round((s[0] - s[1]) - (f[0] - f[1]), 2)) > _BALANCE_TOLERANCE:
+                    out.append((as_of, code, round(s[0] - s[1], 2), round(f[0] - f[1], 2)))
+        return out
+
+    # ------------------------------------------------------------------ #
     # Balances & trial balance
     # ------------------------------------------------------------------ #
+    def _trial_balance_source(self, as_of):
+        """``(code, name, type, net)`` per account, via a snapshot when one covers
+        ``as_of``. Falls back to the full aggregate otherwise."""
+        baseline = self.db.snapshots.latest_at_or_before(as_of) if as_of else None
+        if not baseline:
+            return self.db.journal.trial_balance_rows(as_of)
+
+        nets = {code: d - c
+                for code, (d, c) in self.db.snapshots.balances_at(baseline).items()}
+        if baseline < as_of:
+            for code, debit, credit in self.db.journal.movements_between(baseline, as_of):
+                nets[code] = nets.get(code, 0.0) + debit - credit
+        return [(code, name, typ, nets.get(code, 0.0))
+                for code, name, typ in self.db.journal.accounts_with_names()]
+
+    def _net_via_snapshot(self, account_code, as_of):
+        """``SUM(debit) - SUM(credit)`` for one account, using a snapshot baseline.
+
+        Falls back to a full aggregate when no snapshot covers the date, which
+        is every journal until a period is closed.
+        """
+        if not as_of:
+            return None
+        baseline = self.db.snapshots.latest_at_or_before(as_of)
+        if not baseline:
+            return None
+        stored = self.db.snapshots.balance_at(account_code, baseline)
+        net = (stored[0] - stored[1]) if stored else 0.0
+        if baseline < as_of:
+            net += self.db.journal.account_net_between(account_code, baseline, as_of)
+        return net
+
     def get_account_balance(self, account_code, as_of=None):
         """Return an account's balance in its natural (positive) sense.
 
         Debit-normal accounts are positive when debit-heavy; credit-normal
         accounts are positive when credit-heavy.
+
+        When a closed period's snapshot covers the date, the settled part is
+        read rather than re-aggregated and only the movement since is summed.
         """
-        debit_minus_credit = self.db.journal.account_net(account_code, as_of)
+        debit_minus_credit = self._net_via_snapshot(account_code, as_of)
+        if debit_minus_credit is None:
+            debit_minus_credit = self.db.journal.account_net(account_code, as_of)
         normal = self.db.journal.normal_balance(account_code) or 'debit'
         signed = debit_minus_credit if normal == 'debit' else -debit_minus_credit
         return round(signed, 2)
@@ -221,7 +324,7 @@ class GLService:
         rows = []
         total_debit = 0.0
         total_credit = 0.0
-        for code, name, typ, net in self.db.journal.trial_balance_rows(as_of):
+        for code, name, typ, net in self._trial_balance_source(as_of):
             net = round(net or 0.0, 2)
             if abs(net) < 0.005:
                 continue  # skip accounts with no balance

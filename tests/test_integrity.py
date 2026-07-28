@@ -333,3 +333,22 @@ def test_period_checks_report_what_is_settled(journal):
     report = integrity.verify(journal)
     assert _check(report, "books settled through").detail == "2026-03-31"
     assert _check(report, "no edits inside a closed period").status == integrity.PASS
+
+
+def test_snapshot_drift_is_a_failure_not_a_warning(journal):
+    """A stored figure that disagrees with the journal is not a nuance."""
+    from src.services.period_service import FiscalPeriodService
+    from src.services.gl_service import GLService
+    _seed_member_with_loan(journal)
+    GLService(journal).sync()
+    svc = FiscalPeriodService(journal)
+    svc.close(svc.create("Q1", "2026-01-01", "2026-03-31"))
+    assert _check(integrity.verify(journal),
+                  "period snapshots match the journal").status == integrity.PASS
+
+    journal.conn.execute("UPDATE account_snapshots SET closing_balance = 12345 "
+                         "WHERE account_code='1100'")
+    journal.conn.commit()
+    check = _check(integrity.verify(journal), "period snapshots match the journal")
+    assert check.status == integrity.FAIL and check.count == 1
+    assert not integrity.verify(journal).ok
