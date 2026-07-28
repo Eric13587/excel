@@ -2336,7 +2336,6 @@ class LedgerView(QWidget):
                         from datetime import datetime as dt
                         
                         base_date = dt.strptime(new_date, "%Y-%m-%d")
-                        cursor = self.db.conn.cursor()
                         
                         # Update all rows from current to end
                         for i in range(row, total_rows):
@@ -2346,10 +2345,9 @@ class LedgerView(QWidget):
                             row_amount = float(table.item(i, 3).text().replace(',', ''))
                             row_notes = table.item(i, 5).text()
                             
-                            cursor.execute("""
-                                UPDATE savings SET date=?, amount=?, notes=? WHERE id=?
-                            """, (calc_date, row_amount, row_notes, row_trans_id))
-                        
+                            self.db.funds.update("savings", row_trans_id, calc_date,
+                                                 row_amount, row_notes)
+
                         self.db.conn.commit()
                         self.db.recalculate_savings_balances(self.current_individual_id)
                         table.blockSignals(False)
@@ -2358,11 +2356,7 @@ class LedgerView(QWidget):
                         return
             
             # Update the single transaction
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                UPDATE savings SET date=?, amount=?, notes=? WHERE id=?
-            """, (new_date, new_amount, new_notes, trans_id))
-            self.db.conn.commit()
+            self.db.update_savings_transaction(trans_id, new_date, new_amount, new_notes)
             
             # Recalculate balances
             self.db.recalculate_savings_balances(self.current_individual_id)
@@ -2441,9 +2435,7 @@ class LedgerView(QWidget):
                                        f"Delete ALL {len(savings_df)} savings entries?\nThis cannot be undone!",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if confirm == QMessageBox.StandardButton.Yes:
-            cursor = self.db.conn.cursor()
-            cursor.execute("DELETE FROM savings WHERE individual_id=?", (self.current_individual_id,))
-            self.db.conn.commit()
+            self.db.fund_delete_all("savings", self.current_individual_id)
             self.refresh_table()
             self.refresh_savings_balance()
             QMessageBox.information(self, "Success", "All savings entries deleted.")

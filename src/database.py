@@ -11,7 +11,7 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import MemberRepository, SettingsRepository
+from src.db import FundRepository, MemberRepository, SettingsRepository
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -75,6 +75,7 @@ class DatabaseManager:
         # one lands, so its public API is unchanged for existing callers.
         self.settings = SettingsRepository(self.conn)
         self.members = MemberRepository(self.conn)
+        self.funds = FundRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -1540,9 +1541,8 @@ class DatabaseManager:
 
     def delete_savings_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from savings."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM savings WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.delete_batch("savings", batch_id)
 
     # ========== SAVINGS OPERATIONS ==========
     
@@ -1581,211 +1581,120 @@ class DatabaseManager:
         else:  # Withdrawal
             new_balance = current_balance - amount
         
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes, batch_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
-        new_id = cursor.lastrowid
-        self.conn.commit()
+        with self.transaction():
+            new_id = self.funds.add("savings", individual_id, date, transaction_type,
+                                    amount, new_balance, notes, batch_id)
         self._fire_post_hook(self.savings_post_hook, [new_id])
         return new_balance
     
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual."""
         self.create_savings_table()
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT balance FROM savings WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1", (individual_id,))
-        row = cursor.fetchone()
-        return row[0] if row else 0.0
+        return self.funds.latest_balance("savings", individual_id)
 
     def recalculate_savings_balance(self, individual_id, cursor=None):
-        """Recalculate running balance for all savings transactions of an individual."""
-        # self.create_savings_table() # Removed to prevent commit during transaction
-        
-        should_commit = False
-        if cursor is None:
-            cursor = self.conn.cursor()
-            should_commit = True
-        
-        # Fetch all transactions ordered by date and then insertion order (id)
-        cursor.execute("SELECT id, transaction_type, amount FROM savings WHERE individual_id=? ORDER BY date ASC, id ASC", (individual_id,))
-        transactions = cursor.fetchall()
-        
-        running_balance = 0.0
-        updates = []
-        
-        for t in transactions:
-            tid, t_type, amount = t
-            if t_type in ["Deposit", "Interest"]:
-                running_balance += amount
-            elif t_type == "Withdrawal":
-                running_balance -= amount
-            
-            updates.append((running_balance, tid))
-            
-        # Bulk update
-        cursor.executemany("UPDATE savings SET balance=? WHERE id=?", updates)
-        
-        if should_commit:
-            self.conn.commit()
-    
+        """Recalculate running balance for all savings transactions of an individual.
+
+        Ordered by (date, id); Interest increases the balance. The optional
+        cursor lets the import path fold this into its own transaction — which
+        is why this method does not commit when one is supplied.
+        """
+        if cursor is not None:
+            self.funds.recalc_savings_by_date(individual_id, cursor=cursor)
+            return
+        with self.transaction():
+            self.funds.recalc_savings_by_date(individual_id)
+
     def get_savings_transactions(self, individual_id, start_date=None, end_date=None):
         """Get all savings transactions for an individual."""
         self.create_savings_table()
-        query = "SELECT * FROM savings WHERE individual_id = ?"
-        params = [individual_id]
-        
-        if start_date:
-            query += " AND date >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND date <= ?"
-            params.append(end_date)
-            
-        query += " ORDER BY id"
-        return pd.read_sql_query(query, self.conn, params=tuple(params))
-    
+        return self.funds.transactions("savings", individual_id, start_date, end_date, order="id")
+
     def delete_savings_transaction(self, trans_id):
-        """Delete a savings transaction and recalculate balances."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM savings WHERE id=?", (trans_id,))
-        self.conn.commit()
+        """Delete a savings transaction (caller recalculates afterwards)."""
+        with self.transaction():
+            self.funds.delete("savings", trans_id)
 
     def update_savings_transaction(self, trans_id, new_date, new_amount, new_notes):
         """Update a savings transaction."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE savings SET date=?, amount=?, notes=? WHERE id=?", 
-                       (new_date, new_amount, new_notes, trans_id))
-        self.conn.commit()
-    
-    def recalculate_savings_balances(self, individual_id):
-        """Recalculate running balances for savings."""
-        self.create_savings_table()
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, transaction_type, amount FROM savings WHERE individual_id=? ORDER BY id", (individual_id,))
-        rows = cursor.fetchall()
-        
-        running_balance = 0.0
-        for row in rows:
-            trans_id, trans_type, amount = row
-            if trans_type == "Deposit":
-                running_balance += amount
-            else:
-                running_balance -= amount
-            cursor.execute("UPDATE savings SET balance=? WHERE id=?", (running_balance, trans_id))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.update("savings", trans_id, new_date, new_amount, new_notes)
 
-    # ========== GENERIC FUND LEDGER (Christmas / Benevolent) ==========
-    # A savings-style ledger reused by the Christmas and Benevolent funds.
-    # Table is whitelisted (never user input) so the f-string is injection-safe.
+    def recalculate_savings_balances(self, individual_id):
+        """Recalculate running balances for savings.
+
+        NOTE: ordered by id alone, and anything that is not a Deposit reduces
+        the balance — so an Interest row subtracts here and adds in
+        recalculate_savings_balance. Preserved verbatim; reconciled in Phase 3
+        (finding D1).
+        """
+        self.create_savings_table()
+        with self.transaction():
+            self.funds.recalc_savings_by_id(individual_id)
+
+    # ========== GENERIC FUND LEDGER (Savings / Christmas / Benevolent) ==========
+    # Delegated to FundRepository, which whitelists the table name.
     _FUND_TABLES = ("christmas_savings", "benevolent_ledger")
 
-    def _fund_table(self, table):
-        if table not in self._FUND_TABLES:
-            raise ValueError(f"Unknown fund table: {table}")
-        return table
-
     def fund_balance(self, table, individual_id):
-        t = self._fund_table(table)
-        cur = self.conn.cursor()
-        cur.execute(f"SELECT balance FROM {t} WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1",
-                    (individual_id,))
-        row = cur.fetchone()
-        return row[0] if row else 0.0
+        return self.funds.latest_balance(table, individual_id)
 
     def fund_add_transaction(self, table, individual_id, date, transaction_type, amount,
                              notes="", batch_id=None):
         """Append a fund transaction with a running balance. Withdrawals reduce
-        the balance; everything else (Deposit/Contribution/Interest) increases it."""
-        t = self._fund_table(table)
+        the balance; everything else (Deposit/Contribution/Interest) increases it.
+
+        Unlike add_savings_transaction this fires no general-ledger post hook,
+        so Christmas and Benevolent activity only reaches the books on the next
+        GLService.sync(). Preserved deliberately; fixed in Phase 5.
+        """
         current = self.fund_balance(table, individual_id)
         new_balance = round(current - amount, 2) if transaction_type == "Withdrawal" \
             else round(current + amount, 2)
-        cur = self.conn.cursor()
-        cur.execute(
-            f"INSERT INTO {t} (individual_id, date, transaction_type, amount, balance, notes, batch_id) "
-            f"VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.add(table, individual_id, date, transaction_type, amount,
+                           new_balance, notes, batch_id)
         return new_balance
 
     def fund_transactions(self, table, individual_id):
-        t = self._fund_table(table)
-        return pd.read_sql_query(
-            f"SELECT * FROM {t} WHERE individual_id=? ORDER BY date, id",
-            self.conn, params=(individual_id,))
+        return self.funds.transactions(table, individual_id)
 
     def fund_recalculate(self, table, individual_id):
-        t = self._fund_table(table)
-        cur = self.conn.cursor()
-        cur.execute(f"SELECT id, transaction_type, amount FROM {t} WHERE individual_id=? ORDER BY date ASC, id ASC",
-                    (individual_id,))
-        running = 0.0
-        for tid, ttype, amount in cur.fetchall():
-            running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
-            cur.execute(f"UPDATE {t} SET balance=? WHERE id=?", (running, tid))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.recalc_fund(table, individual_id)
 
     def fund_delete_transaction(self, table, trans_id):
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"DELETE FROM {t} WHERE id=?", (trans_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.delete(table, trans_id)
 
     def fund_delete_batch(self, table, batch_id):
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"DELETE FROM {t} WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.delete_batch(table, batch_id)
 
     def fund_delete_all(self, table, individual_id):
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"DELETE FROM {t} WHERE individual_id=?", (individual_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.delete_all_for_member(table, individual_id)
 
     def fund_get_transaction(self, table, trans_id):
-        t = self._fund_table(table)
-        cur = self.conn.cursor()
-        cur.execute(f"SELECT id, individual_id, date, transaction_type, amount, notes FROM {t} WHERE id=?",
-                    (trans_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return dict(zip([d[0] for d in cur.description], row))
+        return self.funds.get(table, trans_id)
 
     def fund_update_transaction(self, table, trans_id, date, amount, notes):
         """Edit a fund transaction's date/amount/notes (caller should recalc after)."""
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"UPDATE {t} SET date=?, amount=?, notes=? WHERE id=?",
-                                   (date, amount, notes, trans_id))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.update(table, trans_id, date, amount, notes)
 
     # ========== BENEVOLENT ENROLMENT ==========
 
     def get_benevolent_account(self, individual_id):
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, individual_id, monthly_amount, start_date, next_due_date, active "
-                    "FROM benevolent_accounts WHERE individual_id=?", (individual_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return dict(zip([d[0] for d in cur.description], row))
+        return self.funds.get_enrolment(individual_id)
 
     def upsert_benevolent_account(self, individual_id, monthly_amount, start_date, next_due_date):
-        cur = self.conn.cursor()
-        if self.get_benevolent_account(individual_id):
-            cur.execute("UPDATE benevolent_accounts SET monthly_amount=?, start_date=?, "
-                        "next_due_date=?, active=1 WHERE individual_id=?",
-                        (monthly_amount, start_date, next_due_date, individual_id))
-        else:
-            cur.execute("INSERT INTO benevolent_accounts (individual_id, monthly_amount, start_date, "
-                        "next_due_date, active) VALUES (?, ?, ?, ?, 1)",
-                        (individual_id, monthly_amount, start_date, next_due_date))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.upsert_enrolment(individual_id, monthly_amount, start_date, next_due_date)
 
     def set_benevolent_next_due(self, individual_id, next_due_date):
-        self.conn.cursor().execute("UPDATE benevolent_accounts SET next_due_date=? WHERE individual_id=?",
-                                   (next_due_date, individual_id))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.set_next_due(individual_id, next_due_date)
 
     def get_setting(self, key, default=None):
         """Get a setting value (delegates to SettingsRepository).

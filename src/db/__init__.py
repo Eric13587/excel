@@ -8,13 +8,16 @@ The migration is incremental by design: ``DatabaseManager`` keeps its public
 API and delegates to a repository as each one lands, so no caller changes and
 the suite stays green at every step. Repositories added so far:
 
+* :class:`~src.db.fund.FundRepository` — ``savings``, ``christmas_savings``,
+  ``benevolent_ledger`` and ``benevolent_accounts``.
 * :class:`~src.db.member.MemberRepository` — the ``individuals`` table.
 * :class:`~src.db.settings.SettingsRepository` — the ``settings`` table.
 
 See docs/db/repository-layer.md for the full sequencing.
 """
 from src.db.base import Repository
+from src.db.fund import FundRepository
 from src.db.member import MemberRepository
 from src.db.settings import SettingsRepository
 
-__all__ = ["MemberRepository", "Repository", "SettingsRepository"]
+__all__ = ["FundRepository", "MemberRepository", "Repository", "SettingsRepository"]

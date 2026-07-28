@@ -144,9 +144,7 @@ class ChristmasService:
         """Undo a mass catch-up batch: delete its rows and recalc affected members."""
         if not batch_id:
             return False
-        cur = self.db.conn.cursor()
-        cur.execute(f"SELECT DISTINCT individual_id FROM {_TABLE} WHERE batch_id=?", (batch_id,))
-        affected = [r[0] for r in cur.fetchall()]
+        affected = self.db.funds.members_in_batch(_TABLE, batch_id)
         self.db.fund_delete_batch(_TABLE, batch_id)
         for ind in affected:
             self.db.fund_recalculate(_TABLE, ind)

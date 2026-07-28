@@ -129,7 +129,6 @@ class SavingsService:
         transactions = transactions.sort_values(by=['date', 'id'], ascending=[True, True])
         
         running_balance = 0.0
-        cursor = self.db.conn.cursor()
         
         for index, row in transactions.iterrows():
             amount = float(row['amount'])
@@ -143,8 +142,8 @@ class SavingsService:
                 
             # Update balance if different
             if abs(running_balance - float(row['balance'])) > 0.001:
-                cursor.execute("UPDATE savings SET balance=? WHERE id=?", (running_balance, t_id))
-                
+                self.db.funds.set_balance("savings", t_id, running_balance)
+
         self.db.conn.commit()
 
     def catch_up_savings(self, individual_id, monthly_amount=None, batch_id=None, target_date=None):
@@ -274,9 +273,7 @@ class SavingsService:
         if not batch_id: return False
         
         # 1. Identify affected individuals
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT DISTINCT individual_id FROM savings WHERE batch_id=?", (batch_id,))
-        affected_ids = [row[0] for row in cursor.fetchall()]
+        affected_ids = self.db.funds.members_in_batch("savings", batch_id)
 
         # 2. Delete batch
         self.db.delete_savings_batch(batch_id)

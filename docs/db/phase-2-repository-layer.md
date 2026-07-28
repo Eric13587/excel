@@ -12,8 +12,8 @@ repository as it lands.
 |---|---|---|---|
 | **2a** | **done** | `Repository` base, `SettingsRepository`, wiring | 3 |
 | **2b** | **done** | `MemberRepository` (`individuals`) | 21 of 53 |
-| 2c | pending | `LoanRepository` + `LedgerRepository` | 113 |
-| 2d | pending | `FundRepository` (`savings`, both funds) | 55 |
+| **2d** | **done** | `FundRepository` (`savings`, both funds, enrolment) | 32 of 55 |
+| 2c | next | `LoanRepository` + `LedgerRepository` | 113 |
 | 2e | pending | `JournalRepository` (COA, entries, lines) | 42 |
 | 2f | pending | Raw SQL out of views/engine/services; `DatabaseService` root | 36 |
 
@@ -165,3 +165,57 @@ is what lets `update_individual` be atomic across four statements. Phase 2a's
 
 `git revert` the 2b commit. No schema or data change; `DatabaseManager`'s public
 API is identical either side.
+
+---
+
+## 2d — FundRepository
+
+Taken before 2c on the reasoning that the `fund_*` methods were already a
+generic API over a whitelisted table name — most of a repository already — so
+this is the low-risk step, and Phase 3's balance consolidation depends on it
+existing.
+
+32 of the 55 statements move. The rest are the GL service's subledger scans
+(2e), the import path, and the earliest-record-date queries (2f).
+
+### What changed
+
+* `src/db/fund.py` — one repository for `savings`, `christmas_savings`,
+  `benevolent_ledger` and `benevolent_accounts`. `savings` joins the whitelist
+  the other two already used, so all three are reached identically.
+* **Raw SQL removed from the view layer** (finding D6). `views/ledger.py` — a
+  Qt widget — was executing three `savings` statements directly, one of them a
+  duplicate of `DatabaseManager.update_savings_transaction`. Because it
+  bypassed the manager, the savings GL post-hook never fired for edits made
+  through that path.
+* Raw SQL also removed from `savings_service`, `christmas_service` and
+  `benevolent_service` (batch-revert lookups and a balance write).
+
+### Two defects preserved on purpose
+
+Phase 2 is a refactor, so both survive — but they are now visible in one file
+with tests pinning them, which is what the next phases need.
+
+1. **Three running-balance semantics** (finding D1) are now three named methods
+   sitting next to each other: `recalc_savings_by_date` (Interest *increases*,
+   ordered by date), `recalc_savings_by_id` (Interest *decreases*, ordered by
+   id), `recalc_fund` (only Withdrawal decreases, rounded to 2dp). Two tests
+   assert the contradictory answers — 900 versus 700 on the same three rows —
+   so Phase 3 has an explicit baseline to change.
+
+2. **Only `savings` writes fire the GL post hook.** `fund_add_transaction`
+   fires nothing, which is why 12 Christmas deposits sat outside the books
+   until a sync was run. `test_only_savings_fires_the_gl_post_hook` pins it for
+   Phase 5.
+
+### Verification
+
+* 306 → 324 tests (18 added). `ruff` clean.
+* Fund lifecycle against a production copy: savings deposits and both
+  recalculators, Christmas deposits with the unlock month, benevolent enrolment
+  and catch-up, mass catch-up plus revert for all three funds, GL sync
+  (balanced), member delete (FK clean).
+
+### Rollback
+
+`git revert` the 2d commit. No schema or data change.
