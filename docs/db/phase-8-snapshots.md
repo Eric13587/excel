@@ -110,6 +110,13 @@ posting keeps the books in step under real usage.
 
 ### Rollback
 
+> **The migration backups have been deleted** (2026-07-28, at the user's
+> request). The `.bak` file named below no longer exists, so the restore
+> route described here is gone. What remains is the code-level rollback in
+> the same section, plus the app's own `backups/` rotation, which holds only
+> journals taken *after* this point.
+
+
 `DROP TABLE account_snapshots`, or restore
 `loan_master.pre-phase8-20260728-162132.db.bak`. Reverting the code alone is
 safe: with no snapshots stored, every read already takes the fallback path.

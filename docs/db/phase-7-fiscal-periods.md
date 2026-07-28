@@ -118,6 +118,13 @@ a migration should make.
 
 ### Rollback
 
+> **The migration backups have been deleted** (2026-07-28, at the user's
+> request). The `.bak` file named below no longer exists, so the restore
+> route described here is gone. What remains is the code-level rollback in
+> the same section, plus the app's own `backups/` rotation, which holds only
+> journals taken *after* this point.
+
+
 `DROP` the 13 `trg_period_lock_*` triggers to disable the lock, and
 `DROP TABLE fiscal_periods` plus its three triggers to remove the register. With
 no closed periods, a code-only revert changes nothing observable. Backups:

@@ -118,6 +118,13 @@ integrity_check ok | foreign_key_check clean
 
 ### Rollback
 
+> **The migration backups have been deleted** (2026-07-28, at the user's
+> request). The `.bak` file named below no longer exists, so the restore
+> route described here is gone. What remains is the code-level rollback in
+> the same section, plus the app's own `backups/` rotation, which holds only
+> journals taken *after* this point.
+
+
 Both are additive to behaviour, not to data. For 006, `DROP` the four
 `trg_journal_*_immutable_*` triggers — no columns or rows change. For 007,
 restore `loan_master.pre-phase6b-20260728-160007.db.bak`; the table rebuild is

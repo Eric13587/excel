@@ -110,10 +110,18 @@ the existing history is unchanged.
 
 ### C4. Backup files accumulating in the working directory
 
-**Pruned.** Two are kept: `loan_master.pre-phase1-ops-20260728-030342.db.bak`
-(the journal before any of this work) and
-`loan_master.pre-phase8-20260728-162132.db.bak` (before the last migration).
-Both were verified readable before the other fifteen were deleted. 43 MB → 5.2 MB.
+**All removed** (2026-07-28, at the user's request). The eighteen per-phase
+`.bak` files, the four older loose ones, and the ten rotating journals in
+`backups/` are all gone — 39 MB freed, project down to 15 MB.
+
+**There is no restore point for the migration work.** The `.bak` paths named in
+`docs/db/phase-*.md` and in the phase commit messages no longer resolve. Each
+phase's code-level rollback still applies (dropping the triggers a migration
+installed, reverting the commit), but the "restore the backup" route does not.
+
+`backups/` is the application's own rotation — `_backup_on_open` writes one on
+every open and keeps ten. It repopulates the next time the app runs, but only
+with journals taken *after* this deletion.
 
 A related gap was found while merging: `.gitignore` covered `*.db` and `*.bak`
 but not SQLite's sidecars, which are named `<database><suffix>` — so
