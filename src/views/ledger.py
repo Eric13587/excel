@@ -1,4 +1,5 @@
 """LedgerView for managing individual loan ledgers."""
+import logging
 import math
 from datetime import datetime
 
@@ -16,6 +17,8 @@ from PyQt6.QtCore import Qt, QDate, QTimer
 from ..theme import ThemeManager
 from ..engine import LoanEngine
 from ..exceptions import ChristmasLockedError
+
+logger = logging.getLogger(__name__)
 
 
 class LedgerView(QWidget):
@@ -376,6 +379,18 @@ class LedgerView(QWidget):
                     suspend_btn.setStyleSheet(self.theme_manager.button_css("warning", padding="4px 10px", bold=True))
                     suspend_btn.clicked.connect(lambda checked, lid=loan_info['id'], ref=loan_ref: self.suspend_loan_dialog(lid, ref))
                     header_layout.addWidget(suspend_btn)
+
+                # Recorded suspensions had no route out of the application: a
+                # backdated one leaves is_suspended clear, so Resume never
+                # appears for it. Shown only when there is something to manage.
+                if loan_info and self.engine.db.get_loan_suspensions_for_loan(loan_info['id']):
+                    spans_btn = QPushButton("Suspensions")
+                    spans_btn.setStyleSheet(self.theme_manager.outline_button_css("warning", padding="4px 8px"))
+                    spans_btn.setToolTip("View or remove recorded suspension periods")
+                    spans_btn.clicked.connect(
+                        lambda checked, lid=loan_info['id'], ref=loan_ref:
+                        self.manage_suspensions_dialog(lid, ref))
+                    header_layout.addWidget(spans_btn)
 
                 # Order: Catch Up (1) -> Top-Up (2) -> Delete (3) -> Deduct (4) -> Auto (5) -> Undo (6)
 
@@ -1173,11 +1188,24 @@ class LedgerView(QWidget):
                     if proceed != QMessageBox.StandardButton.Yes:
                         return
                 else:
-                    choice = QMessageBox.question(self, "Apply Suspension to Schedule",
+                    # A rebuild does not surgically remove the window's rows: it
+                    # deletes every Repayment and Interest Earned row on the loan
+                    # and re-derives the whole schedule. Say so, with the real
+                    # count, because "rebuild" does not read as "delete payments"
+                    # and the operation cannot be undone.
+                    total_rows = self.engine.db.ledger.count_events(
+                        self.current_individual_id, loan_ref,
+                        ("Repayment", "Interest Earned"))
+                    choice = QMessageBox.question(self, "Rebuild Schedule — Deletes Entries",
                         f"There {'is' if existing == 1 else 'are'} {existing} deduction(s) recorded "
                         f"for {loan_ref} between {start_str} and {end_str}.\n\n"
-                        f"Rebuild the loan's schedule to remove those deductions and apply the "
-                        f"suspension (the loan term extends accordingly)?\n\n"
+                        f"To apply the suspension, this loan's schedule must be rebuilt. "
+                        f"That deletes ALL {total_rows} repayment and interest entries on "
+                        f"{loan_ref} — not only the {existing} in this window — and re-creates "
+                        f"them from the issue date, skipping the suspended months. The loan "
+                        f"term extends accordingly.\n\n"
+                        f"Any manual edits to those entries will be lost, and this cannot be "
+                        f"undone. A backup is saved first.\n\n"
                         f"Yes = rebuild and apply    No = just record a note on statements",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                         | QMessageBox.StandardButton.Cancel)
@@ -1188,11 +1216,23 @@ class LedgerView(QWidget):
             kind = self.engine.db.record_suspension(loan_id, start_str, end_str, today=today_str)
 
             if apply_rebuild:
+                before = self.engine.db.ledger.count_events(
+                    self.current_individual_id, loan_ref, ("Repayment", "Interest Earned"))
+                backup = self._backup_before("rebuild", loan_ref)
+                if backup is False:
+                    return                      # backup failed; the user was told
                 try:
-                    self.engine.loan_service.rebuild_loan_schedule(self.current_individual_id, loan_ref)
+                    created = self.engine.loan_service.rebuild_loan_schedule(
+                        self.current_individual_id, loan_ref)
+                    after = self.engine.db.ledger.count_events(
+                        self.current_individual_id, loan_ref, ("Repayment", "Interest Earned"))
                     QMessageBox.information(self, "Suspension Applied",
-                        f"Rebuilt {loan_ref}: deductions for the suspended months were removed "
-                        f"and the loan term extended accordingly.")
+                        f"Rebuilt {loan_ref}.\n\n"
+                        f"Entries before: {before}\nEntries now: {after}\n"
+                        f"Deductions re-created: {created}\n\n"
+                        f"The suspended months are skipped and the loan term extends "
+                        f"accordingly."
+                        + (f"\n\nBackup saved to:\n{backup}" if backup else ""))
                 except ValueError as e:
                     QMessageBox.warning(self, "Rebuild Skipped", str(e))
             elif kind == 'historical':
@@ -1205,6 +1245,127 @@ class LedgerView(QWidget):
                     f"Deductions will be skipped for {months} month(s).")
             self.refresh_table()
             self.refresh_loans_list()
+
+    def _backup_before(self, what, loan_ref):
+        """Snapshot the journal before an irreversible operation.
+
+        Returns the path, or None if it could not be written — a failed backup
+        is reported but does not block the operation the user asked for. Uses
+        the online-backup API, so it is safe under WAL where a file copy would
+        silently miss uncheckpointed transactions.
+        """
+        import os
+        from datetime import datetime as _dt
+        db_path = self.engine.db.db_name
+        if not db_path or db_path == ":memory:":
+            return None
+        folder = os.path.join(os.path.dirname(os.path.abspath(db_path)), "backups")
+        stem = os.path.splitext(os.path.basename(db_path))[0]
+        safe_ref = "".join(c for c in str(loan_ref) if c.isalnum() or c in "-_")
+        dest = os.path.join(
+            folder, f"{stem}.pre-{what}-{safe_ref}-{_dt.now():%Y%m%d-%H%M%S}.db")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            return self.engine.db.backup_to(dest)
+        except Exception as e:                      # noqa: BLE001 - never block the user
+            logger.warning("Could not back up before %s: %s", what, e)
+            QMessageBox.warning(
+                self, "Backup Failed",
+                f"Could not save a backup before this change:\n{e}\n\n"
+                f"The operation has not been performed. Free some disk space or "
+                f"check permissions on the 'backups' folder, then try again.")
+            return False
+
+    def manage_suspensions_dialog(self, loan_id, loan_ref):
+        """List a loan's recorded suspensions, and remove one.
+
+        There was previously no way to see or undo these. A backdated span whose
+        window has already closed leaves the loan's `is_suspended` flag clear —
+        correctly, since the loan is not suspended now — so the Resume button
+        never appears for it and the record was permanent, with catch-up
+        skipping its months indefinitely.
+        """
+        from PyQt6.QtWidgets import QDialogButtonBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Suspensions — {loan_ref}")
+        dialog.setMinimumSize(620, 340)
+        layout = QVBoxLayout(dialog)
+
+        blurb = QLabel(
+            "Periods when deductions were skipped for this loan. Removing one "
+            "means it never applied, so future catch-ups will deduct those "
+            "months again — it does not restore months already skipped (use "
+            "Suspend → rebuild for that). Resuming, by contrast, ends a "
+            "suspension and leaves its months skipped.")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet(self.theme_manager.hint_css())
+        layout.addWidget(blurb)
+
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["From", "Until", "Status", "Resumed", "Recorded"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(table)
+
+        spans = []
+
+        def reload_spans():
+            spans.clear()
+            spans.extend(self.engine.db.get_loan_suspensions_for_loan(loan_id))
+            table.setRowCount(len(spans))
+            for row, sp in enumerate(spans):
+                cells = (sp["start_date"], sp["suspend_until"] or "indefinite",
+                         "live" if sp["status"] == "active" else "ended",
+                         sp["resumed_date"] or "—", str(sp.get("created_at") or "")[:10])
+                for col, value in enumerate(cells):
+                    table.setItem(row, col, QTableWidgetItem(str(value)))
+            remove_btn.setEnabled(bool(spans))
+
+        def remove_selected():
+            selected = table.selectedItems()
+            if not selected:
+                QMessageBox.information(dialog, "No Selection",
+                                        "Select a suspension to remove.")
+                return
+            span = spans[selected[0].row()]
+            until = span["suspend_until"] or "indefinite"
+            live = span["status"] == "active"
+            if QMessageBox.question(
+                    dialog, "Remove Suspension",
+                    f"Remove the suspension on {loan_ref} from {span['start_date']} "
+                    f"to {until}?\n\n"
+                    + ("This is the live suspension, so the loan will no longer be "
+                       "suspended.\n\n" if live else "")
+                    + "Future catch-ups will deduct those months again. Months "
+                      "already skipped are not restored by this.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            self.engine.db.delete_suspension(span["id"])
+            reload_spans()
+            self.refresh_table()
+            self.refresh_loans_list()
+
+        buttons = QHBoxLayout()
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.setStyleSheet(self.theme_manager.button_css("danger"))
+        remove_btn.clicked.connect(remove_selected)
+        buttons.addWidget(remove_btn)
+        buttons.addStretch()
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_box.rejected.connect(dialog.reject)
+        buttons.addWidget(close_box)
+        layout.addLayout(buttons)
+
+        reload_spans()
+        if not spans:
+            QMessageBox.information(self, "No Suspensions",
+                                    f"No suspensions have been recorded for {loan_ref}.")
+            return
+        dialog.exec()
 
     def resume_loan_btn(self, loan_id):
         """Resume a suspended loan."""

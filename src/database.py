@@ -1349,6 +1349,33 @@ class DatabaseManager:
         """
         return self.loans.suspensions_for_member(individual_id)
 
+    def get_loan_suspensions_for_loan(self, loan_id):
+        """Every recorded suspension span for one loan, earliest first."""
+        return self.loans.suspensions_for_loan(loan_id)
+
+    def delete_suspension(self, suspension_id):
+        """Remove a recorded suspension span.
+
+        Not the same as resuming. Resuming says the suspension *ended*, which
+        leaves its months permanently skipped; deleting says it never applied,
+        so catch-up will deduct those months again. There was previously no way
+        to do this at all — a backdated span leaves ``is_suspended`` clear, so
+        no Resume button ever appears for it and the record was permanent.
+
+        If the deleted span was the live one, the loan's suspended flag is
+        cleared with it; otherwise the flag belongs to a different span and is
+        left alone. Returns the deleted row, or None if it did not exist.
+        """
+        span = self.loans.suspension(suspension_id)
+        if span is None:
+            return None
+        with self.transaction():
+            was_open = self.loans.open_suspension_id(span["loan_id"]) == suspension_id
+            self.loans.delete_suspension(suspension_id)
+            if was_open:
+                self.loans.clear_suspended(span["loan_id"])
+        return span
+
     def record_suspension(self, loan_id, start_date, end_date, today=None):
         """Record a suspension span anywhere in time (past, present or future).
 

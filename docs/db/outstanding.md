@@ -13,14 +13,33 @@ would have been guessing.
 These show as warnings in `python -m src.integrity loan_master.db`. None is a
 code defect; each is a fact about the journal that someone has to rule on.
 
-### A1. Two `Paid` loans carrying a balance
+### A1. Two `Paid` loans carrying a balance — **diagnosed**
 
-Two loans are marked `Paid` but hold a non-zero balance, totalling **−113,778**
-(negative — they are over-repaid on the books).
+Two loans are marked `Paid` but hold a non-zero balance, totalling **−113,778**.
+They have *different* causes, found while testing the suspension work:
 
-Either the status is right and the balance should be written off, or the balance
-is right and the status is wrong. The two answers produce different figures in
-the loan book, so the code cannot pick.
+**Loan 193, BRIAN ODHIAMBO, L-001 — balance −11,898.** Properly issued at
+100,000. The final row is a 95,833 settlement entered as a `Repayment` with
+`principal_portion = 95,233`, but only 83,335 of principal was still
+outstanding. The over-allocation is 11,898 — exactly the negative balance. It
+looks like a buy-off recorded as an ordinary repayment, so the split was
+computed against the installment rather than the payoff figure. Correcting the
+split on that one row clears it.
+
+**Loan 483, NANCY GATHOGO, L-002 — balance −101,880. This is the serious one.**
+There is **no `Loan Issued` row at all**. Ten deductions of 10,188 principal
+each total 101,880 against a recorded disbursement of zero, which is precisely
+the negative balance. The loan record says `principal = 529,770`.
+
+So either the disbursement was never entered (and this member has roughly
+**427,890 genuinely outstanding while the system says `Paid`**), or the loan
+record is a stub that should not exist. Only the SACCO can say which — but this
+is not cosmetic, and it is the one to look at first.
+
+The general failure mode is worth naming: a loan whose ledger has no issue row
+has its balance driven negative by its own repayments and is then flipped to
+`Paid`. `src.integrity` reports the symptom; it does not yet check for the
+cause. A "loans with repayments but no disbursement" check would catch it.
 
 ### A2. Three loans with no recoverable duration
 

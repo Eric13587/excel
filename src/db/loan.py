@@ -266,6 +266,33 @@ class LoanRepository(Repository):
             "resumed_date, status FROM loan_suspensions WHERE individual_id=? "
             "ORDER BY start_date, id", (member_id,))
 
+    def suspensions_for_loan(self, loan_id):
+        """Every recorded span for one loan, earliest first.
+
+        Scoped by the loan's primary key rather than its ref, because a ref is
+        unique per member only.
+        """
+        return self._dicts(
+            "SELECT id, loan_id, individual_id, loan_ref, start_date, suspend_until, "
+            "resumed_date, status, created_at FROM loan_suspensions WHERE loan_id=? "
+            "ORDER BY start_date, id", (loan_id,))
+
+    def suspension(self, suspension_id):
+        """One span, or None."""
+        return self._dict(
+            "SELECT id, loan_id, individual_id, loan_ref, start_date, suspend_until, "
+            "resumed_date, status, created_at FROM loan_suspensions WHERE id=?",
+            (suspension_id,))
+
+    def delete_suspension(self, suspension_id):
+        """Remove a recorded span entirely.
+
+        Distinct from closing one: closing says "the suspension ended", which
+        leaves the skipped months skipped. Deleting says "this never applied",
+        so catch-up will deduct those months again.
+        """
+        self._execute("DELETE FROM loan_suspensions WHERE id=?", (suspension_id,))
+
     def open_suspension_id(self, loan_id):
         """The one open span for a loan, if any.
 
