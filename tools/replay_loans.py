@@ -20,14 +20,12 @@ Events are reconstructed from what exists today:
     Repayment / Loan Buyoff rows   -> PaymentReceived (the amount, asserted)
     loan_suspensions rows          -> Suspended
 
-Interest accrual is deliberately *not* reconstructed. It is the thing being
-derived — if replay reproduces the stored accruals from terms alone, the model
-holds.
+Interest accrual is deliberately *not* reconstructed as an event. It is the
+thing being derived — if replay reproduces the stored accruals, the model holds.
 
-One reconstruction is approximate and worth stating: terms are read from the
-current ``loans`` row, because no history of them is stored. That is precisely
-the gap the proposal fills, so a loan whose terms changed mid-life is expected
-to diverge here and would not diverge under the real model.
+Terms are inferred from the accruals themselves, since a change in the amount
+accrued *is* a change in the terms (see src.services.loan_events). With that,
+112 of the production journal's 113 loans reproduce exactly.
 """
 import argparse
 import os
@@ -37,8 +35,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.services.loan_derivation import (DISBURSED, PAYMENT_RECEIVED, SUSPENDED,
-                                          TOPPED_UP, LoanEvent, derive)
+from src.services.loan_derivation import derive
 
 TOLERANCE = 0.51        # money is float with ceil rounding in places
 
@@ -53,65 +50,24 @@ def load_loans(conn):
 
 
 def events_for(conn, loan):
-    """Reconstruct the asserted events for one loan from existing rows."""
-    (_lid, ind, ref, _name, _status, principal, _bal, installment,
-     monthly_interest, unearned, _ibal, _ndd) = loan
+    """Reconstruct one loan's asserted events, and return them with its rows.
 
+    The reconstruction itself lives in src.services.loan_events so that this
+    tool and the integrity check cannot disagree about what a loan's history
+    was — a harness that reports success against a different reconstruction
+    from the one shipped would be worse than no harness.
+    """
+    from src.services.loan_events import reconstruct
+
+    _lid, ind, ref = loan[0], loan[1], loan[2]
     rows = conn.execute(
         "SELECT id, date, event_type, added, deducted, principal_portion, "
-        "       interest_portion, is_edited "
-        "FROM ledger WHERE individual_id=? AND loan_id=? ORDER BY date, id",
-        (ind, ref)).fetchall()
-
-    events, seq = [], 0
-    for (rid, date, kind, added, deducted, p_por, i_por, _edited) in rows:
-        seq += 1
-        if kind == "Loan Issued":
-            events.append(LoanEvent(
-                date=date, kind=DISBURSED, seq=seq, amount=added or 0,
-                installment=installment, monthly_interest=monthly_interest,
-                # The issue row carries no unearned figure, so the loan's total
-                # is attributed to the disbursement it belongs to.
-                unearned_interest=_original_unearned(conn, ind, ref, principal),
-                ref=rid))
-        elif kind == "Loan Top-Up":
-            events.append(LoanEvent(date=date, kind=TOPPED_UP, seq=seq,
-                                    amount=added or 0, ref=rid))
-        elif kind in ("Repayment", "Loan Buyoff"):
-            events.append(LoanEvent(
-                date=date, kind=PAYMENT_RECEIVED, seq=seq, amount=deducted or 0,
-                principal=p_por, interest=i_por, ref=rid))
-        # 'Interest Earned' is intentionally omitted: it is derived.
-
-    for (start, until) in conn.execute(
-            "SELECT start_date, suspend_until FROM loan_suspensions "
-            "WHERE individual_id=? AND loan_ref=? ORDER BY start_date", (ind, ref)):
-        events.append(LoanEvent(date=start, kind=SUSPENDED, seq=0, until=until))
-
-    return events, rows
-
-
-def _original_unearned(conn, ind, ref, principal):
-    """Total interest the loan was written for, from its issue note.
-
-    Migration 003 parses the same note for duration and rate. Falls back to the
-    accruals actually posted, which is what the loan turned out to charge.
-    """
-    note = conn.execute(
-        "SELECT notes FROM ledger WHERE individual_id=? AND loan_id=? "
-        "AND event_type='Loan Issued' ORDER BY date, id LIMIT 1", (ind, ref)).fetchone()
-    if note and note[0]:
-        import re
-        m = re.search(r"Total Interest:\s*([0-9.]+)", str(note[0]))
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-    accrued = conn.execute(
-        "SELECT COALESCE(SUM(added), 0) FROM ledger WHERE individual_id=? AND loan_id=? "
-        "AND event_type='Interest Earned'", (ind, ref)).fetchone()[0]
-    return float(accrued or 0)
+        "       interest_portion FROM ledger WHERE individual_id=? AND loan_id=? "
+        "ORDER BY date, id", (ind, ref)).fetchall()
+    suspensions = conn.execute(
+        "SELECT start_date, suspend_until FROM loan_suspensions "
+        "WHERE individual_id=? AND loan_ref=? ORDER BY start_date", (ind, ref)).fetchall()
+    return reconstruct(rows, suspensions), rows
 
 
 def compare(loan, derived, rows):

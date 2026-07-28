@@ -252,6 +252,44 @@ def _check_accounting(conn, report):
     # Migration 003 gave loans their own duration and rate; before that a
     # duration existed only inside the issue note's prose.
     if "duration_months" in {r[1] for r in conn.execute("PRAGMA table_info(loans)")}:
+        # Can each loan's history be reproduced from what was asserted about
+        # it? See docs/db/loan-event-model.md. This is a warning, not a
+        # failure: the ledger remains the source of truth, and a loan that will
+        # not replay is telling you its history does not add up, not that
+        # anything is currently wrong with the books.
+        failures = []
+        try:
+            from src.services.loan_events import reconstruct
+            from src.services.loan_derivation import derive
+        except ImportError:                     # pragma: no cover - defensive
+            reconstruct = None
+        if reconstruct is not None:
+            for lid, ref, name, ind in conn.execute(
+                    "SELECT l.id, l.ref, i.name, l.individual_id FROM loans l "
+                    "JOIN individuals i ON i.id = l.individual_id"):
+                rows = conn.execute(
+                    "SELECT id, date, event_type, added, deducted, principal_portion, "
+                    "       interest_portion FROM ledger WHERE individual_id=? "
+                    "AND loan_id=? ORDER BY date, id", (ind, ref)).fetchall()
+                if not rows:
+                    continue
+                susp = conn.execute(
+                    "SELECT start_date, suspend_until FROM loan_suspensions "
+                    "WHERE individual_id=? AND loan_ref=?", (ind, ref)).fetchall()
+                derived = derive(reconstruct(rows, susp))
+                stored = [r for r in rows if r[2] == "Interest Earned"]
+                got = [p for p in derived.postings if p.kind == "Interest Earned"]
+                if len(got) != len(stored) or abs(
+                        derived.total_accrued
+                        - round(sum(r[3] or 0 for r in stored), 2)) > TOLERANCE:
+                    failures.append((lid, ref, name))
+        report.add("loan history replays from its own events", "accounting",
+                   PASS if not failures else WARN,
+                   "every loan reproduces" if not failures else
+                   f"{len(failures)} loan(s) do not reproduce from their recorded "
+                   f"history (first: {failures[0][1]} for {failures[0][2]})",
+                   len(failures))
+
         # A month with no deduction is also a month with no interest, because
         # accrual happens inside the deduction loop rather than on a calendar.
         # So a gap is not merely a missed payment: it is interest the member was

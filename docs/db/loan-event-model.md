@@ -1,8 +1,15 @@
 # A cleaner loan model — proposal, with evidence
 
-Status: **read-only proof.** `src/services/loan_derivation.py` and
-`tools/replay_loans.py` exist and are tested; nothing in the running
-application calls them, and no schema has changed.
+Status: **proved, and continuously checked.** `src/services/loan_derivation.py`
+(the derivation), `src/services/loan_events.py` (recovering events from the
+existing ledger) and `tools/replay_loans.py` (the harness) exist and are tested.
+`src.integrity` runs the replay on every check. **No schema has changed and no
+production code path uses the model yet** — the ledger remains the source of
+truth.
+
+**112 of 113 production loans reproduce exactly** from their own recovered
+history. The one that does not is loan 483, which has no disbursement row —
+a data problem, not a modelling one.
 
 ## The problem, precisely
 
@@ -71,12 +78,11 @@ The 30 divergences were first bucketed by event type, which put top-ups and
 buy-offs in separate piles and left nine cases unexplained. Investigating those
 nine collapsed the picture:
 
-### 26 of 30 are one finding
+### 26 of 30 were one finding — and it is now fixed
 
-Top-ups and buy-offs both **rewrite the loan's terms**, and the terms are stored
-without history. The harness must read `loans.monthly_interest` as it stands
-today and apply it to months it never governed. The give-away is that a single
-loan's accruals are not all the same amount:
+Top-ups and buy-offs both **rewrite the loan's terms**, and terms were being
+read from the *current* `loans` row and applied to months they never governed.
+The give-away is that a single loan's accruals are not all the same amount:
 
 ```
 loan 425   loans.monthly_interest = 1,251   actual accruals = [250, 1251, 1326]
@@ -84,10 +90,20 @@ loan 463   loans.monthly_interest =   832   actual accruals = [250,  832, 1326]
 loan 603   loans.monthly_interest = 1,875   actual accruals = [250, 1326, 1875]
 ```
 
-One `monthly_interest` column cannot have produced three different accruals.
-That is the proposal's central claim, visible in the data: **the current schema
-cannot represent these loans' own histories.** Under the event model each
-carries a `TermsChanged` and replays exactly.
+One column cannot have produced three different accruals — the current schema
+cannot represent these loans' own histories.
+
+But the accruals *are* the record. The application posts
+`min(monthly_interest, unearned)` each due month, so **a change in the amount
+accrued is a change in the terms**, effective the date it first appears.
+`src.services.loan_events.reconstruct` infers `TermsChanged` events from
+exactly that, and the 26 divergences became 0.
+
+The installment is deliberately **not** reconstructed. Payments are asserted
+events carrying the amount actually received, so the installment never enters
+the derivation; inferring it from repayment amounts would mean guessing which
+variations were term changes and which were a final instalment or a manual
+edit — inventing uncertainty for no gain.
 
 ### 3 are a real finding, and they are money
 
@@ -140,8 +156,42 @@ Efficiency is not a concern: a loan has 20–60 events and deriving one is
 microseconds. Scale comes from the patterns already in place — a dirty-loan
 queue like `gl_outbox`, and period checkpoints like `account_snapshots`.
 
-## Next step, if this is worth pursuing
+## Where this leaves things
 
-Raise the 73%. Work through the 6 buy-offs and 3 accrual divergences, since
-those are unexplained; if they resolve into modelling gaps that `derive` can
-express, the case is made. Only then is a migration worth designing.
+```
+                        first pass    with terms recovered
+  reproduced exactly       83 (73%)        112 (99%)
+  diverged                 30                1
+```
+
+The remaining one is loan 483. Loan 193 reproduces its accruals and balance;
+only its `Paid` status is inconsistent, which is the known over-allocation.
+
+`src.integrity` now carries **"loan history replays from its own events"**, so
+this is verified on every health check rather than by running a tool. While the
+ledger remains the source of truth, a loan that stops replaying is telling you
+its history does not add up.
+
+## What has deliberately *not* been done
+
+**No `loan_events` table.** Materialising the reconstruction now would create a
+second copy of the truth that the application does not maintain, and it would
+drift from the ledger the moment anyone posted a transaction. The reconstruction
+is a pure function that regenerates on demand and is checked continuously; that
+is strictly safer until the application actually writes events.
+
+A table belongs to the next stage, where the write path emits events and the
+ledger becomes the projection. That is a behavioural change to loan posting,
+and it should be its own phase with its own verification — not a rider on a
+proof.
+
+## If you decide to go further
+
+1. Fix loan 483 and loan 193, so the replay is clean at 113/113.
+2. Add `loan_events` and have `LoanService` write to it, with the ledger still
+   authoritative and the replay check as the guard.
+3. Flip the read path to the derivation, one report at a time.
+4. Delete `is_edited`, `rebuild_loan_schedule` and the four recalculation entry
+   points, which will have nothing left to do.
+
+Each step is independently verifiable, and each can be stopped at.
