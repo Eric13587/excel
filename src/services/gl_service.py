@@ -540,29 +540,90 @@ class GLService:
 
         return self._entry_count() - before
 
+    # ------------------------------------------------------------------ #
+    # Incremental projection
+    # ------------------------------------------------------------------ #
+    # Subledger table -> the source_ref prefix its rows are projected under.
+    # `savings` and `christmas_savings` are distinct tables with independent id
+    # sequences, so the prefix is what keeps "savings:7" and "christmas:7" apart.
+    _PROJECTION_PREFIX = {
+        "ledger": "ledger",
+        "savings": "savings",
+        "christmas_savings": "christmas",
+        "benevolent_ledger": "benevolent",
+    }
+
+    def project_rows(self, table, row_ids):
+        """Bring the GL into line with specific subledger rows.
+
+        The single-row equivalent of ``rebuild_auto_journals``, and the reason
+        it exists: the wipe-and-re-derive is correct but costs the whole
+        projection every time, because posting alone cannot express the two
+        things a member can do after the fact.
+
+        Each id is re-derived from scratch — the previous entry is withdrawn,
+        then the current state of the row is posted — which covers all three
+        cases with one path:
+
+        * **new row** — nothing to withdraw, the entry is posted;
+        * **edited row** — the stale entry is withdrawn and replaced, rather
+          than being kept by ``post_journal``'s idempotency short-circuit;
+        * **deleted or undone row** — nothing remains to derive, so the
+          withdrawal stands and the entry is gone.
+
+        Only the projected sources are touched. Manual, migration and reversal
+        entries are never withdrawn, whatever ``source_ref`` they carry.
+
+        Returns ``(posted, withdrawn)``.
+        """
+        prefix = self._PROJECTION_PREFIX.get(table)
+        if prefix is None:
+            raise ValueError(f"{table!r} is not a projected subledger")
+        ids = [int(i) for i in row_ids]
+        if not ids:
+            return (0, 0)
+
+        refs = [f"{prefix}:{i}" for i in ids]
+        posted = 0
+        with self._bulk():
+            withdrawn = self.db.journal.delete_projected(refs, self._AUTO_SOURCES)
+            for row_id, ref in zip(ids, refs):
+                if self._project_one(table, row_id, ref) is not None:
+                    posted += 1
+        return (posted, withdrawn)
+
+    def _project_one(self, table, row_id, ref):
+        """Derive and post the journal for one subledger row, or None if the
+        row is gone or its event has no accounting effect."""
+        if table == "ledger":
+            row = self.db.ledger.gl_projection_row(row_id)
+            if not row:
+                return None
+            date, event, added, deducted, p_portion, i_portion, i_amt = row
+            return self._post_ledger_event(event, date, added, deducted,
+                                           p_portion, i_portion, i_amt, ref)
+        row = self.db.funds.gl_projection_row(table, row_id)
+        if not row:
+            return None
+        date, ttype, amount = row
+        if table == "savings":
+            return self._post_savings_event(ttype, amount, date, ref)
+        if table == "christmas_savings":
+            return self._post_christmas_event(ttype, amount, date, ref)
+        return self._post_benevolent_event(ttype, amount, date, ref)
+
     # ----- Live write-path hooks (post journals as rows are created) ----- #
     # Registered on DatabaseManager so member activity posts to the GL the moment
-    # it is written, rather than only on the next rebuild. Idempotent via
-    # source_ref, so they never conflict with backfill/rebuild; edits and undos
-    # are still reconciled by rebuild_auto_journals on the next sync.
+    # it is written, rather than only on the next rebuild. They delegate to
+    # project_rows, so re-firing one for a row that has since been edited
+    # corrects its entry instead of leaving the stale one in place.
     def post_ledger_rows(self, ledger_ids):
         """Post journals for the given ledger rows (one batched transaction)."""
-        with self._bulk():
-            for lid in ledger_ids:
-                row = self.db.ledger.gl_projection_row(lid)
-                if row:
-                    date, event, added, deducted, p_portion, i_portion, i_amt = row
-                    self._post_ledger_event(event, date, added, deducted,
-                                            p_portion, i_portion, i_amt, f"ledger:{lid}")
+        self.project_rows("ledger", ledger_ids)
 
     def post_savings_rows(self, savings_ids):
         """Post journals for the given savings rows (one batched transaction)."""
-        with self._bulk():
-            for sid in savings_ids:
-                row = self.db.funds.gl_projection_row("savings", sid)
-                if row:
-                    date, ttype, amount = row
-                    self._post_savings_event(ttype, amount, date, f"savings:{sid}")
+        self.project_rows("savings", savings_ids)
 
     def _post_ledger_event(self, event, date, added, deducted,
                            p_portion, i_portion, i_amt, ref):

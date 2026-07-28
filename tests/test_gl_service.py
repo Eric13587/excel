@@ -488,3 +488,139 @@ def test_hook_then_rebuild_is_consistent(gl):
     live = svc.get_account_balance(GL_LOANS_RECEIVABLE)
     svc.sync()  # full rebuild from subledgers
     assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == live  # identical
+
+
+# --------------------------------------------------------------------------- #
+# Phase 5a — incremental projection of individual subledger rows
+# --------------------------------------------------------------------------- #
+def _repayment_row(db):
+    return db.conn.execute(
+        "SELECT id FROM ledger WHERE event_type='Repayment'").fetchone()[0]
+
+
+def test_project_rows_posts_a_new_row(gl):
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    before = svc.get_account_balance(GL_MEMBER_DEPOSITS)
+
+    db.add_savings_transaction(ind, "2026-04-01", "Deposit", 750, "later")
+    row_id = db.conn.execute("SELECT MAX(id) FROM savings").fetchone()[0]
+    posted, withdrawn = svc.project_rows("savings", [row_id])
+
+    assert (posted, withdrawn) == (1, 0)  # nothing to withdraw; no hook registered here
+    assert svc.get_account_balance(GL_MEMBER_DEPOSITS) == before + 750.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_replaces_the_entry_for_an_edited_row(gl):
+    """The case post_journal's idempotency cannot express: the row already has
+    an entry, and the entry is now wrong."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    entries_before = svc._entry_count()
+    row_id = _repayment_row(db)
+
+    # The user corrects the repayment from 1000 (850/150) to 2000 (1850/150).
+    db.conn.execute("UPDATE ledger SET deducted=2000, principal_portion=1850 WHERE id=?",
+                    (row_id,))
+    db.conn.commit()
+    posted, withdrawn = svc.project_rows("ledger", [row_id])
+
+    assert (posted, withdrawn) == (1, 1)
+    assert svc._entry_count() == entries_before, "the entry was replaced, not duplicated"
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == 10000.0 - 1850.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_withdraws_the_entry_for_a_deleted_row(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    before = svc.get_account_balance(GL_LOANS_RECEIVABLE)
+    row_id = _repayment_row(db)
+
+    db.conn.execute("DELETE FROM ledger WHERE id=?", (row_id,))
+    db.conn.commit()
+    posted, withdrawn = svc.project_rows("ledger", [row_id])
+
+    assert (posted, withdrawn) == (0, 1)
+    assert svc.get_account_balance(GL_LOANS_RECEIVABLE) == before + 850.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_follows_a_row_that_changes_source(gl):
+    """Regression: a ledger row's *source* is decided by its event type, so an
+    edit can move its entry between sources. Matching on (source, source_ref)
+    missed the old entry and left a duplicate behind."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    entries_before = svc._entry_count()
+    row_id = _repayment_row(db)
+
+    db.conn.execute("UPDATE ledger SET event_type='Interest Earned', deducted=0, "
+                    "added=150, interest_amount=150, principal_portion=0, "
+                    "interest_portion=0 WHERE id=?", (row_id,))
+    db.conn.commit()
+    svc.project_rows("ledger", [row_id])
+
+    assert svc._entry_count() == entries_before, "the repayment entry was left behind"
+    refs = [r[0] for r in db.conn.execute(
+        "SELECT source FROM journal_entries WHERE source_ref=?", (f"ledger:{row_id}",))]
+    assert refs == ["interest"]
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_project_rows_never_withdraws_a_manual_entry(gl):
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+    row_id = _repayment_row(db)
+
+    # A manual entry that happens to carry the same source_ref.
+    manual = svc.post_journal("2026-05-01", [
+        {'account': GL_CASH, 'debit': 10}, {'account': GL_LOAN_INTEREST_INCOME, 'credit': 10},
+    ], source="manual", source_ref=f"ledger:{row_id}")
+
+    svc.project_rows("ledger", [row_id])
+    assert svc._find_entry("manual", f"ledger:{row_id}") == manual
+
+
+def test_project_rows_matches_a_full_rebuild(gl):
+    """The equivalence the incremental path has to hold: projecting the changed
+    rows leaves the books exactly where wiping and re-deriving would."""
+    svc, db = gl
+    ind = _seed_subledgers(db)
+    svc.rebuild_auto_journals()
+
+    row_id = _repayment_row(db)
+    gone = db.conn.execute(
+        "SELECT id FROM savings WHERE transaction_type='Withdrawal'").fetchone()[0]
+    db.conn.execute("UPDATE ledger SET deducted=1500, principal_portion=1350 WHERE id=?", (row_id,))
+    db.conn.execute("DELETE FROM savings WHERE id=?", (gone,))
+    db.conn.commit()
+
+    svc.project_rows("ledger", [row_id])
+    svc.project_rows("savings", [gone, gone + 1000])   # deleted, and one that never existed
+
+    def snapshot():
+        rows, balanced = svc.get_trial_balance()
+        assert balanced
+        return {r['code']: (r['debit'], r['credit']) for r in rows}
+
+    incremental = snapshot()
+    svc.rebuild_auto_journals()
+    assert incremental == snapshot()
+    assert ind
+
+
+def test_project_rows_rejects_an_unprojected_table(gl):
+    svc, _ = gl
+    with pytest.raises(ValueError):
+        svc.project_rows("loans", [1])

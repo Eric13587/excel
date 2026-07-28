@@ -96,6 +96,42 @@ class JournalRepository(Repository):
         self._execute(
             f"DELETE FROM journal_entries WHERE source IN ({placeholders})", tuple(sources))
 
+    # SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds, so
+    # any IN (...) over a caller-supplied list is chunked below that.
+    _PARAM_CHUNK = 400
+
+    def delete_projected(self, source_refs, sources):
+        """Delete the projected entries for specific source rows.
+
+        The single-row counterpart of :meth:`delete_by_sources`: it is how a
+        re-projection clears the previous entry before deriving the new one,
+        and how an undone subledger row has its entry withdrawn.
+
+        Matching is by ``source_ref`` alone within ``sources``, deliberately
+        *not* by ``(source, source_ref)``. A ledger row's source is decided by
+        its event type, so editing ``Repayment`` into ``Interest Earned`` moves
+        the entry between sources; a lookup pinned to the old source would miss
+        it and the re-post would leave a duplicate behind.
+
+        Returns the number of entries removed.
+        """
+        refs = list(source_refs)
+        if not refs:
+            return 0
+        src_ph = ",".join("?" * len(sources))
+        removed = 0
+        for start in range(0, len(refs), self._PARAM_CHUNK):
+            chunk = refs[start:start + self._PARAM_CHUNK]
+            ref_ph = ",".join("?" * len(chunk))
+            where = (f"source_ref IN ({ref_ph}) AND source IN ({src_ph})")
+            params = tuple(chunk) + tuple(sources)
+            self._execute(
+                f"DELETE FROM journal_lines WHERE entry_id IN "
+                f"(SELECT id FROM journal_entries WHERE {where})", params)
+            removed += self._execute(
+                f"DELETE FROM journal_entries WHERE {where}", params).rowcount
+        return removed
+
     # ------------------------------------------------------------------ #
     # Balances and statements
     # ------------------------------------------------------------------ #
