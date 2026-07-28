@@ -98,7 +98,8 @@ class LoanService:
         self.db.add_loan_record(
             individual_id, loan_id, principal, total_repayment, principal,
             monthly_deduction, monthly_interest, date_str, next_due_date,
-            unearned_interest=unearned_interest
+            unearned_interest=unearned_interest,
+            duration_months=duration, interest_rate=interest_rate
         )
         
         new_balance = current_balance + principal
@@ -684,6 +685,9 @@ class LoanService:
         
         self.db.update_loan_details(loan['id'], new_total_amount, new_principal, new_installment,
                                     new_monthly_interest, next_due, unearned_interest=new_unearned)
+        # The top-up re-terms the loan; keep the stored duration describing it.
+        with self.db.transaction():
+            self.db.loans.set_terms(loan['id'], new_duration)
         
         self.db.add_transaction(
             individual_id, date_str, "Loan Top-Up", loan_ref,
@@ -735,7 +739,10 @@ class LoanService:
         today = datetime.now().strftime("%Y-%m-%d")
         next_due = (datetime.now() + relativedelta(months=1)).strftime("%Y-%m-%d")
         
-        self.db.update_loan_details(loan['id'], new_total, current_balance, new_installment, new_monthly_interest, next_due)
+        self.db.update_loan_details(loan['id'], new_total, current_balance, new_installment,
+                                    new_monthly_interest, next_due)
+        with self.db.transaction():
+            self.db.loans.set_terms(loan['id'], new_duration, new_interest_rate)
         
         interest_note = f", New Rate: {new_interest_rate*100:.0f}%" if new_interest_rate else ""
         self.db.add_transaction(

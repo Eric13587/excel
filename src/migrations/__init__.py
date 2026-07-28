@@ -22,6 +22,11 @@ Design notes
 
 * **Migrations are ordered by their numeric prefix** and applied at most once,
   tracked in the ``schema_migrations`` table.
+
+* **Two kinds are supported.** ``NNN_name.sql`` is executed statement by
+  statement. ``NNN_name.py`` must define ``apply(conn)`` and is called with the
+  open connection inside the same transaction — needed whenever a migration has
+  to do something SQL cannot express, such as parsing a value out of free text.
 """
 import logging
 import os
@@ -36,7 +41,7 @@ logger = logging.getLogger(__name__)
 MIGRATION_TABLE = "schema_migrations"
 
 # 001_some_name.sql — the numeric prefix is the version and defines the order.
-_FILENAME_RE = re.compile(r"^(\d{3,})_(.+)\.sql$")
+_FILENAME_RE = re.compile(r"^(\d{3,})_(.+)\.(sql|py)$")
 
 
 @dataclass
@@ -82,6 +87,8 @@ def discover():
         logger.error("Migrations directory not found: %s", directory)
         return found
     for filename in entries:
+        if filename == "__init__.py":
+            continue
         m = _FILENAME_RE.match(filename)
         if m:
             found.append((int(m.group(1)), m.group(2), os.path.join(directory, filename)))
@@ -165,27 +172,35 @@ def apply_pending(conn):
         if version in done:
             report.already_applied.append((version, name))
             continue
-        try:
-            with open(path, encoding="utf-8") as fh:
-                statements = split_statements(fh.read())
-        except OSError as e:
-            report.failed = (version, name, f"unreadable: {e}")
-            logger.error("Migration %03d_%s unreadable: %s", version, name, e)
-            return report
+        is_python = path.endswith(".py")
+        statements = []
+        if not is_python:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    statements = split_statements(fh.read())
+            except OSError as e:
+                report.failed = (version, name, f"unreadable: {e}")
+                logger.error("Migration %03d_%s unreadable: %s", version, name, e)
+                return report
 
         try:
             if conn.in_transaction:
                 conn.commit()
             conn.execute("BEGIN IMMEDIATE")
-            for statement in statements:
-                conn.execute(statement)
+            if is_python:
+                statements = [None] * _run_python_migration(path, conn)
+            else:
+                for statement in statements:
+                    conn.execute(statement)
             conn.execute(
                 f"INSERT INTO {MIGRATION_TABLE} (version, name, applied_at, statements) "
                 f"VALUES (?, ?, ?, ?)",
                 (version, name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), len(statements)),
             )
             conn.commit()
-        except sqlite3.DatabaseError as e:
+        except Exception as e:      # noqa: BLE001 — a migration must never be fatal
+            # Broad on purpose: a .py migration can raise anything, and the
+            # guarantee is that a journal which cannot be migrated still opens.
             conn.rollback()
             report.failed = (version, name, str(e))
             logger.error("Migration %03d_%s rolled back: %s", version, name, e)
@@ -195,3 +210,22 @@ def apply_pending(conn):
         logger.info("Applied migration %03d_%s (%d statements)", version, name, len(statements))
 
     return report
+
+
+def _run_python_migration(path, conn):
+    """Import a ``NNN_name.py`` migration and run its ``apply(conn)``.
+
+    Returns the number of rows it reports having changed, purely so
+    ``schema_migrations`` records something meaningful. The module is loaded
+    from its path rather than imported by name so a frozen build does not need
+    it on the import path.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        f"_migration_{os.path.basename(path)[:-3]}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "apply"):
+        raise RuntimeError(f"{os.path.basename(path)} defines no apply(conn)")
+    return module.apply(conn) or 0

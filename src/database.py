@@ -1141,10 +1141,12 @@ class DatabaseManager:
 
     # Loan operations
     def add_loan_record(self, individual_id, ref, principal, total, balance, installment,
-                        monthly_interest, start_date, next_due_date, unearned_interest=0):
+                        monthly_interest, start_date, next_due_date, unearned_interest=0,
+                        duration_months=None, interest_rate=None):
         with self.transaction():
             self.loans.add(individual_id, ref, principal, total, balance, installment,
-                           monthly_interest, start_date, next_due_date, unearned_interest)
+                           monthly_interest, start_date, next_due_date, unearned_interest,
+                           duration_months, interest_rate)
 
     def get_active_loans(self, individual_id):
         return self.loans.active_for_member(individual_id)

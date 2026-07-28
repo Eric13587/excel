@@ -251,6 +251,20 @@ def _check_accounting(conn, report):
     report.add("settled loans carry a zero balance", "accounting", PASS if not n else WARN,
                "all zero" if not n else f"{n} 'Paid' loan(s) with a non-zero balance", n)
 
+    # Migration 003 gave loans their own duration and rate; before that a
+    # duration existed only inside the issue note's prose.
+    if "duration_months" in {r[1] for r in conn.execute("PRAGMA table_info(loans)")}:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM loans "
+            "WHERE duration_months IS NULL OR duration_months <= 0 GROUP BY status").fetchall()
+        n = sum(count for _, count in rows)
+        active = sum(count for status, count in rows if status == 'Active')
+        report.add("loans record their own duration", "accounting",
+                   PASS if not n else WARN,
+                   "all recorded" if not n else
+                   f"{n} loan(s) without a duration ({active} still Active) — "
+                   f"their issue note did not parse", n)
+
 
 def _control(conn, report, label, code, side, subledger_sql, subledger_name):
     """Compare a GL control account against the subledger it summarises."""

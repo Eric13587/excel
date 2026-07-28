@@ -191,3 +191,84 @@ def test_foreign_keys_enforced_on_a_clean_journal(journal):
         journal.conn.execute(
             "INSERT INTO ledger (individual_id, date, event_type, loan_id) "
             "VALUES (99999, '2026-01-01', 'Repayment', 'L-001')")
+
+
+# --------------------------------------------------------------------------- #
+# Migration 003 — loan terms out of prose
+# --------------------------------------------------------------------------- #
+
+def test_loan_terms_columns_exist(journal):
+    columns = {r[1] for r in journal.conn.execute("PRAGMA table_info(loans)")}
+    assert {"duration_months", "interest_rate"} <= columns
+
+
+def test_new_loans_record_their_own_terms(journal):
+    from src.engine import LoanEngine
+    ind = journal.add_individual("Borrower", "0700", "b@x.com")
+    LoanEngine(journal).add_loan_event(ind, 50000, 18, "2026-01-15", 0.15)
+
+    loan = journal.get_loan_by_ref(ind, "L-001")
+    assert loan["duration_months"] == 18
+    assert loan["interest_rate"] == 0.15
+
+
+def test_backfill_reads_the_issue_note(journal):
+    """A loan created before migration 003 has its terms recovered from the
+    note, which is the only place they existed."""
+    from src.migrations import _run_python_migration, migrations_dir
+
+    ind = journal.add_individual("Legacy", "0700", "l@x.com")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, status, start_date) "
+                "VALUES (?, 'L-009', 100000, 115000, 100000, 9584, 'Active', '2026-01-01')", (ind,))
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, balance, notes) "
+                "VALUES (?, '2026-01-01', 'Loan Issued', 'L-009', 100000, 100000, "
+                "'Principal: 100000.0, Total Interest: 15000.0, Duration: 12m')", (ind,))
+    journal.conn.commit()
+
+    path = os.path.join(migrations_dir(), "003_loan_terms.py")
+    _run_python_migration(path, journal.conn)
+    journal.conn.commit()
+
+    loan = journal.get_loan_by_ref(ind, "L-009")
+    assert loan["duration_months"] == 12
+    assert loan["interest_rate"] == 0.15
+
+
+def test_unparseable_notes_are_left_null_not_guessed(journal):
+    """A duration is what the member contracted to repay over; inventing one
+    would change the loan. They are reported instead."""
+    from src.migrations import _run_python_migration, migrations_dir
+
+    ind = journal.add_individual("NoTerms", "0700", "n@x.com")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, status, start_date) "
+                "VALUES (?, 'L-009', 100000, 115000, 100000, 9584, 'Active', '2026-01-01')", (ind,))
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, balance, notes) "
+                "VALUES (?, '2026-01-01', 'Loan Issued', 'L-009', 100000, 100000, "
+                "'Principal: 100000.0, Total Interest: 15000.0')", (ind,))   # no Duration
+    journal.conn.commit()
+
+    _run_python_migration(os.path.join(migrations_dir(), "003_loan_terms.py"), journal.conn)
+    journal.conn.commit()
+
+    assert journal.get_loan_by_ref(ind, "L-009")["duration_months"] is None
+    leftovers = journal.loans.without_contract_terms()
+    assert [row["ref"] for row in leftovers] == ["L-009"]
+
+
+def test_a_python_migration_that_raises_is_rolled_back(journal, monkeypatch, tmp_path):
+    """A .py migration can raise anything; the journal must still open."""
+    bad = tmp_path / "998_explodes.py"
+    bad.write_text("def apply(conn):\n"
+                   "    conn.execute(\"CREATE INDEX idx_probe_py ON individuals(name)\")\n"
+                   "    raise RuntimeError('boom')\n")
+    monkeypatch.setattr(migrations, "discover", lambda: [(998, "explodes", str(bad))])
+
+    report = migrations.apply_pending(journal.conn)
+    assert not report.ok and "boom" in report.failed[2]
+    assert 998 not in migrations.applied_versions(journal.conn)
+    assert "idx_probe_py" not in _objects(journal.conn, "index", "idx_")
+    assert journal.add_individual("Still Works", "0700", "s@x.com")

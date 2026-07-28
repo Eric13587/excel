@@ -145,16 +145,26 @@ class LoanEngine:
         if self.db.ledger.count_edited(individual_id, loan_ref, "Repayment") > 0:
             return {"healable": False, "reason": "has edited repayments", "loan_id": lid}
 
-        note = self.db.ledger.first_note(individual_id, loan_ref, "Loan Issued") or ""
-        mp = re.search(r"Principal:\s*([\d.]+)", note or "")
-        mi = re.search(r"Total Interest:\s*([\d.]+)", note or "")
-        md = re.search(r"Duration:\s*(\d+)", note or "")
-        if not (mp and mi and md and int(md.group(1)) > 0):
-            return {"healable": False, "reason": "no parseable issue note", "loan_id": lid}
+        # Prefer the loan's own stored terms (migration 003). The issue note is
+        # only a fallback for loans whose note never parsed, because a term
+        # carried in prose changes whenever someone edits the note.
+        stored = self.db.loans.contract_terms(individual_id, loan_ref)
+        duration = rate = principal = None
+        if stored and stored[0] and stored[0] > 0:
+            duration, rate, principal = int(stored[0]), stored[1], float(stored[2] or 0)
 
-        principal = float(mp.group(1))
-        interest = float(mi.group(1))
-        duration = int(md.group(1))
+        if duration is None or not principal:
+            note = self.db.ledger.first_note(individual_id, loan_ref, "Loan Issued") or ""
+            mp = re.search(r"Principal:\s*([\d.]+)", note)
+            mi = re.search(r"Total Interest:\s*([\d.]+)", note)
+            md = re.search(r"Duration:\s*(\d+)", note)
+            if not (mp and mi and md and int(md.group(1)) > 0):
+                return {"healable": False, "reason": "no loan terms recorded", "loan_id": lid}
+            principal = float(mp.group(1))
+            interest = float(mi.group(1))
+            duration = int(md.group(1))
+        else:
+            interest = principal * (rate if rate is not None else DEFAULT_INTEREST_RATE)
         total_amount = principal + interest                      # current creation logic
         installment = math.ceil(total_amount / duration)
         monthly_interest = math.ceil(interest / duration)

@@ -76,6 +76,24 @@ class LoanRepository(Repository):
             "SELECT id, total_amount, installment, monthly_interest FROM loans "
             "WHERE individual_id=? AND ref=?", (member_id, ref))
 
+    def contract_terms(self, member_id, ref):
+        """(duration_months, interest_rate, principal), or None values where the
+        loan predates migration 003 and its issue note did not parse."""
+        return self._row(
+            "SELECT duration_months, interest_rate, principal FROM loans "
+            "WHERE individual_id=? AND ref=?", (member_id, ref))
+
+    def without_contract_terms(self):
+        """Loans still missing a duration — the backfill's leftovers.
+
+        Reported rather than guessed: inventing a duration changes what a loan
+        is contracted to repay.
+        """
+        return self._dicts(
+            "SELECT id, individual_id, ref, status, principal FROM loans "
+            "WHERE duration_months IS NULL OR duration_months <= 0 "
+            "ORDER BY individual_id, ref")
+
     def identity(self, loan_id):
         """(ref, individual_id) for a loan, or (None, None)."""
         row = self._row("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
@@ -86,15 +104,32 @@ class LoanRepository(Repository):
     # ------------------------------------------------------------------ #
 
     def add(self, member_id, ref, principal, total, balance, installment,
-            monthly_interest, start_date, next_due_date, unearned_interest=0):
-        """Issue a loan. interest_balance starts at 0 and status at 'Active'."""
+            monthly_interest, start_date, next_due_date, unearned_interest=0,
+            duration_months=None, interest_rate=None):
+        """Issue a loan. interest_balance starts at 0 and status at 'Active'.
+
+        ``duration_months`` and ``interest_rate`` are the loan's own terms.
+        Until migration 003 they existed only inside the issue note's prose, so
+        a note edit changed the loan's mathematics.
+        """
         cur = self._execute(
             "INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
             "installment, monthly_interest, start_date, next_due_date, unearned_interest, "
-            "interest_balance, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Active')",
+            "interest_balance, status, duration_months, interest_rate) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Active', ?, ?)",
             (member_id, ref, principal, total, balance, installment, monthly_interest,
-             start_date, next_due_date, unearned_interest))
+             start_date, next_due_date, unearned_interest, duration_months, interest_rate))
         return cur.lastrowid
+
+    def set_terms(self, loan_id, duration_months, interest_rate=None):
+        """Record a new duration (and optionally rate) after a top-up or
+        restructure, so the stored terms keep describing the live loan."""
+        if interest_rate is None:
+            self._execute("UPDATE loans SET duration_months=? WHERE id=?",
+                          (duration_months, loan_id))
+        else:
+            self._execute("UPDATE loans SET duration_months=?, interest_rate=? WHERE id=?",
+                          (duration_months, interest_rate, loan_id))
 
     def add_imported(self, member_id, ref, principal, total_amount, balance, installment,
                      start_date, next_due_date, status, monthly_interest,
