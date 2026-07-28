@@ -117,34 +117,13 @@ class SavingsService:
         return balance
 
     def recalculate_user_savings(self, individual_id):
-        """Recalculate running balances for a user's savings account."""
-        transactions = self.db.get_savings_transactions(individual_id)
-        if transactions.empty:
-            return
+        """Recalculate running balances for a user's savings account.
 
-        # Sort by date, then id (if available, usually implicit rowid)
-        # Assuming get_savings_transactions returns sorted or we sort it
-        # It usually returns sorted by Date descending?
-        # We need Ascending for running balance.
-        transactions = transactions.sort_values(by=['date', 'id'], ascending=[True, True])
-        
-        running_balance = 0.0
-        
-        for index, row in transactions.iterrows():
-            amount = float(row['amount'])
-            t_type = row['transaction_type']
-            t_id = row['id']
-            
-            if t_type == "Deposit":
-                running_balance += amount
-            else:
-                running_balance -= amount
-                
-            # Update balance if different
-            if abs(running_balance - float(row['balance'])) > 0.001:
-                self.db.funds.set_balance("savings", t_id, running_balance)
-
-        self.db.conn.commit()
+        Delegates to the single implementation. This used to be a fourth
+        variant — a pandas sort that treated any non-Deposit row as a decrease,
+        so an Interest row subtracted here and added elsewhere (finding D1).
+        """
+        self.db.recalculate_savings_balance(individual_id)
 
     def catch_up_savings(self, individual_id, monthly_amount=None, batch_id=None, target_date=None):
         """Auto-increment savings from last entry up to current month (or target date).

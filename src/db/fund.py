@@ -11,12 +11,10 @@ parameterised.
 Two behaviours are preserved verbatim even though they are known defects,
 because Phase 2 is a refactor:
 
-* **Three different running-balance semantics** survive as three separate
-  methods (:meth:`recalc_savings_by_date`, :meth:`recalc_savings_by_id`,
-  :meth:`recalc_fund`). They disagree about what an ``Interest`` row does and
-  about ordering — finding **D1**, five implementations with three semantics.
-  Collapsing them changes numbers, so it is Phase 3's job; keeping them side by
-  side here at least makes the disagreement visible in one file.
+* **The running balance now has one implementation** (:meth:`recalculate`) and
+  the balance one reader (:meth:`balance`). Finding **D1** — five
+  implementations with three semantics — is resolved; see Phase 3 in
+  docs/db/phase-3-balance-consolidation.md for what changed and for whom.
 * **Only ``savings`` writes fire the general-ledger post hook.** Christmas and
   Benevolent activity reaches the GL only on a full sync, which is why 12
   Christmas deposits were missing from the books until one was run. Wiring the
@@ -46,16 +44,20 @@ class FundRepository(Repository):
 
     # -- reads ------------------------------------------------------------ #
 
-    def latest_balance(self, table, member_id):
-        """The running balance carried on the member's most recent row.
+    def balance(self, table, member_id):
+        """A member's current fund balance.
 
-        A stored snapshot, not a recomputed sum: if a mid-history row is edited
-        without a recalculation it goes stale (finding D9).
+        Summed from the rows rather than read off the most recent one. The
+        stored ``balance`` column is a per-row running total for display; it
+        goes stale the moment a back-dated row is inserted without a
+        recalculation, and reading it was reporting two members' savings
+        wrongly on the production journal. A sum cannot go stale.
         """
         t = self._table(table)
-        return self._scalar(
-            f"SELECT balance FROM {t} WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1",
-            (member_id,), 0.0) or 0.0
+        return round(self._scalar(
+            f"SELECT COALESCE(SUM(CASE transaction_type WHEN 'Withdrawal' "
+            f"THEN -amount ELSE amount END), 0) FROM {t} WHERE individual_id=?",
+            (member_id,), 0.0) or 0.0, 2)
 
     def transactions(self, table, member_id, start_date=None, end_date=None, order="date, id"):
         """A member's fund history as a DataFrame."""
@@ -167,50 +169,40 @@ class FundRepository(Repository):
         t = self._table(table)
         self._execute(f"DELETE FROM {t} WHERE individual_id=?", (member_id,))
 
-    # -- running-balance recalculation (three semantics, see module docstring) - #
+    # -- running balance: one implementation ------------------------------ #
 
-    def _ordered_rows(self, table, member_id, order):
+    def _ordered_rows(self, table, member_id):
+        """A member's rows in the order a statement shows them."""
         t = self._table(table)
         return self._rows(
             f"SELECT id, transaction_type, amount FROM {t} "
-            f"WHERE individual_id=? ORDER BY {order}", (member_id,))
+            f"WHERE individual_id=? ORDER BY date ASC, id ASC", (member_id,))
 
-    def recalc_savings_by_date(self, member_id, cursor=None):
-        """Ordered by (date, id); Interest **increases** the balance; no rounding.
+    def recalculate(self, table, member_id, cursor=None):
+        """Rewrite the stored running balance for one member's fund history.
 
-        The variant used by the import path, which passes its own cursor so the
-        work joins the caller's transaction.
+        Ordered by ``(date, id)`` — the order a statement displays — with
+        ``Withdrawal`` decreasing and everything else increasing, rounded to
+        2dp at each step so float drift cannot accumulate.
+
+        This replaced three implementations that disagreed (finding D1): one
+        ordered by ``id`` alone, and one that treated any non-``Deposit`` row as
+        a decrease. Ordering by insertion id produces a running balance that
+        does not match the order the rows are displayed in, which is what
+        corrupted two members' balances on the production journal.
+
+        ``cursor`` lets the import path fold the writes into its own
+        transaction.
         """
-        rows = self._ordered_rows(SAVINGS, member_id, "date ASC, id ASC")
         running = 0.0
         updates = []
-        for row_id, ttype, amount in rows:
-            if ttype in ("Deposit", "Interest"):
-                running += amount
-            elif ttype == "Withdrawal":
-                running -= amount
-            updates.append((running, row_id))
-        (cursor or self.conn).executemany(
-            "UPDATE savings SET balance=? WHERE id=?", updates)
-
-    def recalc_savings_by_id(self, member_id):
-        """Ordered by id alone; anything that is not a Deposit **decreases** the
-        balance — so Interest subtracts here and adds in the sibling method.
-
-        Preserved as-is; reconciled in Phase 3.
-        """
-        running = 0.0
-        for row_id, ttype, amount in self._ordered_rows(SAVINGS, member_id, "id"):
-            running += amount if ttype == "Deposit" else -amount
-            self.set_balance(SAVINGS, row_id, running)
-
-    def recalc_fund(self, table, member_id):
-        """Ordered by (date, id); only Withdrawal decreases; rounded to 2dp."""
-        t = self._table(table)
-        running = 0.0
-        for row_id, ttype, amount in self._ordered_rows(t, member_id, "date ASC, id ASC"):
+        for row_id, ttype, amount in self._ordered_rows(table, member_id):
             running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
-            self.set_balance(t, row_id, running)
+            updates.append((running, row_id))
+        if updates:
+            t = self._table(table)
+            (cursor or self.conn).executemany(
+                f"UPDATE {t} SET balance=? WHERE id=?", updates)
 
     # -- benevolent enrolment (1:0..1 per member) ------------------------- #
 

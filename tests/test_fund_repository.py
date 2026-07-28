@@ -35,7 +35,7 @@ def _member(db, name="Saver"):
 def test_table_name_is_whitelisted(journal):
     for bad in ("individuals", "ledger", "savings; DROP TABLE individuals", ""):
         with pytest.raises(ValueError):
-            journal.funds.latest_balance(bad, 1)
+            journal.funds.balance(bad, 1)
 
 
 def test_all_three_subledgers_are_reachable(journal):
@@ -44,14 +44,14 @@ def test_all_three_subledgers_are_reachable(journal):
         journal.funds.add(table, ind, "2026-01-01", "Deposit", 100, 100)
     journal.conn.commit()
     for table in (SAVINGS, CHRISTMAS, BENEVOLENT):
-        assert journal.funds.latest_balance(table, ind) == 100
+        assert journal.funds.balance(table, ind) == 100
 
 
 # --------------------------------------------------------------------------- #
 # Balances
 # --------------------------------------------------------------------------- #
 
-def test_latest_balance_reads_the_most_recent_row(journal):
+def test_balance_is_summed_not_snapshotted(journal):
     ind = _member(journal)
     journal.add_savings_transaction(ind, "2026-01-01", "Deposit", 1000)
     journal.add_savings_transaction(ind, "2026-02-01", "Deposit", 500)
@@ -60,7 +60,7 @@ def test_latest_balance_reads_the_most_recent_row(journal):
     assert journal.get_savings_balance(ind) == 1300
 
 
-def test_latest_balance_is_zero_for_a_member_with_no_history(journal):
+def test_balance_is_zero_for_a_member_with_no_history(journal):
     assert journal.get_savings_balance(_member(journal)) == 0.0
 
 
@@ -81,7 +81,7 @@ def test_fund_add_rounds_and_directs_by_type(journal):
 # --------------------------------------------------------------------------- #
 
 def _seed_with_interest(db, ind):
-    """Deposit 1000, Interest 100, Withdrawal 200 — balances differ by method."""
+    """Deposit 1000, Interest 100, Withdrawal 200 — final balance 900."""
     cur = db.conn.cursor()
     for date, ttype, amount in (("2026-01-01", "Deposit", 1000),
                                 ("2026-02-01", "Interest", 100),
@@ -91,32 +91,78 @@ def _seed_with_interest(db, ind):
     db.conn.commit()
 
 
-def test_recalc_by_date_treats_interest_as_an_increase(journal):
+def test_interest_increases_the_balance(journal):
+    """One semantic now. Interest adds, matching GLService, which credits
+    member deposits when interest is paid on them. The retired by-id variant
+    subtracted it (finding D1)."""
     ind = _member(journal)
     _seed_with_interest(journal, ind)
     journal.recalculate_savings_balance(ind)
     assert journal.get_savings_balance(ind) == 900        # 1000 + 100 - 200
 
 
-def test_recalc_by_id_treats_interest_as_a_decrease(journal):
-    """The sibling implementation disagrees. Preserved verbatim; Phase 3
-    reconciles them (docs/db/inconsistent-sql.md D1)."""
+def test_every_entry_point_agrees(journal):
+    """The four call sites that used to have their own arithmetic."""
     ind = _member(journal)
     _seed_with_interest(journal, ind)
-    journal.recalculate_savings_balances(ind)
-    assert journal.get_savings_balance(ind) == 700        # 1000 - 100 - 200
+
+    from src.services.savings_service import SavingsService
+    for recalc in (lambda: journal.recalculate_savings_balance(ind),
+                   lambda: journal.recalculate_savings_balances(ind),
+                   lambda: journal.fund_recalculate(SAVINGS, ind),
+                   lambda: SavingsService(journal).recalculate_user_savings(ind)):
+        recalc()
+        assert journal.get_savings_balance(ind) == 900
+        stored = [r[0] for r in journal.conn.execute(
+            "SELECT balance FROM savings WHERE individual_id=? ORDER BY date, id", (ind,))]
+        assert stored == [1000, 1100, 900]
 
 
-def test_recalc_fund_rounds_to_cents(journal):
+def test_running_balance_follows_date_order_not_insertion_order(journal):
+    """The bug that corrupted two members on the production journal.
+
+    A back-dated row inserted later must take its place in date order. Ordering
+    by insertion id produced a running balance that did not match the order the
+    statement displays.
+    """
+    ind = _member(journal)
+    cur = journal.conn.cursor()
+    for date, ttype, amount in (("2026-01-01", "Deposit", 1000),      # id 1
+                                ("2026-03-01", "Deposit", 1000),      # id 2
+                                ("2026-02-01", "Withdrawal", 500)):   # id 3, back-dated
+        cur.execute("INSERT INTO savings (individual_id, date, transaction_type, amount, balance) "
+                    "VALUES (?, ?, ?, ?, 0)", (ind, date, ttype, amount))
+    journal.conn.commit()
+
+    journal.recalculate_savings_balance(ind)
+
+    in_date_order = journal.conn.execute(
+        "SELECT date, balance FROM savings WHERE individual_id=? ORDER BY date, id",
+        (ind,)).fetchall()
+    assert in_date_order == [("2026-01-01", 1000), ("2026-02-01", 500), ("2026-03-01", 1500)]
+    assert journal.get_savings_balance(ind) == 1500
+
+
+def test_balance_survives_a_stale_stored_column(journal):
+    """The reported balance is summed, so it is right even when the per-row
+    running column has not been recalculated."""
+    ind = _member(journal)
+    _seed_with_interest(journal, ind)
+    journal.conn.execute("UPDATE savings SET balance = 999999 WHERE individual_id=?", (ind,))
+    journal.conn.commit()
+    assert journal.get_savings_balance(ind) == 900
+
+
+def test_recalculate_rounds_to_cents(journal):
     ind = _member(journal)
     for date, amount in (("2026-01-01", 0.1), ("2026-02-01", 0.2)):
         journal.funds.add(CHRISTMAS, ind, date, "Deposit", amount, 0)
     journal.conn.commit()
     journal.fund_recalculate(CHRISTMAS, ind)
-    assert journal.funds.latest_balance(CHRISTMAS, ind) == 0.3   # not 0.30000000000000004
+    assert journal.funds.balance(CHRISTMAS, ind) == 0.3   # not 0.30000000000000004
 
 
-def test_recalc_by_date_accepts_a_caller_cursor(journal):
+def test_recalculate_accepts_a_caller_cursor(journal):
     """The import path passes its own cursor so the work joins its transaction."""
     ind = _member(journal)
     _seed_with_interest(journal, ind)
@@ -237,4 +283,4 @@ def test_repository_works_against_a_bare_connection(journal):
     ind = _member(journal)
     repo.add(SAVINGS, ind, "2026-01-01", "Deposit", 10, 10)
     journal.conn.commit()
-    assert repo.latest_balance(SAVINGS, ind) == 10
+    assert repo.balance(SAVINGS, ind) == 10

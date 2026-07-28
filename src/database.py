@@ -1365,20 +1365,20 @@ class DatabaseManager:
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual."""
         self.create_savings_table()
-        return self.funds.latest_balance("savings", individual_id)
+        return self.funds.balance("savings", individual_id)
 
     def recalculate_savings_balance(self, individual_id, cursor=None):
-        """Recalculate running balance for all savings transactions of an individual.
+        """Recalculate the stored running balance for a member's savings.
 
-        Ordered by (date, id); Interest increases the balance. The optional
+        Delegates to the single implementation in FundRepository. The optional
         cursor lets the import path fold this into its own transaction — which
         is why this method does not commit when one is supplied.
         """
         if cursor is not None:
-            self.funds.recalc_savings_by_date(individual_id, cursor=cursor)
+            self.funds.recalculate("savings", individual_id, cursor=cursor)
             return
         with self.transaction():
-            self.funds.recalc_savings_by_date(individual_id)
+            self.funds.recalculate("savings", individual_id)
 
     def get_savings_transactions(self, individual_id, start_date=None, end_date=None):
         """Get all savings transactions for an individual."""
@@ -1398,21 +1398,21 @@ class DatabaseManager:
     def recalculate_savings_balances(self, individual_id):
         """Recalculate running balances for savings.
 
-        NOTE: ordered by id alone, and anything that is not a Deposit reduces
-        the balance — so an Interest row subtracts here and adds in
-        recalculate_savings_balance. Preserved verbatim; reconciled in Phase 3
-        (finding D1).
+        Retained as the name the ledger view calls; identical to
+        recalculate_savings_balance since Phase 3 collapsed the two. It used to
+        order by id alone and treat any non-Deposit row as a decrease, which is
+        what corrupted two members' balances (finding D1).
         """
         self.create_savings_table()
         with self.transaction():
-            self.funds.recalc_savings_by_id(individual_id)
+            self.funds.recalculate("savings", individual_id)
 
     # ========== GENERIC FUND LEDGER (Savings / Christmas / Benevolent) ==========
     # Delegated to FundRepository, which whitelists the table name.
     _FUND_TABLES = ("christmas_savings", "benevolent_ledger")
 
     def fund_balance(self, table, individual_id):
-        return self.funds.latest_balance(table, individual_id)
+        return self.funds.balance(table, individual_id)
 
     def fund_add_transaction(self, table, individual_id, date, transaction_type, amount,
                              notes="", batch_id=None):
@@ -1436,7 +1436,7 @@ class DatabaseManager:
 
     def fund_recalculate(self, table, individual_id):
         with self.transaction():
-            self.funds.recalc_fund(table, individual_id)
+            self.funds.recalculate(table, individual_id)
 
     def fund_delete_transaction(self, table, trans_id):
         with self.transaction():
@@ -1683,7 +1683,7 @@ class DatabaseManager:
                     affected.add(new_id)
                     stats[key] += 1
                 for member_id in affected:
-                    self.funds.recalc_fund(table, member_id)
+                    self.funds.recalculate(table, member_id)
 
             if src.has_table("benevolent_accounts"):
                 cols, rows = src.all_rows("benevolent_accounts")
