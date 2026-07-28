@@ -5,19 +5,20 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.helpers import make_settings
 from src import branding
 from src.theme import Theme, ThemeManager
 
 
 class FakeDB:
     def __init__(self, theme="Light"):
-        self.settings = {"app_theme": theme}
+        self.settings = make_settings({"app_theme": theme})
 
     def get_setting(self, key, default=None):
         return self.settings.get(key, default)
 
     def set_setting(self, key, value):
-        self.settings[key] = value
+        self.settings.set(key, value)
 
 
 def test_button_css_uses_palette_and_tracks_theme():

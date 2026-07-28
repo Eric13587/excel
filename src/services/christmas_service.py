@@ -30,10 +30,7 @@ class ChristmasService:
         return self.db.fund_transactions(_TABLE, individual_id)
 
     def get_unlock_month(self):
-        try:
-            return int(self.db.get_setting("christmas_unlock_month", "12"))
-        except (TypeError, ValueError):
-            return 12
+        return self.db.settings.christmas_unlock_month
 
     def withdrawals_allowed(self, date_str):
         """True if a withdrawal dated date_str falls in the unlock month."""
@@ -47,7 +44,7 @@ class ChristmasService:
         df = self.get_transactions(individual_id)
         deposits = df[df['transaction_type'] == 'Deposit'] if not df.empty else df
         if deposits is None or deposits.empty:
-            return float(self.db.get_setting("default_christmas_increment", "0") or 0)
+            return self.db.settings.default_christmas_increment
         try:
             mode = deposits['amount'].mode()
             if not mode.empty:

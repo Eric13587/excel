@@ -116,7 +116,7 @@ class BalanceRecalculator:
                             if last_repayment_date:
                                 new_due_dt = base_dt + relativedelta(months=1)
                             else:
-                                deduct_same = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+                                deduct_same = self.db.settings.deduct_same_month
                                 new_due_dt = base_dt if deduct_same else base_dt + relativedelta(months=1)
                                     
                             new_due_date = new_due_dt.strftime("%Y-%m-%d")

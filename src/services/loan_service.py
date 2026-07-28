@@ -90,7 +90,7 @@ class LoanService:
         
         start_date_obj = datetime.strptime(date_str, "%Y-%m-%d")
         
-        deduct_same_month = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+        deduct_same_month = self.db.settings.deduct_same_month
         next_due_obj = start_date_obj if deduct_same_month else start_date_obj + relativedelta(months=1)
         next_due_date = next_due_obj.strftime("%Y-%m-%d")
         
@@ -189,7 +189,7 @@ class LoanService:
         cursor.execute("SELECT MIN(date) FROM ledger WHERE individual_id=? AND loan_id=? "
                        "AND event_type='Loan Issued'", (individual_id, loan_ref))
         issue = cursor.fetchone()[0] or loan.get('start_date')
-        deduct_same = self.db.get_setting("deduct_same_month", "false").lower() == "true"
+        deduct_same = self.db.settings.deduct_same_month
         issue_dt = datetime.strptime(str(issue)[:10], "%Y-%m-%d")
         next_due = (issue_dt if deduct_same else issue_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
 

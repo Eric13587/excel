@@ -11,6 +11,7 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
+from src.db import SettingsRepository
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -70,6 +71,9 @@ class DatabaseManager:
         # in tests / headless contexts; a failing hook never breaks the insert.
         self.ledger_post_hook = None
         self.savings_post_hook = None
+        # Repository layer (Phase 2). DatabaseManager delegates to these as each
+        # one lands, so its public API is unchanged for existing callers.
+        self.settings = SettingsRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -1842,17 +1846,16 @@ class DatabaseManager:
         self.conn.commit()
 
     def get_setting(self, key, default=None):
-        """Get a setting value."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-        res = cursor.fetchone()
-        return res[0] if res else default
+        """Get a setting value (delegates to SettingsRepository).
+
+        Retained as the public API every caller already uses; prefer the typed
+        accessors on ``db.settings`` in new code.
+        """
+        return self.settings.get(key, default)
 
     def set_setting(self, key, value):
-        """Set a setting value."""
-        cursor = self.conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-        self.conn.commit()
+        """Set a setting value (delegates to SettingsRepository)."""
+        self.settings.set(key, value)
 
     def import_individuals_from_external_db(self, source_db_path):
         """

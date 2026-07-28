@@ -1003,12 +1003,12 @@ class Dashboard(QWidget):
         # --- Organization (branding used on every statement and report) ---
         org_box = QGroupBox("Organization")
         org_form = QFormLayout(org_box)
-        org_name_edit = QLineEdit(self.db.get_setting(branding.ORG_NAME_KEY, "") or "")
+        org_name_edit = QLineEdit(self.db.settings.org_name)
         org_name_edit.setPlaceholderText("e.g. Umoja Staff Co-operative")
         org_form.addRow("Organization Name:", org_name_edit)
 
         logo_row = QHBoxLayout()
-        logo_edit = QLineEdit(self.db.get_setting(branding.ORG_LOGO_KEY, "") or "")
+        logo_edit = QLineEdit(self.db.settings.org_logo_path)
         logo_edit.setPlaceholderText("Bundled default logo")
         logo_edit.setReadOnly(True)
         browse_btn = QPushButton("Browse…")
@@ -1036,14 +1036,13 @@ class Dashboard(QWidget):
         months = ["January", "February", "March", "April", "May", "June",
                   "July", "August", "September", "October", "November", "December"]
         fy_combo.addItems(months)
-        current_fy_str = self.db.get_setting("fy_start_month", "November")
+        current_fy_str = self.db.settings.fy_start_month
         if current_fy_str in months:
             fy_combo.setCurrentText(current_fy_str)
         fin_form.addRow("Financial Year Start:", fy_combo)
 
         deduct_cb = QCheckBox("Allow Deduction in Same Month of Issue")
-        deduct_val = self.db.get_setting("deduct_same_month", "false")
-        deduct_cb.setChecked(deduct_val.lower() == "true")
+        deduct_cb.setChecked(self.db.settings.deduct_same_month)
         fin_form.addRow(deduct_cb)
         outer.addWidget(fin_box)
 
@@ -1799,7 +1798,7 @@ class Dashboard(QWidget):
         
         layout.addWidget(QLabel("<b>Select individuals to increment savings:</b>"))
         layout.addWidget(QLabel("Checked individuals will be processed to catch up savings contributions."))
-        default_amount = self.db.get_setting("default_savings_increment", "2500")
+        default_amount = self.db.settings.default_savings_increment
         layout.addWidget(QLabel(f"<i>Amt will be auto-detected from each user's last transaction (Default: {default_amount}).</i>"))
         
         # Get all individuals

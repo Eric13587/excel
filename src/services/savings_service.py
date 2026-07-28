@@ -52,8 +52,7 @@ class SavingsService:
         deposits = transactions[transactions['transaction_type'] == 'Deposit']
         if deposits.empty:
             # Check settings for default
-            default = self.db.get_setting("default_savings_increment", "2500")
-            return float(default)
+            return self.db.settings.default_savings_increment
         
         # Truly return the most common deposit amount (mode)
         try:

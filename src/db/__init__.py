@@ -1,0 +1,18 @@
+"""Data-access layer.
+
+Phase 2 moves SQL out of services, views and the 2,500-line ``DatabaseManager``
+into one repository per aggregate, so that every statement touching a table
+lives in exactly one place.
+
+The migration is incremental by design: ``DatabaseManager`` keeps its public
+API and delegates to a repository as each one lands, so no caller changes and
+the suite stays green at every step. Repositories added so far:
+
+* :class:`~src.db.settings.SettingsRepository` — the ``settings`` table.
+
+See docs/db/repository-layer.md for the full sequencing.
+"""
+from src.db.base import Repository
+from src.db.settings import SettingsRepository
+
+__all__ = ["Repository", "SettingsRepository"]

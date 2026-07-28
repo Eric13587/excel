@@ -68,7 +68,7 @@ class Theme:
 class ThemeManager:
     def __init__(self, db_manager):
         self.db = db_manager
-        self.current_theme_name = self.db.get_setting("app_theme", "Light") # Default to Light
+        self.current_theme_name = self.db.settings.app_theme
         self.colors = Theme.LIGHT if self.current_theme_name == "Light" else Theme.DARK
 
     def set_theme(self, theme_name):
