@@ -138,25 +138,45 @@ def test_statement_rows_respect_the_period(gl):
     assert q1_income["4900"] == -100
 
 
-def test_trial_balance_as_of_does_not_filter(gl):
-    """Preserved defect. The date lands on a LEFT JOIN's ON clause, so a line
-    whose entry falls after it still contributes — the join simply fails to
-    match the header while the line survives the outer join.
+def test_trial_balance_as_of_filters(gl):
+    """Regression for a bug that made every dated trial balance an all-time one.
 
-    views/treasury.py passes a date, so the Treasury trial balance shows
-    all-time figures whatever date is chosen. Pinned here so the fix is a
-    deliberate, reviewed change rather than an accident.
+    The date used to be appended to a LEFT JOIN's ON clause, so a line whose
+    entry fell after it still contributed — the join merely failed to match the
+    header while the line survived the outer join. views/treasury.py passes a
+    date from a picker, so the Treasury screen reported all-time figures
+    whatever date was chosen.
     """
     svc, db = gl
-    svc.post_journal("2026-06-01", [{"account": "1000", "debit": 100},
+    svc.post_journal("2026-01-01", [{"account": "1000", "debit": 100},
                                     {"account": "4900", "credit": 100}])
+    svc.post_journal("2026-06-01", [{"account": "1000", "debit": 400},
+                                    {"account": "4900", "credit": 400}])
 
-    unfiltered = db.journal.trial_balance_rows()
-    dated = db.journal.trial_balance_rows(as_of="2020-01-01")
-    assert dict((c, n) for c, _, _, n in dated) == dict((c, n) for c, _, _, n in unfiltered)
+    def cash(rows):
+        return next(n for c, _, _, n in rows if c == "1000")
 
-    # By contrast the account-level query, which uses a WHERE, does filter.
-    assert db.journal.account_net("1000", as_of="2020-01-01") == 0
+    assert cash(db.journal.trial_balance_rows()) == 500
+    assert cash(db.journal.trial_balance_rows(as_of="2026-03-01")) == 100
+    assert cash(db.journal.trial_balance_rows(as_of="2020-01-01")) == 0
+
+    # Every account is still listed, including those with no postings.
+    assert len(db.journal.trial_balance_rows(as_of="2026-03-01")) == 25
+
+    # And it agrees with the account-level query, which always filtered.
+    assert cash(db.journal.trial_balance_rows(as_of="2026-03-01")) == \
+        db.journal.account_net("1000", as_of="2026-03-01")
+
+
+def test_trial_balance_still_balances_when_dated(gl):
+    svc, _ = gl
+    svc.post_journal("2026-01-01", [{"account": "1000", "debit": 100},
+                                    {"account": "4900", "credit": 100}])
+    svc.post_journal("2026-06-01", [{"account": "1000", "debit": 400},
+                                    {"account": "4900", "credit": 400}])
+    rows, balanced = svc.get_trial_balance(as_of="2026-03-01")
+    assert balanced
+    assert sum(r["debit"] for r in rows) == sum(r["credit"] for r in rows) == 100
 
 
 def test_cash_helpers(gl):

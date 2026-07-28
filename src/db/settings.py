@@ -34,21 +34,20 @@ EXCEL_TOTAL_BG = "excel_total_bg"
 # were previously repeated at each call site; changing one here changes it
 # everywhere, which is the point.
 #
-# fy_start_month is 'January' — deliberately, and it is the one value here that
-# is not simply a tidy-up. The Settings dialog used to display 'November' when
-# the key was unset while reports.py computed on 'January', so the UI and the
-# books disagreed (finding S1). Unifying on 'January' preserves every number
-# the application currently produces; unifying on 'November' would silently
-# move the financial year on any journal where the key was never written, which
-# a refactor must not do. Which value is *correct* for the institution is a
-# business decision — see docs/db/phase-2-repository-layer.md §"Open question".
-# Journals that have the key set (including the production journal, which says
-# November) are unaffected either way.
+# fy_start_month is 'November', the institution's actual financial year and
+# what the production journal stores. It resolves finding S1, where the
+# Settings dialog displayed 'November' when the key was unset while reports.py
+# computed on 'January'.
+#
+# This default now only ever applies to a brand-new journal: migration 002
+# writes every key below into the journal, so an existing journal has an
+# explicit row and is unaffected. Change it in Settings -> Financial rather
+# than here.
 DEFAULTS = {
     ORG_NAME: "",
     ORG_LOGO_PATH: "",
     APP_THEME: "Light",
-    FY_START_MONTH: "January",
+    FY_START_MONTH: "November",
     DEDUCT_SAME_MONTH: "false",
     CHRISTMAS_UNLOCK_MONTH: "12",
     DEFAULT_SAVINGS_INCREMENT: "2500",

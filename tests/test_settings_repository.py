@@ -130,11 +130,12 @@ def test_excel_palette_defaults_match_branding():
 # Behaviour preservation (finding S1)
 # --------------------------------------------------------------------------- #
 
-def test_fy_start_month_default_preserves_report_behaviour():
-    """reports.py computed on 'January' when the key was unset; that is the
-    value that affects money, so unifying on it changes no existing figure."""
-    assert settings_module.DEFAULTS[settings_module.FY_START_MONTH] == "January"
-    assert make_settings().fy_start_month == "January"
+def test_fy_start_month_default_is_the_institutions_year():
+    """Resolves finding S1: the Settings dialog showed 'November' when the key
+    was unset while reports.py computed on 'January'. One value now, and it is
+    the one the production journal stores."""
+    assert settings_module.DEFAULTS[settings_module.FY_START_MONTH] == "November"
+    assert make_settings().fy_start_month == "November"
 
 
 def test_fy_start_month_respects_a_stored_value():

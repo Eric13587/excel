@@ -77,8 +77,9 @@ invalid on a November one. Unifying on November would silently shift the
 financial year — and therefore every quarterly report — on any journal where
 the key was never written.
 
-So the default is **`'January'`**: the value `reports.py` already used, which
-preserves every figure the application currently produces. The Settings dialog
+At the time the default was set to **`'January'`** — the value `reports.py`
+already used — so that the refactor changed no figure. It was changed to
+`'November'` afterwards as an approved behavioural fix (below). The Settings dialog
 now displays January when unset, which is a cosmetic change that makes the UI
 agree with what the books were already doing.
 
@@ -86,15 +87,10 @@ The production journal has the key explicitly set to `November`, so it is
 unaffected either way — verified after the change: stored `November`, FY index
 `11`, unchanged.
 
-> ### Open question for the institution
+> ### Resolved
 >
-> Which month *should* start the financial year on a **new** journal? The code
-> now says January; the Settings dialog used to suggest November, and the
-> production journal is set to November. If November is the institution's real
-> financial year, change `DEFAULTS[FY_START_MONTH]` in `src/db/settings.py` and
-> the matching row in `seed.sql` — one line each, and it affects new journals
-> only. This is deliberately left as a business decision rather than an
-> assumption baked into a refactor.
+> The default is now **November**, the institution's actual financial year and
+> what the production journal stores. See §"Three approved fixes" below.
 
 ### Test doubles
 
@@ -422,3 +418,62 @@ Treasury screen reports, which is why it is not bundled into a refactor.
 ### Rollback
 
 `git revert` the 2e commit. No schema or data change.
+
+---
+
+## Three approved fixes
+
+Behavioural changes, made deliberately after the refactor phases had shown what
+they were, each with the evidence that justified it.
+
+### 1. The dated trial balance now filters
+
+`get_trial_balance(as_of=…)` ignored its date because the predicate sat on a
+`LEFT JOIN`'s `ON` clause. The filter moved into a subquery over
+`journal_lines`, which drops the line rather than just failing to match the
+header, while the outer `LEFT JOIN` still lists every account.
+
+On the production journal, as at 2024-12-31:
+
+| | Debits | Credits | Balanced |
+|---|---|---|---|
+| Before (all-time, whatever date) | 42,453,293.19 | 42,453,293.19 | yes |
+| After, as at 2024-12-31 | 38,502.90 | 38,502.90 | yes |
+
+`views/treasury.py` passes a date from a picker, so the Treasury trial balance
+now answers the question the user actually asked. `test_trial_balance_as_of_filters`
+is the regression guard, and a second test confirms a dated trial balance still
+balances.
+
+### 2. `DeleteTransactionCommand` deleted
+
+90 lines of dead code. It was exported from `src/services/__init__.py` but never
+instantiated anywhere, and its `INSERT` targeted `ledger.principal_amount` and
+`ledger.linked_trans_id` — columns that have never existed in any schema
+generation — so the path raised `OperationalError` if reached. The live undo
+path is `UndoTransactionCommand`, which is unaffected.
+
+### 3. `fy_start_month` defaults to November
+
+The institution's actual financial year, and what the production journal
+stores. This closes finding **S1**, where the Settings dialog displayed
+November when the key was unset while `reports.py` computed on January.
+
+The default now only ever applies to a **brand-new** journal: migration 002
+writes every settings key into the journal, so an existing one has an explicit
+row and is unaffected — confirmed against the production journal, still
+November, FY index 11.
+
+Two consequences worth recording:
+
+* **Migration 002 was edited in place**, which is normally wrong. It is safe
+  here and only here: 002 has never been applied to anything but the production
+  journal — where `fy_start_month` was already November, so its
+  `INSERT OR IGNORE` was a no-op — and throwaway test databases. The file says
+  so. Any future correction to a seeded value must be a new migration.
+* `tests/test_fund_reports.py` failed on the change, correctly: it asserts
+  column ordering using calendar quarters and had been relying on the January
+  default. Its fixture now pins `fy_start_month` explicitly, which it should
+  have done regardless.
+
+381 tests, `ruff` clean.

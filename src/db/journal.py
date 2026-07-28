@@ -103,8 +103,7 @@ class JournalRepository(Repository):
     def account_net(self, account_code, as_of=None):
         """SUM(debit) - SUM(credit) for one account, optionally as at a date.
 
-        The date is a WHERE predicate, so it genuinely filters — unlike
-        :meth:`trial_balance_rows`; see the note there.
+        The date is a WHERE predicate, so it genuinely filters.
         """
         sql = ("SELECT COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) "
                "FROM journal_lines l JOIN journal_entries e ON l.entry_id = e.id "
@@ -116,34 +115,33 @@ class JournalRepository(Repository):
         return self._scalar(sql, tuple(params), 0.0) or 0.0
 
     def trial_balance_rows(self, as_of=None):
-        """(code, name, type, net) for every account.
+        """(code, name, type, net) for every account, optionally as at a date.
 
-        .. warning::
-
-           ``as_of`` does **not** filter. The predicate lands on the second
-           ``LEFT JOIN``'s ``ON`` clause, so a line whose entry falls after the
-           date simply fails to match ``e`` while the line itself survives the
-           outer join and still contributes to the sums. A dated trial balance
-           is therefore an all-time trial balance.
-
-           Preserved verbatim here because Phase 2 must not change behaviour.
-           The fix is to move the predicate into a ``WHERE`` with a NULL guard
-           (``AND (e.entry_date IS NULL OR e.entry_date <= ?)`` will not do it
-           either — the line must be excluded, so the join has to become an
-           inner join or the filter has to sit on a subquery). Tracked in
-           docs/db/phase-2-repository-layer.md; ``views/treasury.py`` passes a
-           date, so the Treasury trial balance is affected.
+        The date filter lives in a subquery rather than on the outer join. The
+        previous form appended ``AND e.entry_date <= ?`` to a second
+        ``LEFT JOIN``'s ``ON`` clause, which does not exclude anything: a line
+        whose entry falls after the date simply failed to match the header
+        while the line itself survived the outer join and still contributed to
+        the sums, so a dated trial balance was an all-time trial balance.
+        Filtering inside the subquery drops the line, and the outer ``LEFT
+        JOIN`` still lists every account.
         """
-        sql = ("SELECT a.code, a.name, a.type, "
-               "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
-               "FROM chart_of_accounts a "
-               "LEFT JOIN journal_lines l ON l.account_code = a.code "
-               "LEFT JOIN journal_entries e ON l.entry_id = e.id")
-        params = []
         if as_of:
-            sql += " AND e.entry_date <= ?"
-            params.append(as_of)
-        return self._rows(sql + " GROUP BY a.code, a.name, a.type ORDER BY a.code", tuple(params))
+            sql = ("SELECT a.code, a.name, a.type, "
+                   "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
+                   "FROM chart_of_accounts a "
+                   "LEFT JOIN (SELECT jl.account_code, jl.debit, jl.credit "
+                   "           FROM journal_lines jl "
+                   "           JOIN journal_entries je ON jl.entry_id = je.id "
+                   "           WHERE je.entry_date <= ?) l ON l.account_code = a.code")
+            params = (as_of,)
+        else:
+            sql = ("SELECT a.code, a.name, a.type, "
+                   "COALESCE(SUM(l.debit),0) - COALESCE(SUM(l.credit),0) AS net "
+                   "FROM chart_of_accounts a "
+                   "LEFT JOIN journal_lines l ON l.account_code = a.code")
+            params = ()
+        return self._rows(sql + " GROUP BY a.code, a.name, a.type ORDER BY a.code", params)
 
     def statement_rows(self, account_type, start_date=None, end_date=None):
         """(code, name, net) for one account type over a date range.

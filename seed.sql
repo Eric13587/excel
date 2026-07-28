@@ -81,7 +81,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('org_name',                    ''),          -- branding: organisation name
     ('org_logo_path',               ''),          -- branding: falls back to bundled logo
     ('app_theme',                   'Light'),     -- 'Light' | 'Dark'
-    ('fy_start_month',              'January'),   -- fiscal-year start month name
+    ('fy_start_month',              'November'),  -- fiscal-year start month name
     ('deduct_same_month',           'false'),     -- first deduction in the issue month?
     ('christmas_unlock_month',      '12'),        -- month withdrawals are permitted
     ('default_savings_increment',   '2500'),      -- fallback monthly savings amount
