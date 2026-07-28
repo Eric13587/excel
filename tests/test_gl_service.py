@@ -9,7 +9,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.database import DatabaseManager
 from src.services.gl_service import GLService
-from src.exceptions import UnbalancedJournalError, UnknownAccountError
+from src.exceptions import (UnbalancedJournalError, UnknownAccountError,
+                            ImmutableEntryError)
 from src.config import (
     DEFAULT_CHART_OF_ACCOUNTS, GL_CASH, GL_LOANS_RECEIVABLE,
     GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS, GL_LOAN_INTEREST_INCOME,
@@ -803,3 +804,130 @@ def test_clearing_the_marker_forces_a_rebuild(gl):
 
     svc.sync()
     assert svc.get_account_balance(GL_MEMBER_DEPOSITS) == 1500.0
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6a — posted entries are immutable; corrections are reversals
+# --------------------------------------------------------------------------- #
+def _manual_entry(svc, memo="rent"):
+    return svc.post_journal("2026-01-01", [
+        {'account': GL_CASH, 'debit': 100},
+        {'account': GL_LOAN_INTEREST_INCOME, 'credit': 100},
+    ], source="manual", memo=memo)
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE journal_entries SET memo='changed' WHERE id=?",
+    "UPDATE journal_entries SET entry_date='2027-01-01' WHERE id=?",
+    "UPDATE journal_entries SET source='repayment' WHERE id=?",
+    "DELETE FROM journal_entries WHERE id=?",
+])
+def test_an_authored_entry_cannot_be_altered(gl, sql):
+    import sqlite3
+    svc, db = gl
+    entry = _manual_entry(svc)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute(sql, (entry,))
+    db.conn.rollback()
+    assert svc._entry_count() == 1
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE journal_lines SET debit=999 WHERE entry_id=?",
+    "DELETE FROM journal_lines WHERE entry_id=?",
+])
+def test_an_authored_entrys_lines_cannot_be_altered(gl, sql):
+    import sqlite3
+    svc, db = gl
+    entry = _manual_entry(svc)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute(sql, (entry,))
+    db.conn.rollback()
+    assert svc.get_account_balance(GL_CASH) == 100.0
+
+
+def test_reversing_still_records_the_status_change(gl):
+    """The UPDATE trigger is scoped to accounting substance: writing `status`
+    and `reversal_of` is the audit trail being recorded, not the entry being
+    changed, so it must stay allowed."""
+    svc, db = gl
+    entry = _manual_entry(svc)
+    reversal = svc.reverse_entry(entry)
+
+    rows = dict(db.conn.execute("SELECT id, status FROM journal_entries").fetchall())
+    assert rows[entry] == "reversed" and rows[reversal] == "reversal"
+    assert db.conn.execute("SELECT reversal_of FROM journal_entries WHERE id=?",
+                           (reversal,)).fetchone()[0] == entry
+    assert svc.get_account_balance(GL_CASH) == 0.0
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_the_projection_is_still_free_to_re_derive_itself(gl):
+    """Freezing the projected slice would freeze the projection. It is derived
+    data, and rebuilding it is recomputing a view, not rewriting the books."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    manual = _manual_entry(svc)
+
+    projected_before = db.conn.execute(
+        "SELECT COUNT(*) FROM journal_entries WHERE source IN "
+        "('loan_disbursement','repayment','interest','savings')").fetchone()[0]
+    assert projected_before == 5
+
+    svc.sync(full=True)          # wipes and re-derives every projected entry
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM journal_entries WHERE source IN "
+        "('loan_disbursement','repayment','interest','savings')").fetchone()[0] == 5
+    assert db.conn.execute("SELECT memo FROM journal_entries WHERE id=?",
+                           (manual,)).fetchone()[0] == "rent", "the authored entry survived"
+    _, balanced = svc.get_trial_balance()
+    assert balanced
+
+
+def test_a_projected_entry_cannot_be_reversed(gl):
+    """The reversal is authored and survives; the original is re-derived on the
+    next rebuild. The pair stops netting to zero and the correction doubles."""
+    svc, db = gl
+    _seed_subledgers(db)
+    svc.sync()
+    projected = db.conn.execute(
+        "SELECT id FROM journal_entries WHERE source='repayment'").fetchone()[0]
+
+    with pytest.raises(ImmutableEntryError):
+        svc.reverse_entry(projected)
+    assert db.conn.execute("SELECT COUNT(*) FROM journal_entries WHERE source='reversal'"
+                           ).fetchone()[0] == 0
+
+
+def test_an_entry_cannot_be_reversed_twice(gl):
+    svc, _ = gl
+    entry = _manual_entry(svc)
+    svc.reverse_entry(entry)
+    with pytest.raises(ImmutableEntryError):
+        svc.reverse_entry(entry)
+
+
+def test_a_reversal_is_itself_immutable(gl):
+    import sqlite3
+    svc, db = gl
+    reversal = svc.reverse_entry(_manual_entry(svc))
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute("DELETE FROM journal_entries WHERE id=?", (reversal,))
+    db.conn.rollback()
+
+
+def test_projected_sources_match_the_trigger(gl):
+    """Migration 006 hard-codes the projected sources — a trigger cannot read a
+    Python constant. This fails if the two lists ever drift apart."""
+    svc, db = gl
+    sql = db.conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name='trg_journal_entry_immutable_del'"
+    ).fetchone()[0]
+    for source in svc._AUTO_SOURCES:
+        assert f"'{source}'" in sql, f"{source} is projected but the trigger freezes it"
+    quoted = {s.strip().strip("'") for s in
+              sql.split("NOT IN (")[1].split(")")[0].split(",")}
+    assert quoted == set(svc._AUTO_SOURCES)

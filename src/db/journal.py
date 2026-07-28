@@ -78,6 +78,14 @@ class JournalRepository(Repository):
         """(entry_date, memo) or None."""
         return self._row("SELECT entry_date, memo FROM journal_entries WHERE id=?", (entry_id,))
 
+    def entry_origin(self, entry_id):
+        """(source, status) — what kind of entry this is and where it stands.
+
+        Both decide whether it may be reversed, so they are read together.
+        """
+        return self._row("SELECT source, status FROM journal_entries WHERE id=?",
+                         (entry_id,)) or (None, None)
+
     def entry_lines(self, entry_id):
         """(account_code, debit, credit) tuples, for building a reversal."""
         return self._rows(

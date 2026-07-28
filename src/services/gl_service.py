@@ -14,7 +14,8 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime
 
-from src.exceptions import UnbalancedJournalError, UnknownAccountError
+from src.exceptions import (UnbalancedJournalError, UnknownAccountError,
+                            ImmutableEntryError)
 from src.config import (
     GL_CASH, GL_LOANS_RECEIVABLE, GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS,
     GL_LOAN_INTEREST_INCOME, GL_OPENING_EQUITY, GL_FEES_INCOME,
@@ -141,10 +142,28 @@ class GLService:
 
         Corrections never edit or delete a posted entry; they post the inverse.
         Both entries remain in the ledger and net to zero.
+
+        Two entries cannot be reversed, and the rule belongs here rather than in
+        the dialog that happens to offer the button:
+
+        * **a projected entry**, because the reversal is authored and survives
+          while the original is re-derived on the next rebuild. The pair stops
+          netting to zero and the correction silently doubles. Such an entry is
+          corrected by editing the loan or savings row behind it, which
+          re-projects through the change queue.
+        * **an entry that is already reversed**, which would net the correction
+          back to the original amount.
         """
         head = self.db.journal.entry_header(entry_id)
         if not head:
             raise ValueError(f"Journal entry {entry_id} not found.")
+        source, status = self.db.journal.entry_origin(entry_id)
+        if self.is_auto_source(source):
+            raise ImmutableEntryError(
+                entry_id, "it is projected from member activity — correct the "
+                          "underlying loan or savings record instead")
+        if status != "posted":
+            raise ImmutableEntryError(entry_id, f"it is already '{status}'")
         orig_lines = self.db.journal.entry_lines(entry_id)
 
         rev_lines = [{'account': code, 'debit': credit, 'credit': debit}

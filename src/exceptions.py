@@ -139,3 +139,20 @@ class ChristmasLockedError(LoanMasterError):
             f"Christmas withdrawals are locked until {month_name}",
             {'unlock_month': unlock_month},
         )
+
+
+class ImmutableEntryError(LoanMasterError):
+    """Raised when a posted journal entry is altered instead of reversed.
+
+    A posted entry is a statement about what the books said at a point in time.
+    Correcting it by editing it destroys that statement; correcting it by
+    posting the inverse leaves both on the record. This is the Python-side
+    guard — migration 006 enforces the same rule with database triggers, so it
+    holds for a code path that never reaches :class:`GLService`.
+    """
+
+    def __init__(self, entry_id: int, reason: str):
+        super().__init__(
+            f"Journal entry #{entry_id} cannot be altered: {reason}",
+            {'entry_id': entry_id, 'reason': reason},
+        )
