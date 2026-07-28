@@ -315,9 +315,11 @@ def test_an_open_period_is_untouched(locked):
 
 
 def test_a_journal_cannot_be_hand_posted_into_a_closed_period(locked):
+    """post_journal does not go through DatabaseManager.transaction, so it
+    translates the lock itself — a caller sees one exception type either way."""
     s, db, ind = locked
     gl = GLService(db)
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(PeriodClosedError):
         gl.post_journal("2026-02-01", [
             {'account': '1000', 'debit': 10}, {'account': '4000', 'credit': 10}],
             source="manual")

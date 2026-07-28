@@ -11,11 +11,13 @@ and ``savings`` tables become subledgers that reconcile to GL control accounts
 rather than three disconnected sources of truth.
 """
 import logging
+import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 
-from src.exceptions import (UnbalancedJournalError, UnknownAccountError,
-                            ImmutableEntryError)
+from src.exceptions import (PERIOD_LOCK_MARKER, ImmutableEntryError,
+                            PeriodClosedError, UnbalancedJournalError,
+                            UnknownAccountError)
 from src.config import (
     GL_CASH, GL_LOANS_RECEIVABLE, GL_INTEREST_RECEIVABLE, GL_MEMBER_DEPOSITS,
     GL_LOAN_INTEREST_INCOME, GL_OPENING_EQUITY, GL_FEES_INCOME,
@@ -129,11 +131,20 @@ class GLService:
         if abs(round(total_debit - total_credit, 2)) > _BALANCE_TOLERANCE:
             raise UnbalancedJournalError(total_debit, total_credit)
 
-        entry_id = self.db.journal.add_entry(
-            entry_date, memo, source, source_ref,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by)
-        self.db.journal.add_lines(
-            [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm])
+        try:
+            entry_id = self.db.journal.add_entry(
+                entry_date, memo, source, source_ref,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), created_by)
+            self.db.journal.add_lines(
+                [(entry_id, c, d, cr, lm) for (c, d, cr, lm) in norm])
+        except sqlite3.IntegrityError as e:
+            # Posting does not go through DatabaseManager.transaction, so the
+            # period lock (migration 009) is translated here instead — same
+            # contract, so a caller sees one exception type either way.
+            if PERIOD_LOCK_MARKER in str(e):
+                raise PeriodClosedError(entry_date, "a closed period",
+                                        what="This journal entry") from e
+            raise
         self._maybe_commit()
         return entry_id
 

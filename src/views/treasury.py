@@ -2,13 +2,15 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QTableWidget, QTableWidgetItem, QHeaderView,
                              QMessageBox, QLabel, QGroupBox, QFormLayout,
                              QComboBox, QLineEdit, QDateEdit, QTabWidget, QWidget,
-                             QProgressDialog, QApplication)
+                             QProgressDialog, QApplication, QInputDialog)
 from PyQt6.QtCore import Qt, QDate
 from PyQt6.QtGui import QColor
 
 from src.services.gl_service import GLService
+from src.services.period_service import FiscalPeriodService
 from src.services.provisioning import ProvisioningService
-from src.exceptions import UnbalancedJournalError, UnknownAccountError
+from src.exceptions import (UnbalancedJournalError, UnknownAccountError,
+                            PeriodClosedError)
 
 
 class TreasuryDialog(QDialog):
@@ -27,6 +29,7 @@ class TreasuryDialog(QDialog):
         self.theme_manager = theme_manager
         self.gl = GLService(db_manager)
         self.prov = ProvisioningService(db_manager, self.gl)
+        self.periods = FiscalPeriodService(db_manager, self.gl)
         # Project member activity + migrate legacy treasury rows so everything
         # shown is current. Runs under a progress dialog (only appears if it
         # actually takes a moment) so the window never looks frozen.
@@ -92,6 +95,8 @@ class TreasuryDialog(QDialog):
         self.tabs.addTab(self._build_journal_list_tab(), "Journal Register")
         self._prov_tab = self._build_provisioning_tab()
         self.tabs.addTab(self._prov_tab, "Loan Provisioning")
+        self._periods_tab = self._build_periods_tab()
+        self.tabs.addTab(self._periods_tab, "Fiscal Periods")
         # The Account Ledger (thousands of cash lines) and Provisioning (a query
         # per member) are heavy; load them only when their tab is opened so the
         # dialog itself opens instantly.
@@ -237,7 +242,8 @@ class TreasuryDialog(QDialog):
                 memo=self.je_memo.text().strip(),
                 source="manual",
             )
-        except (UnbalancedJournalError, UnknownAccountError, ValueError) as e:
+        except (UnbalancedJournalError, UnknownAccountError,
+                PeriodClosedError, ValueError) as e:
             QMessageBox.critical(self, "Posting Failed", str(e))
             return
 
@@ -543,12 +549,135 @@ class TreasuryDialog(QDialog):
         elif self.tabs.widget(idx) is self._prov_tab:
             self.refresh_provisioning()
 
+    # ----- Tab 6: Fiscal Periods ----- #
+    def _build_periods_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+
+        blurb = QLabel(
+            "Closing a period freezes it: activity dated inside it can no "
+            "longer be added, edited or removed. Corrections are posted in an "
+            "open period instead.")
+        blurb.setWordWrap(True)
+        v.addWidget(blurb)
+
+        self.fp_table = QTableWidget()
+        self.fp_table.setColumnCount(6)
+        self.fp_table.setHorizontalHeaderLabels(
+            ["ID", "Period", "From", "To", "Status", "Notes"])
+        self.fp_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.fp_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.fp_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        v.addWidget(self.fp_table)
+
+        actions = QHBoxLayout()
+        self.btn_fp_suggest = QPushButton("Add This Year's Quarters")
+        self.btn_fp_suggest.setToolTip(
+            "Declare the quarters of the current financial year, using the "
+            "financial-year start month from Settings.")
+        self.btn_fp_suggest.clicked.connect(self.add_suggested_periods)
+        actions.addWidget(self.btn_fp_suggest)
+        actions.addStretch()
+        self.btn_fp_close = QPushButton("Close Selected Period")
+        self.btn_fp_close.setStyleSheet(self.theme_manager.button_css("warning"))
+        self.btn_fp_close.clicked.connect(self.close_selected_period)
+        actions.addWidget(self.btn_fp_close)
+        self.btn_fp_reopen = QPushButton("Reopen Selected Period")
+        self.btn_fp_reopen.clicked.connect(self.reopen_selected_period)
+        actions.addWidget(self.btn_fp_reopen)
+        v.addLayout(actions)
+        return w
+
+    def refresh_periods(self):
+        periods = self.periods.periods()
+        self.fp_table.setRowCount(0)
+        for p in periods:
+            r = self.fp_table.rowCount()
+            self.fp_table.insertRow(r)
+            for col, value in enumerate((str(p['id']), p['label'], p['start_date'],
+                                         p['end_date'], p['status'], p['note'] or "")):
+                self.fp_table.setItem(r, col, QTableWidgetItem(value))
+
+    def _selected_period(self):
+        sel = self.fp_table.selectedItems()
+        if not sel:
+            QMessageBox.information(self, "No Selection", "Select a period first.")
+            return None
+        return int(self.fp_table.item(sel[0].row(), 0).text())
+
+    def add_suggested_periods(self):
+        suggestions = self.periods.suggest_periods()
+        if not suggestions:
+            QMessageBox.information(
+                self, "Nothing to Add",
+                "Every quarter of the current financial year is already declared.")
+            return
+        listing = "\n".join(f"  {s['label']}:  {s['start_date']} → {s['end_date']}"
+                            for s in suggestions)
+        if QMessageBox.question(
+                self, "Add Periods", f"Declare these periods?\n\n{listing}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes) != QMessageBox.StandardButton.Yes:
+            return
+        self.periods.create_suggested()
+        self.refresh_periods()
+
+    def close_selected_period(self):
+        period_id = self._selected_period()
+        if period_id is None:
+            return
+        period = self.db.periods.get(period_id)
+        blockers = self.periods.closing_blockers(period_id)
+        if blockers:
+            reasons = "\n".join(f"  • {b}" for b in blockers)
+            answer = QMessageBox.question(
+                self, "Not Ready to Close",
+                f"{period['label']} is not ready to close:\n\n{reasons}\n\n"
+                "Close it anyway? The reasons above will be recorded against "
+                "the period.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            self.periods.close(period_id, force=True)
+        else:
+            if QMessageBox.question(
+                    self, "Close Period",
+                    f"Close {period['label']} ({period['start_date']} → "
+                    f"{period['end_date']})?\n\nActivity dated inside it can no "
+                    f"longer be added, edited or removed.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+            self.periods.close(period_id)
+        self.refresh_periods()
+
+    def reopen_selected_period(self):
+        period_id = self._selected_period()
+        if period_id is None:
+            return
+        period = self.db.periods.get(period_id)
+        if period['status'] != 'closed':
+            QMessageBox.information(self, "Already Open",
+                                    f"{period['label']} is not closed.")
+            return
+        reason, ok = QInputDialog.getText(
+            self, "Reopen Period",
+            f"Reopening {period['label']} undoes a published statement.\n"
+            f"Reason (recorded against the period):")
+        if not ok or not reason.strip():
+            return
+        self.periods.reopen(period_id, reason=reason)
+        self.refresh_periods()
+
     def _on_tab_changed(self, idx):
         w = self.tabs.widget(idx)
         if w is self._ledger_tab:
             self.refresh_account_ledger()
         elif w is self._prov_tab:
             self.refresh_provisioning()
+        elif w is self._periods_tab:
+            self.refresh_periods()
 
     def update_bank_cash_visual(self):
         # Single source of truth: the Cash at Bank balance from the ledger.
