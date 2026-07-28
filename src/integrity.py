@@ -252,6 +252,48 @@ def _check_accounting(conn, report):
     # Migration 003 gave loans their own duration and rate; before that a
     # duration existed only inside the issue note's prose.
     if "duration_months" in {r[1] for r in conn.execute("PRAGMA table_info(loans)")}:
+        # Why a loan ends up "Paid" with a negative balance. The check above
+        # reports the symptom; these two name the cause, because the balance is
+        # derived from the ledger and only two things drive it below zero.
+        #
+        # Scoped by individual_id throughout: a loan ref is unique per member
+        # only, so joining on ref alone would mix members together.
+        rows = conn.execute(
+            "SELECT l.id, l.ref, i.name FROM loans l JOIN individuals i ON i.id=l.individual_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM ledger y WHERE y.individual_id=l.individual_id "
+            "                    AND y.loan_id=l.ref "
+            "                    AND y.event_type IN ('Loan Issued','Loan Top-Up')) "
+            "  AND EXISTS (SELECT 1 FROM ledger z WHERE z.individual_id=l.individual_id "
+            "                AND z.loan_id=l.ref "
+            "                AND z.event_type IN ('Repayment','Loan Buyoff'))").fetchall()
+        report.add("loans record their disbursement", "accounting",
+                   PASS if not rows else WARN,
+                   "every loan with repayments has an issue row" if not rows else
+                   f"{len(rows)} loan(s) have repayments but no disbursement — "
+                   f"their balance is driven negative by their own payments "
+                   f"(first: {rows[0][1]} for {rows[0][2]})", len(rows))
+
+        rows = conn.execute(
+            "SELECT l.ref, i.name, "
+            "  (SELECT COALESCE(SUM(x.principal_portion),0) FROM ledger x "
+            "     WHERE x.individual_id=l.individual_id AND x.loan_id=l.ref "
+            "       AND x.event_type IN ('Repayment','Loan Buyoff')) "
+            "  - (SELECT COALESCE(SUM(y.added),0) FROM ledger y "
+            "       WHERE y.individual_id=l.individual_id AND y.loan_id=l.ref "
+            "         AND y.event_type IN ('Loan Issued','Loan Top-Up')) AS excess "
+            "FROM loans l JOIN individuals i ON i.id=l.individual_id "
+            "WHERE excess > ? AND EXISTS (SELECT 1 FROM ledger z "
+            "  WHERE z.individual_id=l.individual_id AND z.loan_id=l.ref "
+            "    AND z.event_type IN ('Loan Issued','Loan Top-Up'))",
+            (TOLERANCE,)).fetchall()
+        report.add("principal repaid stays within what was lent", "accounting",
+                   PASS if not rows else WARN,
+                   "no loan is over-allocated" if not rows else
+                   f"{len(rows)} loan(s) allocate more to principal than was "
+                   f"disbursed (first: {rows[0][0]} for {rows[0][1]}, over by "
+                   f"{rows[0][2]:,.2f}) — usually a buy-off entered as an "
+                   f"ordinary repayment", len(rows))
+
         rows = conn.execute(
             "SELECT status, COUNT(*) FROM loans "
             "WHERE duration_months IS NULL OR duration_months <= 0 GROUP BY status").fetchall()

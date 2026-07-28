@@ -352,3 +352,93 @@ def test_snapshot_drift_is_a_failure_not_a_warning(journal):
     check = _check(integrity.verify(journal), "period snapshots match the journal")
     assert check.status == integrity.FAIL and check.count == 1
     assert not integrity.verify(journal).ok
+
+
+# --------------------------------------------------------------------------- #
+# Why a loan goes "Paid" with a negative balance
+# --------------------------------------------------------------------------- #
+
+def _issued_loan(journal, ref="L-001", member="Borrower"):
+    ind = journal.add_individual(member, "07", "b@x")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, status, start_date) "
+                "VALUES (?, ?, 100000, 115000, 100000, 5750, 'Active', '2025-01-01')",
+                (ind, ref))
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                "deducted, balance, principal_portion, interest_portion) "
+                "VALUES (?, '2025-01-01', 'Loan Issued', ?, 100000, 0, 100000, 0, 0)",
+                (ind, ref))
+    journal.conn.commit()
+    return ind
+
+
+def test_a_loan_with_repayments_and_no_disbursement_is_named(journal):
+    """The cause behind production loan 483: ten deductions against a
+    disbursement that was never entered."""
+    ind = journal.add_individual("No Issue Row", "07", "n@x")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, status, start_date) VALUES (?, 'L-002', 529770, 609235, "
+                "-101880, 11717, 'Paid', '2025-01-01')", (ind,))
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                "deducted, balance, principal_portion, interest_portion) "
+                "VALUES (?, '2025-08-28', 'Repayment', 'L-002', 0, 11717, 0, 10188, 1529)",
+                (ind,))
+    journal.conn.commit()
+
+    check = _check(integrity.verify(journal), "loans record their disbursement")
+    assert check.status == integrity.WARN and check.count == 1
+    assert "L-002" in check.detail and "No Issue Row" in check.detail
+
+
+def test_a_properly_issued_loan_is_not_flagged(journal):
+    _issued_loan(journal)
+    assert _check(integrity.verify(journal),
+                  "loans record their disbursement").status == integrity.PASS
+
+
+def test_over_allocated_principal_is_named(journal):
+    """The cause behind production loan 193: a buy-off entered as an ordinary
+    repayment, allocating more to principal than was outstanding."""
+    ind = _issued_loan(journal)
+    journal.conn.execute(
+        "INSERT INTO ledger (individual_id, date, event_type, loan_id, added, deducted, "
+        "balance, principal_portion, interest_portion) "
+        "VALUES (?, '2025-11-28', 'Repayment', 'L-001', 0, 95833, 0, 111898, 600)", (ind,))
+    journal.conn.commit()
+
+    check = _check(integrity.verify(journal), "principal repaid stays within what was lent")
+    assert check.status == integrity.WARN and check.count == 1
+    assert "11,898.00" in check.detail
+
+
+def test_repaying_exactly_what_was_lent_is_not_flagged(journal):
+    ind = _issued_loan(journal)
+    journal.conn.execute(
+        "INSERT INTO ledger (individual_id, date, event_type, loan_id, added, deducted, "
+        "balance, principal_portion, interest_portion) "
+        "VALUES (?, '2025-11-28', 'Repayment', 'L-001', 0, 100000, 0, 100000, 0)", (ind,))
+    journal.conn.commit()
+    assert _check(integrity.verify(journal),
+                  "principal repaid stays within what was lent").status == integrity.PASS
+
+
+def test_the_checks_are_scoped_per_member(journal):
+    """Loan refs are unique per member only. Joining on ref alone would let one
+    member's disbursement excuse another member's missing one."""
+    _issued_loan(journal, ref="L-001", member="Has Issue Row")
+    other = journal.add_individual("No Issue Row", "07", "n@x")
+    cur = journal.conn.cursor()
+    cur.execute("INSERT INTO loans (individual_id, ref, principal, total_amount, balance, "
+                "installment, status, start_date) VALUES (?, 'L-001', 50000, 57500, "
+                "-5000, 2875, 'Paid', '2025-01-01')", (other,))
+    cur.execute("INSERT INTO ledger (individual_id, date, event_type, loan_id, added, "
+                "deducted, balance, principal_portion, interest_portion) "
+                "VALUES (?, '2025-08-28', 'Repayment', 'L-001', 0, 2875, 0, 2500, 375)",
+                (other,))
+    journal.conn.commit()
+
+    check = _check(integrity.verify(journal), "loans record their disbursement")
+    assert check.count == 1, "the other member's issue row must not cover this one"
+    assert "No Issue Row" in check.detail

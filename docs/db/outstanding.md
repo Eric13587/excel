@@ -38,8 +38,13 @@ is not cosmetic, and it is the one to look at first.
 
 The general failure mode is worth naming: a loan whose ledger has no issue row
 has its balance driven negative by its own repayments and is then flipped to
-`Paid`. `src.integrity` reports the symptom; it does not yet check for the
-cause. A "loans with repayments but no disbursement" check would catch it.
+`Paid`. `src.integrity` now checks for both causes directly, not just the
+symptom — **loans record their disbursement** and **principal repaid stays
+within what was lent** — so each names the loan and the member, and a
+recurrence is caught rather than discovered.
+
+Swept across the whole journal when those checks were written: **exactly one
+loan each**, and both are the two above. No other loan is affected.
 
 ### A2. Three loans with no recoverable duration
 
