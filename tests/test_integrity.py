@@ -238,3 +238,79 @@ def test_detects_an_entry_that_outlived_its_source_row(journal):
 
     check = _check(integrity.verify(journal), "projected entries have a live source row")
     assert check.status == integrity.WARN and check.count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Subledger audit trail (Phase 6b)
+# --------------------------------------------------------------------------- #
+
+def _audit(journal, entity=None):
+    sql = "SELECT operation, entity, entity_id, before_image FROM audit_log"
+    if entity:
+        sql += f" WHERE entity='{entity}'"
+    return journal.conn.execute(sql + " ORDER BY id").fetchall()
+
+
+def test_a_balance_recalculation_is_not_audited(journal):
+    """It rewrites `balance` on thousands of rows and changes nobody's
+    position. Auditing it would bury the real events."""
+    _seed_member_with_loan(journal)
+    journal.conn.execute("DELETE FROM audit_log")
+    journal.conn.execute("UPDATE ledger SET balance = balance + 1")
+    journal.conn.commit()
+    assert _audit(journal) == []
+
+
+def test_editing_an_amount_records_what_it_was(journal):
+    import json
+    _seed_member_with_loan(journal)
+    journal.conn.execute("DELETE FROM audit_log")
+    journal.conn.execute("UPDATE ledger SET added = 750 WHERE event_type='Loan Issued'")
+    journal.conn.commit()
+
+    rows = _audit(journal, "ledger")
+    assert len(rows) == 1 and rows[0][0] == "UPDATE"
+    assert json.loads(rows[0][3])["added"] == 1000.0, "the before-image, not the new value"
+
+
+def test_deleting_a_member_records_every_money_row_it_takes(journal):
+    """The Phase 1 bug that started this: a member's ledger rows were destroyed
+    with nothing recording it. The cascade fires the child triggers, so the
+    before-images survive the parent."""
+    import json
+    ind = _seed_member_with_loan(journal)
+    journal.add_savings_transaction(ind, "2026-02-01", "Deposit", 500, "")
+    journal.conn.execute("DELETE FROM audit_log")
+    journal.conn.commit()
+
+    journal.delete_individual(ind)
+
+    logged = {(e, op) for op, e, _, _ in _audit(journal)}
+    assert ("ledger", "DELETE") in logged
+    assert ("savings", "DELETE") in logged
+    assert ("individual", "DELETE") in logged
+    gone = json.loads([r for r in _audit(journal, "ledger")][0][3])
+    assert gone["added"] == 1000.0 and gone["individual_id"] == ind
+
+
+def test_money_changes_reads_back_only_money(journal):
+    ind = _seed_member_with_loan(journal)
+    journal.conn.execute("DELETE FROM audit_log")
+    journal.conn.execute("UPDATE individuals SET name='Renamed' WHERE id=?", (ind,))
+    journal.conn.execute("UPDATE ledger SET added = 900 WHERE event_type='Loan Issued'")
+    journal.conn.commit()
+
+    changes = journal.audit.money_changes()
+    assert [c["entity"] for c in changes] == ["ledger"]
+    assert journal.audit.money_change_count() == 1
+    assert journal.audit.recent(), "the member rename is still in the full trail"
+
+
+def test_inserting_activity_is_not_a_money_change(journal):
+    """Only after-the-fact edits and deletions belong here — posting a
+    transaction in the first place is not a restatement."""
+    ind = _seed_member_with_loan(journal)
+    journal.conn.execute("DELETE FROM audit_log")
+    journal.conn.commit()
+    journal.add_savings_transaction(ind, "2026-03-01", "Deposit", 100, "")
+    assert journal.audit.money_change_count() == 0

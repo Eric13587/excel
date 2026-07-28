@@ -123,9 +123,15 @@ class AuditRepository(Repository):
     captured regardless of the code path taken. This is the read side only.
     """
 
+    # Entities whose rows carry money. Migration 007 records a before-image for
+    # every edit and deletion of these; 'individual' and 'loan' are logged for
+    # existence only, as they were before.
+    MONEY_ENTITIES = ("ledger", "savings", "christmas_savings", "benevolent_ledger")
+
     def recent(self, limit=500, entity=None, entity_id=None):
         """Audit entries, most recent first, optionally for one entity."""
-        sql = "SELECT ts, operation, entity, entity_id, summary FROM audit_log"
+        sql = ("SELECT ts, operation, entity, entity_id, summary, before_image "
+               "FROM audit_log")
         params = []
         if entity is not None and entity_id is not None:
             sql += " WHERE entity=? AND entity_id=?"
@@ -133,3 +139,32 @@ class AuditRepository(Repository):
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
         return self._dicts(sql, tuple(params))
+
+    def money_changes(self, limit=500, since=None):
+        """Edits and deletions of rows that carry money, most recent first.
+
+        The question this table exists to answer: *what was changed after the
+        fact, and what did it say before?* Everything here is an amount, a date
+        or an event type that someone altered or removed once it had already
+        been posted — each with the ``before_image`` needed to see what it was.
+        """
+        placeholders = ",".join("?" * len(self.MONEY_ENTITIES))
+        sql = (f"SELECT ts, operation, entity, entity_id, summary, before_image "
+               f"FROM audit_log WHERE entity IN ({placeholders})")
+        params = list(self.MONEY_ENTITIES)
+        if since:
+            sql += " AND ts >= ?"
+            params.append(since)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return self._dicts(sql, tuple(params))
+
+    def money_change_count(self, since=None):
+        """How many money rows have been altered or removed after the fact."""
+        placeholders = ",".join("?" * len(self.MONEY_ENTITIES))
+        sql = f"SELECT COUNT(*) FROM audit_log WHERE entity IN ({placeholders})"
+        params = list(self.MONEY_ENTITIES)
+        if since:
+            sql += " AND ts >= ?"
+            params.append(since)
+        return self._scalar(sql, tuple(params), 0)
