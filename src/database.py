@@ -11,7 +11,7 @@ from contextlib import contextmanager
 logger = logging.getLogger(__name__)
 
 from src import migrations
-from src.db import SettingsRepository
+from src.db import MemberRepository, SettingsRepository
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -74,6 +74,7 @@ class DatabaseManager:
         # Repository layer (Phase 2). DatabaseManager delegates to these as each
         # one lands, so its public API is unchanged for existing callers.
         self.settings = SettingsRepository(self.conn)
+        self.members = MemberRepository(self.conn)
         self.create_tables()
         # Versioned migrations run after the legacy bootstrap, so a brand-new
         # journal and an existing one converge on the same schema. Failure is
@@ -964,141 +965,75 @@ class DatabaseManager:
         return [dict(zip(["ts", "operation", "entity", "entity_id", "summary"], r))
                 for r in cur.fetchall()]
 
-    # Individual operations
-    @staticmethod
-    def _retirement_for_status(status, existing_retired_date=None):
-        """Derive (is_retired, retired_date) from an employment status.
-
-        Every status except 'Active' is treated as retired/inactive (mirrors the
-        retirement flag), keeping an existing retirement date if one is set,
-        otherwise stamping today. 'Active' clears the flag.
-        """
-        if (status or 'Active') == 'Active':
-            return 0, None
-        return 1, (existing_retired_date or datetime.now().strftime("%Y-%m-%d"))
+    # ------------------------------------------------------------------
+    # Individual operations — delegated to MemberRepository (Phase 2b).
+    # These signatures and return shapes are unchanged; ten call sites index
+    # get_individuals() positionally, so the raw-tuple shape is load-bearing.
+    # ------------------------------------------------------------------
 
     def add_individual(self, name, phone, email, default_deduction=0,
                        employment_status='Active', pf_no='', id_no=''):
-        cursor = self.conn.cursor()
-        status = employment_status or 'Active'
-        is_retired, retired_date = self._retirement_for_status(status)
-        cursor.execute(
-            "INSERT INTO individuals (name, phone, email, default_deduction, created_at, "
-            "employment_status, pf_no, id_no, is_retired, retired_date) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (name, phone, email, default_deduction,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             status, pf_no or '', id_no or '', is_retired, retired_date))
-        self.conn.commit()
-        return cursor.lastrowid
+        with self.transaction():
+            return self.members.add(name, phone, email, default_deduction,
+                                    employment_status, pf_no, id_no)
 
     def individual_name_exists(self, name):
         """Check if an individual with the given name already exists (case-insensitive)."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM individuals WHERE LOWER(name) = LOWER(?)", (name,))
-        return cursor.fetchone()[0] > 0
+        return self.members.name_exists(name)
 
     def pf_no_owner(self, pf_no, exclude_id=None):
-        """Return the name of the individual already using this PF number, or None.
-
-        Empty/blank PF numbers are never considered duplicates.
-        """
-        if not pf_no or not str(pf_no).strip():
-            return None
-        cursor = self.conn.cursor()
-        if exclude_id is not None:
-            cursor.execute("SELECT name FROM individuals WHERE pf_no=? AND id<>?",
-                           (str(pf_no).strip(), exclude_id))
-        else:
-            cursor.execute("SELECT name FROM individuals WHERE pf_no=?", (str(pf_no).strip(),))
-        row = cursor.fetchone()
-        return row[0] if row else None
+        """Return the name of the individual already using this PF number, or None."""
+        return self.members.owner_of_pf_no(pf_no, exclude_id)
 
     def id_no_owner(self, id_no, exclude_id=None):
-        """Return the name of the individual already using this ID number, or None.
-
-        Empty/blank ID numbers are never considered duplicates.
-        """
-        if not id_no or not str(id_no).strip():
-            return None
-        cursor = self.conn.cursor()
-        if exclude_id is not None:
-            cursor.execute("SELECT name FROM individuals WHERE id_no=? AND id<>?",
-                           (str(id_no).strip(), exclude_id))
-        else:
-            cursor.execute("SELECT name FROM individuals WHERE id_no=?", (str(id_no).strip(),))
-        row = cursor.fetchone()
-        return row[0] if row else None
+        """Return the name of the individual already using this ID number, or None."""
+        return self.members.owner_of_id_no(id_no, exclude_id)
 
     def get_individuals(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM individuals")
-        return cursor.fetchall()
+        return self.members.rows()
 
     def get_individual_name(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT name FROM individuals WHERE id=?", (id,))
-        row = cursor.fetchone()
-        return row[0] if row else f"Individual {id}"
+        name = self.members.name_of(id)
+        return name if name is not None else f"Individual {id}"
 
     def get_individual(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM individuals WHERE id=?", (id,))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
-        return None
+        return self.members.get(id)
 
     def update_individual(self, id, name, phone, email,
                           employment_status=None, pf_no=None, id_no=None):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET name=?, phone=?, email=? WHERE id=?",
-                       (name, phone, email, id))
-        # Only touch the new fields when supplied, so callers that pass just the
-        # core details don't clobber an existing status / PF / ID number.
-        if employment_status is not None:
-            # Setting the status also drives the retirement flag: any non-Active
-            # status retires the member; 'Active' reinstates them.
-            row = cursor.execute("SELECT retired_date FROM individuals WHERE id=?", (id,)).fetchone()
-            is_retired, retired_date = self._retirement_for_status(
-                employment_status, row[0] if row else None)
-            cursor.execute(
-                "UPDATE individuals SET employment_status=?, is_retired=?, retired_date=? WHERE id=?",
-                (employment_status, is_retired, retired_date, id))
-        if pf_no is not None:
-            cursor.execute("UPDATE individuals SET pf_no=? WHERE id=?", (pf_no, id))
-        if id_no is not None:
-            cursor.execute("UPDATE individuals SET id_no=? WHERE id=?", (id_no, id))
-        self.conn.commit()
+        # Only touch the optional fields when supplied, so callers that pass
+        # just the core details don't clobber an existing status / PF / ID.
+        with self.transaction():
+            self.members.update_core(id, name, phone, email)
+            if employment_status is not None:
+                self.members.set_employment_status(id, employment_status)
+            if pf_no is not None:
+                self.members.set_pf_no(id, pf_no)
+            if id_no is not None:
+                self.members.set_id_no(id, id_no)
 
     def update_individual_deduction(self, id, amount):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET default_deduction=? WHERE id=?", (amount, id))
-        self.conn.commit()
+        with self.transaction():
+            self.members.set_default_deduction(id, amount)
 
     def delete_individual(self, id):
         """Delete a member and their records as a single atomic operation.
 
         The two statements were previously issued without a transaction. Once
         foreign-key enforcement engaged (which happens automatically as soon as
-        a journal has no orphaned rows), the second statement began failing —
-        the member still has savings, fund, enrolment and suspension rows that
-        no code path removes — while the first had already succeeded. The
-        exception propagated with the transaction still open, so the *next*
-        unrelated write committed the half-delete: the member's entire loan
-        ledger destroyed, the member still listed. Reproduced against a copy of
-        a production journal before this change.
+        a journal has no orphaned rows), the second began failing — the member
+        still has savings, fund, enrolment and suspension rows that no code path
+        removed — while the first had already succeeded. The exception
+        propagated with the transaction still open, so the *next* unrelated
+        write committed the half-delete: the member's entire loan ledger
+        destroyed, the member still listed. Reproduced against a copy of a
+        production journal before this change.
 
-        Wrapping both statements makes the operation all-or-nothing on every
-        schema generation. Migration 001 additionally installs cascade triggers
-        so the remaining child tables are cleared with the parent instead of
-        being left behind.
+        Migration 001 additionally installs cascade triggers so the remaining
+        child tables are cleared with the parent instead of being left behind.
         """
         with self.transaction():
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM ledger WHERE individual_id=?", (id,))
-            cursor.execute("DELETE FROM individuals WHERE id=?", (id,))
+            self.members.delete(id)
 
     def get_statement_data(self, individual_id, start_date=None, end_date=None) -> StatementData:
         """Fetch all data required for statement generation in one go."""
@@ -1567,22 +1502,18 @@ class DatabaseManager:
 
     def retire_individual(self, ind_id, date_str):
         """Mark an individual as retired.
-        
+
         Args:
             ind_id: The individual's ID.
             date_str: Retirement date in YYYY-MM-DD format.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET is_retired=1, retired_date=?, "
-                       "employment_status='Retired' WHERE id=?", (date_str, ind_id))
-        self.conn.commit()
+        with self.transaction():
+            self.members.retire(ind_id, date_str)
 
     def reinstate_individual(self, ind_id):
         """Clear retirement flag for an individual."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET is_retired=0, retired_date=NULL, "
-                       "employment_status='Active' WHERE id=?", (ind_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.members.reinstate(ind_id)
 
     def has_outstanding_loans(self, ind_id):
         """Check if an individual has any active (outstanding) loans."""
@@ -1855,7 +1786,8 @@ class DatabaseManager:
 
     def set_setting(self, key, value):
         """Set a setting value (delegates to SettingsRepository)."""
-        self.settings.set(key, value)
+        with self.transaction():
+            self.settings.set(key, value)
 
     def import_individuals_from_external_db(self, source_db_path):
         """

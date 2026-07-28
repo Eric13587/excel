@@ -11,7 +11,7 @@ repository as it lands.
 | Sub-phase | Status | Scope | SQL statements |
 |---|---|---|---|
 | **2a** | **done** | `Repository` base, `SettingsRepository`, wiring | 3 |
-| 2b | pending | `MemberRepository` (`individuals`) | 53 |
+| **2b** | **done** | `MemberRepository` (`individuals`) | 21 of 53 |
 | 2c | pending | `LoanRepository` + `LedgerRepository` | 113 |
 | 2d | pending | `FundRepository` (`savings`, both funds) | 55 |
 | 2e | pending | `JournalRepository` (COA, entries, lines) | 42 |
@@ -116,3 +116,52 @@ the class it stands in for.
 `git revert` the 2a commit. No schema or data change; `DatabaseManager`'s public
 API is identical before and after, so nothing outside `src/db/` depends on the
 new code.
+
+---
+
+## 2b — MemberRepository
+
+All `individuals` SQL lived in `database.py`; no view or service touched the
+table, which made this self-contained. 21 of the 53 statements move — the
+member CRUD block plus the retirement operations. The remaining 32 are the
+import path (one 456-line method with nested savepoints), the orphan-repair
+join over dynamic table names, and trigger DDL. Those are 2f and later.
+
+### Behaviour preserved deliberately
+
+| Kept as-is | Why |
+|---|---|
+| `get_individuals()` returns raw `SELECT *` tuples | Ten call sites index them positionally (`m[0]`). Dataclasses are a 2f/3 change, once those callers move. |
+| `get_individual_name()` falls back to `"Individual {id}"` | A display decision, so it stays on the manager; `members.name_of()` reports absence honestly as `None`. |
+| Blank PF/ID numbers are never duplicates | Matches the partial unique indexes on those columns. |
+| `update_individual`'s partial semantics | Optional fields are only written when supplied, so a caller passing core details cannot clobber a status or PF number. |
+
+### One strengthened guarantee
+
+`update_individual` issues up to four statements and previously relied on a
+single trailing `commit()`. It now runs inside `transaction()`, so a failure
+part-way — a PF-number collision against the unique index added in migration
+001, say — rolls back the earlier statements instead of leaving a
+half-applied edit. `test_update_is_atomic_across_its_statements` pins this.
+
+### Commit convention, now consistent
+
+Repositories **never commit**; the caller owns the transaction boundary. That
+is what lets `update_individual` be atomic across four statements. Phase 2a's
+`SettingsRepository.set` committed internally (extracted verbatim from
+`set_setting`); it no longer does, and `DatabaseManager.set_setting` wraps it.
+
+### Verification
+
+* 283 → 303 tests (20 added). `ruff` clean.
+* Read back against a copy of the live journal: `get_individuals()` still a
+  `list` of `tuple` (119 rows, first `(6, 'GRACE MBURU')`), `get_individual(23)`
+  still a 13-key dict, the `"Individual {id}"` fallback intact, case-insensitive
+  name matching and PF-owner lookup unchanged.
+* Audit triggers still fire on insert/update/delete through the repository —
+  the SQL is byte-identical, only its home changed.
+
+### Rollback
+
+`git revert` the 2b commit. No schema or data change; `DatabaseManager`'s public
+API is identical either side.

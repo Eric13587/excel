@@ -78,9 +78,9 @@ class SettingsRepository(Repository):
         return default if default is not None else DEFAULTS.get(key)
 
     def set(self, key, value):
+        """Write a setting. Does not commit — the caller owns the transaction."""
         self._execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                       (key, str(value)))
-        self.conn.commit()
 
     def all(self):
         """Every stored key/value pair, defaults not included."""
