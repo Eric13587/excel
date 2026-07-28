@@ -1133,9 +1133,132 @@ class DatabaseManager:
         stem = os.path.splitext(os.path.basename(self.db_name))[0]
         safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(tag))[:60]
         os.makedirs(folder, exist_ok=True)
-        dest = os.path.join(
-            folder, f"{stem}.pre-{safe}-{datetime.now():%Y%m%d-%H%M%S}.db")
+        # The stamp is only second-resolution, so two snapshots in the same
+        # second would collide — and backup_to overwrites its destination. That
+        # is not merely untidy: restoring twice in one second wrote the safety
+        # copy over the very file being restored from, destroying it. Never
+        # reuse a path.
+        base = os.path.join(
+            folder, f"{stem}.pre-{safe}-{datetime.now():%Y%m%d-%H%M%S}")
+        dest, suffix = f"{base}.db", 1
+        while os.path.exists(dest):
+            dest = f"{base}-{suffix}.db"
+            suffix += 1
         return self.backup_to(dest)
+
+    # Tables a file must have before it is credible as a journal of this app.
+    _JOURNAL_MARKER_TABLES = ("individuals", "loans", "ledger")
+
+    def inspect_backup(self, path):
+        """Describe a candidate backup without touching the live journal.
+
+        Returns a dict with ``ok``, ``problem`` and, when readable, the row
+        counts and schema version — enough for a restore screen to show what a
+        file contains and for :meth:`restore_from` to refuse a bad one.
+
+        Opened read-only, so inspecting a file can never modify it.
+        """
+        info = {"path": path, "ok": False, "problem": None, "counts": {},
+                "schema_version": None}
+        if not os.path.exists(path):
+            info["problem"] = "The file does not exist."
+            return info
+        try:
+            src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            info["problem"] = f"Cannot open the file: {e}"
+            return info
+        try:
+            check = src.execute("PRAGMA quick_check").fetchone()[0]
+            if check != "ok":
+                info["problem"] = f"The file is damaged: {check}"
+                return info
+            present = {r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = [t for t in self._JOURNAL_MARKER_TABLES if t not in present]
+            if missing:
+                info["problem"] = ("This does not look like a LoanMaster journal "
+                                   f"(missing {', '.join(missing)}).")
+                return info
+            for table in ("individuals", "loans", "ledger", "savings"):
+                if table in present:
+                    info["counts"][table] = src.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            info["schema_version"] = migrations.schema_version(src)
+            info["ok"] = True
+            return info
+        except sqlite3.DatabaseError as e:
+            info["problem"] = f"Could not read the file: {e}"
+            return info
+        finally:
+            src.close()
+
+    def restore_from(self, path):
+        """Replace this journal's contents with a backup's. Returns a report dict.
+
+        Two things make this safe enough to offer in the UI:
+
+        * the source is inspected first and a file that is damaged, unreadable
+          or not a journal is refused before anything is touched;
+        * the current state is snapshotted first, so restoring is itself
+          reversible — the commonest way to lose data with a restore feature is
+          restoring the wrong file.
+
+        The copy goes through SQLite's backup API *into the open connection*
+        rather than replacing the file. That avoids the whole class of problems
+        around overwriting a database that is currently open (which simply
+        fails on Windows), and leaves every repository still pointing at a
+        valid connection.
+
+        A backup may predate the current schema, so migrations are re-applied
+        afterwards and their report is returned with the rest.
+        """
+        info = self.inspect_backup(path)
+        if not info["ok"]:
+            raise ValueError(info["problem"])
+
+        safety = self.snapshot("pre-restore")
+        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            src.backup(self.conn)
+        finally:
+            src.close()
+
+        # The restored contents may be on an older schema than the code.
+        report = migrations.apply_pending(self.conn)
+        self._check_integrity()
+        self._evaluate_foreign_keys()
+        logger.warning("Journal restored from %s (safety copy: %s)", path, safety)
+        return {"restored_from": path, "safety_copy": safety,
+                "counts": info["counts"], "migration_report": report,
+                "integrity_ok": self.integrity_ok}
+
+    def available_backups(self):
+        """Every backup beside this journal, newest first.
+
+        Covers both the rotation written on open and the snapshots taken before
+        an irreversible change; they share the folder and differ only in name.
+        """
+        if not self.db_name or self.db_name == ":memory:":
+            return []
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.db_name)), "backups")
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return []
+        found = []
+        for name in names:
+            if not name.endswith(".db"):
+                continue
+            full = os.path.join(folder, name)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            found.append({"path": full, "name": name, "size": stat.st_size,
+                          "modified": datetime.fromtimestamp(stat.st_mtime)})
+        found.sort(key=lambda b: b["modified"], reverse=True)
+        return found
 
     def member_record_counts(self, individual_id):
         """What deleting this member would remove, per table.

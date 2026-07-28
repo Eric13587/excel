@@ -127,3 +127,157 @@ def test_the_counts_match_what_deletion_actually_removes(db):
             f"SELECT COUNT(*) FROM {table} WHERE individual_id=?", (ind,)).fetchone()[0] == 0
     assert sum(counts.values()) == 5
     assert db.find_orphaned_rows() == []
+
+
+# --------------------------------------------------------------------------- #
+# Restore — the other half of a snapshot
+# --------------------------------------------------------------------------- #
+
+def test_a_backup_can_be_inspected_without_touching_it(db):
+    ind = _busy_member(db)
+    path = db.snapshot("inspect")
+    try:
+        before = os.path.getmtime(path)
+        info = db.inspect_backup(path)
+        assert info["ok"] and info["problem"] is None
+        assert info["counts"]["individuals"] == 1
+        assert info["counts"]["ledger"] == 2
+        assert info["schema_version"] > 0
+        assert os.path.getmtime(path) == before, "opened read-only"
+        assert ind
+    finally:
+        os.remove(path)
+
+
+def test_a_damaged_file_is_refused(db, tmp_path):
+    bad = tmp_path / "rubbish.db"
+    bad.write_bytes(b"this is not a database at all, not even close" * 40)
+    info = db.inspect_backup(str(bad))
+    assert not info["ok"] and info["problem"]
+    with pytest.raises(ValueError):
+        db.restore_from(str(bad))
+
+
+def test_a_database_that_is_not_a_journal_is_refused(db, tmp_path):
+    """A valid SQLite file is not the same thing as a LoanMaster journal."""
+    other = tmp_path / "shopping.db"
+    conn = sqlite3.connect(str(other))
+    conn.execute("CREATE TABLE groceries (item TEXT)")
+    conn.commit()
+    conn.close()
+
+    info = db.inspect_backup(str(other))
+    assert not info["ok"] and "does not look like" in info["problem"]
+    with pytest.raises(ValueError):
+        db.restore_from(str(other))
+
+
+def test_a_missing_file_is_refused(db):
+    assert db.inspect_backup("/nowhere/at/all.db")["problem"]
+
+
+def test_restoring_brings_back_deleted_records(db):
+    """The point of the whole exercise."""
+    ind = _busy_member(db)
+    path = db.snapshot("before-delete")
+    try:
+        db.delete_individual(ind)
+        assert db.conn.execute("SELECT COUNT(*) FROM individuals").fetchone()[0] == 0
+
+        result = db.restore_from(path)
+        assert db.conn.execute("SELECT COUNT(*) FROM individuals").fetchone()[0] == 1
+        assert db.conn.execute("SELECT COUNT(*) FROM ledger").fetchone()[0] == 2
+        assert db.conn.execute("SELECT COUNT(*) FROM savings").fetchone()[0] == 1
+        assert result["integrity_ok"]
+        os.remove(result["safety_copy"])
+    finally:
+        os.remove(path)
+
+
+def test_restoring_snapshots_the_current_state_first(db):
+    """Restoring the wrong file is the commonest way to lose data with a
+    restore feature, so restoring is itself reversible."""
+    ind = _busy_member(db)
+    old = db.snapshot("old-state")
+    try:
+        db.add_savings_transaction(ind, "2025-04-01", "Deposit", 4321, "since")
+        result = db.restore_from(old)
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM savings WHERE amount=4321").fetchone()[0] == 0
+
+        # The work done since is not lost — it is in the safety copy.
+        db.restore_from(result["safety_copy"])
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM savings WHERE amount=4321").fetchone()[0] == 1
+        os.remove(result["safety_copy"])
+    finally:
+        os.remove(old)
+
+
+def test_the_connection_survives_a_restore(db):
+    """The copy goes into the open connection rather than replacing the file,
+    so every repository is still usable afterwards."""
+    ind = _busy_member(db)
+    path = db.snapshot("live")
+    try:
+        db.restore_from(path)
+        assert db.get_savings_balance(ind) == 2000
+        assert db.members.all_ids() if hasattr(db.members, "all_ids") else True
+        new_ind = db.add_individual("After Restore", "07", "a@x")
+        assert new_ind
+        result_counts = db.member_record_counts(ind)
+        assert result_counts["loans"] == 1
+    finally:
+        for f in [path] + [b["path"] for b in db.available_backups()]:
+            if os.path.exists(f):
+                os.remove(f)
+
+
+def test_restoring_an_older_schema_re_applies_migrations(db, tmp_path):
+    """A backup may predate the current code."""
+    legacy = str(tmp_path / "legacy.db")
+    old = DatabaseManager(legacy, auto_backup=False, bootstrap="legacy")
+    old.add_individual("Legacy", "07", "l@x")
+    old.conn.execute("DELETE FROM schema_migrations WHERE version >= 8")
+    old.conn.commit()
+    old.close()
+
+    result = db.restore_from(legacy)
+    from src import migrations
+    assert migrations.schema_version(db.conn) == max(
+        v for v, _, _ in migrations.discover())
+    assert result["migration_report"].ok
+    os.remove(result["safety_copy"])
+
+
+def test_available_backups_lists_newest_first(db):
+    import time
+    first = db.snapshot("one")
+    time.sleep(1.05)                       # mtime resolution
+    second = db.snapshot("two")
+    try:
+        listed = db.available_backups()
+        assert [b["path"] for b in listed][:2] == [second, first]
+        assert all(b["size"] > 0 for b in listed)
+    finally:
+        os.remove(first)
+        os.remove(second)
+
+
+def test_available_backups_is_empty_when_there_are_none(db):
+    assert db.available_backups() == []
+
+
+def test_two_snapshots_in_the_same_second_do_not_collide(db):
+    """Regression. The stamp is second-resolution and backup_to overwrites its
+    destination, so a collision does not merely lose a backup — restoring twice
+    within one second wrote the safety copy over the file being restored from,
+    destroying it and restoring the wrong state."""
+    _busy_member(db)
+    paths = [db.snapshot("rapid") for _ in range(4)]
+    try:
+        assert len(set(paths)) == 4, paths
+        assert all(os.path.exists(p) and os.path.getsize(p) > 0 for p in paths)
+    finally:
+        for p in paths:
+            os.remove(p)

@@ -178,9 +178,12 @@ rest are recorded rather than done.
 * **Four swallowed exceptions** in `src/views/dashboard.py` (lines ~200, 576,
   1639, 2124) do `except Exception: pass`. One is the "open the exported file"
   path, so a failed export looks like a successful one.
-* **No in-app restore.** Snapshots land in `backups/` and the user is told the
-  path; opening one means finding it on disk. A "restore from backup" screen
-  would close the loop.
+* ~~**No in-app restore.**~~ Done. Mass Operations → **Restore From Backup**
+  lists every backup beside the journal with what is *in* each one (members,
+  loans, ledger entries), refuses a file that is damaged or is not a journal,
+  and snapshots the current state before restoring so the restore is itself
+  reversible. Mass Operations also gained **Journal Health Check**, so the
+  report is reachable without opening Treasury.
 
 ## D. Why Phase 9 was dropped
 

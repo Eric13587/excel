@@ -474,6 +474,16 @@ class Dashboard(QWidget):
         activity_action.triggered.connect(self.show_activity_log)
         mass_menu.addAction(activity_action)
 
+        health_action = QAction("Journal Health Check…", self)
+        health_action.triggered.connect(self.show_health_check)
+        mass_menu.addAction(health_action)
+
+        # Backups were written and their paths reported, but opening one meant
+        # finding it on disk — not a thing to ask of someone mid-mistake.
+        restore_action = QAction("Restore From Backup…", self)
+        restore_action.triggered.connect(self.open_restore_dialog)
+        mass_menu.addAction(restore_action)
+
         mass_menu.addSeparator()
         
         self.undo_mass_action = QAction("Undo Last Mass Operation", self)
@@ -2150,6 +2160,28 @@ class Dashboard(QWidget):
                 value = f"{value:,.2f}"
             parts.append(f"{key.replace('_', ' ')} {value}")
         return ", ".join(parts)
+
+    def show_health_check(self):
+        """Open the full integrity report."""
+        from .integrity_report import IntegrityReportDialog
+        IntegrityReportDialog(self.db, self.theme_manager, self).exec()
+
+    def open_restore_dialog(self):
+        """Restore the journal from a backup, refreshing everything after."""
+        from .restore_backup import RestoreBackupDialog
+        RestoreBackupDialog(self.db, self.theme_manager, self,
+                            on_restored=self._after_restore).exec()
+
+    def _after_restore(self):
+        """Every cached figure on screen is now stale — reload from the journal."""
+        try:
+            self.refresh_list()
+        except Exception:                       # noqa: BLE001 - never leave a dead screen
+            logger.exception("Could not refresh the dashboard after a restore")
+            QMessageBox.information(
+                self, "Restored",
+                "The journal was restored. Please close and reopen the "
+                "application so every screen reloads.")
 
     def show_activity_log(self):
         """View the CRUD audit trail (member/loan create/update/delete with dates)."""
