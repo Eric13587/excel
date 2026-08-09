@@ -1820,8 +1820,17 @@ class LedgerView(QWidget):
         progress.setMinimumDuration(0)
         progress.show()
         
+        # Qt trap: QProgressDialog.close() sets the cancellation flag, so
+        # asking wasCanceled() *after* closing reports a successful run as
+        # cancelled — which is what put "Operation cancelled" in front of users
+        # who had just watched it finish. Verified: wasCanceled() is False after
+        # a completed loop and True immediately after close(). Capture the
+        # answer while the loop is still running.
+        cancelled = False
+
         for i, loan in enumerate(active_loans):
             if progress.wasCanceled():
+                cancelled = True
                 break
                 
             progress.setLabelText(f"Processing {loan['ref']}...")
@@ -1840,7 +1849,7 @@ class LedgerView(QWidget):
         
         progress.close()
         
-        if progress.wasCanceled():
+        if cancelled:
             self.refresh_table()
             self.refresh_loans_list()
             QMessageBox.information(self, "Cancelled", f"Operation cancelled. Processed {total_deductions} deductions.")
@@ -2848,8 +2857,11 @@ class LedgerView(QWidget):
         progress.show()
         
         count = 0
+        cancelled = False       # see loans_catch_up_to_current
+
         while current_date < current_month_start:
             if progress.wasCanceled():
+                cancelled = True
                 break
                 
             date_str = current_date.strftime("%Y-%m-%d")
@@ -2871,7 +2883,7 @@ class LedgerView(QWidget):
         self.refresh_table()
         new_balance = self.db.get_savings_balance(self.current_individual_id)
         
-        if progress.wasCanceled():
+        if cancelled:
             QMessageBox.information(self, "Cancelled", f"Operation cancelled. Added {count} deposits.\nNew balance: {new_balance:,.0f}")
         else:
             QMessageBox.information(self, "Success", f"Added {count} deposits of {amount:,.0f} each.\nNew balance: {new_balance:,.0f}")
