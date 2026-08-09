@@ -2856,6 +2856,20 @@ class LedgerView(QWidget):
         progress.setMinimumDuration(0)
         progress.show()
         
+        # Ask before doing. The membership rules would refuse the first deposit
+        # anyway, but discovering that behind a progress dialog — or as a
+        # traceback — is worse than being told up front. This is what
+        # src/services/posting.py separates check() from post() for.
+        from src.services.posting import Posting
+        from src.services.posting import check as check_posting
+        _tidy, problems = check_posting(self.db, Posting(
+            table='savings', member_id=self.current_individual_id,
+            date=current_date.strftime('%Y-%m-%d'), kind='Deposit', amount=amount))
+        if problems:
+            progress.close()
+            QMessageBox.information(self, 'Not Allowed', ' '.join(problems))
+            return
+
         count = 0
         cancelled = False       # see loans_catch_up_to_current
 

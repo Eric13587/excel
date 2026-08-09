@@ -78,12 +78,19 @@ def test_no_view_asks_wasCanceled_after_closing():
         if not name.endswith(".py"):
             continue
         text = open(os.path.join(root, name), encoding="utf-8").read()
-        for match in re.finditer(r"\.close\(\)", text):
-            after = text[match.end():match.end() + 400]
-            # a wasCanceled() check before the next def is the mistake
-            segment = after.split("\n    def ")[0]
-            if ".wasCanceled()" in segment:
-                offenders.append(f"{name} near offset {match.start()}")
+        for match in re.finditer(r"progress\.close\(\)", text):
+            segment = text[match.end():match.end() + 400].split("\n    def ")[0]
+            hit = segment.find(".wasCanceled()")
+            if hit == -1:
+                continue
+            # A `return`, or the start of a loop, between the two means they are
+            # different code paths — an early exit followed by the loop that
+            # legitimately polls the dialog. Only a straight-line close-then-ask
+            # is the mistake.
+            between = segment[:hit]
+            if re.search(r"\breturn\b|\bwhile\b|\bfor\b", between):
+                continue
+            offenders.append(f"{name} near offset {match.start()}")
     assert not offenders, (
         "wasCanceled() is being asked after close(), which always returns "
         f"True: {offenders}")

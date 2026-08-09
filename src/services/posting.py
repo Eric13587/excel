@@ -37,6 +37,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 
+from src.exceptions import LoanMasterError
 from src.services.policy import Operation, default_policy
 
 logger = logging.getLogger(__name__)
@@ -60,8 +61,13 @@ _ACCRUING_KIND = {"savings": "savings.deposit",
                   "benevolent_ledger": "benevolent.contribute"}
 
 
-class PostingError(ValueError):
-    """A fund transaction that cannot be written, explained in a sentence."""
+class PostingError(LoanMasterError, ValueError):
+    """A fund transaction that cannot be written, explained in a sentence.
+
+    Deriving from LoanMasterError is what marks the message as written *for the
+    user*: src/views/error_handling.py shows those as a plain refusal rather
+    than a crash. ValueError is kept so existing callers that catch it still do.
+    """
 
 
 @dataclass(frozen=True)

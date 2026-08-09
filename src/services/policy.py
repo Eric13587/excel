@@ -36,6 +36,8 @@ failure than the one being fixed.
 import logging
 from dataclasses import dataclass
 
+from src.exceptions import LoanMasterError
+
 logger = logging.getLogger(__name__)
 
 # Membership states. Only ACTIVE may accrue new obligations; the rest are all
@@ -87,8 +89,12 @@ class Refusal:
         return self.reason
 
 
-class OperationNotAllowed(Exception):
-    """Raised by :meth:`Policy.enforce` when a rule refuses."""
+class OperationNotAllowed(LoanMasterError):
+    """Raised by :meth:`Policy.enforce` when a rule refuses.
+
+    A LoanMasterError because its message is written for the person reading it;
+    see src/views/error_handling.py.
+    """
 
     def __init__(self, refusals):
         self.refusals = list(refusals)

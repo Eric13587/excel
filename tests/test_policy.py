@@ -251,3 +251,35 @@ def test_a_deposit_for_a_departed_member_is_refused_too(db):
 
     # …but they can still take their savings out.
     assert db.add_savings_transaction(ind, "2025-08-01", "Withdrawal", 400, "") == 600
+
+
+# --------------------------------------------------------------------------- #
+# A refusal must reach the user, not the console
+# --------------------------------------------------------------------------- #
+
+def test_refusals_are_marked_as_written_for_the_user():
+    """src/views/error_handling shows LoanMasterError as a plain refusal and
+    anything else as a crash. A refusal that is not one reaches the user as a
+    traceback and a window that appears to do nothing — which is how this was
+    found."""
+    from src.exceptions import LoanMasterError
+    from src.services.policy import OperationNotAllowed
+    from src.services.posting import PostingError
+
+    assert issubclass(OperationNotAllowed, LoanMasterError)
+    assert issubclass(PostingError, LoanMasterError)
+    # kept so existing callers catching ValueError still work
+    assert issubclass(PostingError, ValueError)
+
+
+def test_a_refusal_carries_its_reason_as_the_message(db):
+    from src.services.posting import PostingError
+    ind = _member(db)
+    db.add_savings_transaction(ind, "2025-01-01", "Deposit", 1000, "")
+    db.set_membership_status(ind, RETIRED, "2025-06-30")
+    try:
+        db.add_savings_transaction(ind, "2025-08-01", "Deposit", 500, "")
+    except PostingError as e:
+        assert "has retired" in str(e) and "still allowed" in str(e)
+    else:
+        pytest.fail("the deposit should have been refused")
