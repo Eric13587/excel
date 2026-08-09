@@ -1654,27 +1654,17 @@ class DatabaseManager:
         self.conn.commit()
     
     def add_savings_transaction(self, individual_id, date, transaction_type, amount, notes="", batch_id=None):
-        """Add a deposit or withdrawal to savings."""
-        # Ensure table exists
-        self.create_savings_table()
-        
-        # Get current balance
-        current_balance = self.get_savings_balance(individual_id)
-        
-        if transaction_type == "Deposit":
-            new_balance = current_balance + amount
-        else:  # Withdrawal
-            new_balance = current_balance - amount
+        """Add a deposit, withdrawal or interest credit to savings.
 
-        with self.transaction():
-            self.funds.add("savings", individual_id, date, transaction_type,
-                           amount, new_balance, notes, batch_id)
-            # The balance computed above is the running total *as at insertion*,
-            # which is only correct when the row is the newest. Back-date one and
-            # it, and every row after it, is wrong. Re-derive in date order.
-            if self._is_back_dated("savings", individual_id, date):
-                self.funds.recalculate("savings", individual_id)
-        return new_balance
+        Goes through src.services.posting, which is also what the Christmas and
+        Benevolent funds use. This path used to have its own sign rule —
+        anything that was not a 'Deposit' reduced the balance — so an Interest
+        credit subtracted, disagreeing with FundRepository and with the other
+        two funds. Returns the member's new balance.
+        """
+        self.create_savings_table()
+        return self._post_fund("savings", individual_id, date, transaction_type,
+                               amount, notes, batch_id)
     
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual."""
@@ -1770,19 +1760,25 @@ class DatabaseManager:
 
     def fund_add_transaction(self, table, individual_id, date, transaction_type, amount,
                              notes="", batch_id=None):
-        """Append a fund transaction with a running balance. Withdrawals reduce
-        the balance; everything else (Deposit/Contribution/Interest) increases it.
+        """Append a fund transaction. Withdrawals reduce the balance; everything
+        else (Deposit/Contribution/Interest) increases it.
 
-"""
-        current = self.fund_balance(table, individual_id)
-        new_balance = round(current - amount, 2) if transaction_type == "Withdrawal" \
-            else round(current + amount, 2)
-        with self.transaction():
-            self.funds.add(table, individual_id, date, transaction_type, amount,
-                           new_balance, notes, batch_id)
-            if self._is_back_dated(table, individual_id, date):
-                self.funds.recalculate(table, individual_id)
-        return new_balance
+        Returns the member's new balance.
+        """
+        return self._post_fund(table, individual_id, date, transaction_type,
+                               amount, notes, batch_id)
+
+    def _post_fund(self, table, individual_id, date, transaction_type, amount,
+                   notes="", batch_id=None):
+        """The one write path for all three funds.
+
+        Normalise, validate, check membership, insert, re-derive the running
+        totals — see src/services/posting.py for why each stage is there.
+        """
+        from src.services.posting import Posting, post
+        return post(self, Posting(table=table, member_id=individual_id, date=date,
+                                  kind=transaction_type, amount=amount,
+                                  notes=notes, batch_id=batch_id))
 
     def fund_transactions(self, table, individual_id):
         return self.funds.transactions(table, individual_id)

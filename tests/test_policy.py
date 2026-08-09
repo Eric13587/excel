@@ -123,8 +123,9 @@ def test_a_broken_rule_does_not_block_the_operation(db):
 # --------------------------------------------------------------------------- #
 
 def test_savings_catch_up_is_refused_for_a_retired_member(db):
-    ind = _member(db, RETIRED)
+    ind = _member(db)                       # history first — see the note below
     db.add_savings_transaction(ind, "2025-01-01", "Deposit", 1000, "")
+    db.set_membership_status(ind, RETIRED, "2025-06-30")
     engine = LoanEngine(db)
     before = db.conn.execute("SELECT COUNT(*) FROM savings").fetchone()[0]
 
@@ -235,3 +236,18 @@ def test_appending_in_order_still_costs_no_recalculation(db):
     for i in range(1, 5):
         db.add_savings_transaction(ind, f"2026-0{i}-01", "Deposit", 100, "")
     assert list(db.get_savings_transactions(ind)["balance"]) == [100, 200, 300, 400]
+
+
+def test_a_deposit_for_a_departed_member_is_refused_too(db):
+    """Not just catch-up. A single deposit is money going in, so it is a new
+    obligation; the member's own withdrawal is not."""
+    from src.services.posting import PostingError
+    ind = _member(db)
+    db.add_savings_transaction(ind, "2025-01-01", "Deposit", 1000, "")
+    db.set_membership_status(ind, RETIRED, "2025-06-30")
+
+    with pytest.raises(PostingError, match="has retired"):
+        db.add_savings_transaction(ind, "2025-08-01", "Deposit", 500, "")
+
+    # …but they can still take their savings out.
+    assert db.add_savings_transaction(ind, "2025-08-01", "Withdrawal", 400, "") == 600

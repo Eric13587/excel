@@ -77,12 +77,26 @@ Ranked by what it would actually buy:
    would let the preview screen show exactly what the commit will do, from the
    same code that does it. **Highest value, lowest risk.**
 
-2. **Posting a transaction** — partly done. The running-total repair is now one
-   shared post-write step (`DatabaseManager._mutate_fund`) rather than a
-   docstring asking the caller to remember, which is what the `balance` column
-   depended on before. Validation and normalisation are still spelled out
-   slightly differently across `add_transaction`, `add_savings_transaction` and
-   `fund_add_transaction`.
+2. **Posting a fund transaction — done.** `src/services/posting.py` runs
+   normalise → validate → guard → write → repair, and all three funds go through
+   it. It existed to end a divergence that was a bug rather than a nuance:
+   savings applied `+amount if type == "Deposit" else -amount`, so an `Interest`
+   credit *reduced* the balance, while the funds and `FundRepository` applied
+   `-amount if type == "Withdrawal" else +amount`. Crediting 500 of interest on
+   1,000 returned 500, stored 500, and silently became 1,500 the next time
+   anything recalculated.
+
+   Validation moved up with it. A negative amount and a malformed date were
+   already caught, but by `CHECK` constraints surfacing as
+   `TransactionError: CHECK constraint failed: amount >= 0` — a sentence for a
+   developer. They now read *"The amount must be greater than zero — use a
+   Withdrawal to take money out."*, and every problem is reported at once so a
+   form does not make the user fix one thing to discover the next.
+
+   Still separate: the loan `ledger` write path. Its rows carry a different
+   shape — two-sided amounts, principal/interest portions, a replay anchor — so
+   folding it in would mean one pipeline with two vocabularies. It is the next
+   candidate, not a leftover.
 
 3. **Report generation** — gather → filter (retired, date range) → compute →
    render. The retired-member filter is currently four near-identical blocks in
