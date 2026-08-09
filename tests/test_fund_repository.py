@@ -92,7 +92,7 @@ def _seed_with_interest(db, ind):
 
 
 def test_interest_increases_the_balance(journal):
-    """One semantic now. Interest adds, matching GLService, which credits
+    """One semantic now. Interest adds, matching how the fund itself credits
     member deposits when interest is paid on them. The retired by-id variant
     subtracted it (finding D1)."""
     ind = _member(journal)
@@ -252,26 +252,6 @@ def test_set_next_due(journal):
     journal.upsert_benevolent_account(ind, 300, "2026-01-01", "2026-02-01")
     journal.set_benevolent_next_due(ind, "2026-06-01")
     assert journal.get_benevolent_account(ind)["next_due_date"] == "2026-06-01"
-
-
-# --------------------------------------------------------------------------- #
-# Post-hook asymmetry (finding preserved for Phase 5)
-# --------------------------------------------------------------------------- #
-
-def test_only_savings_fires_the_gl_post_hook(journal):
-    """Christmas and Benevolent writes reach the GL only on a full sync — which
-    is how 12 Christmas deposits went unposted in production. Preserved here so
-    Phase 5 has a baseline to change."""
-    fired = []
-    journal.savings_post_hook = fired.append
-    ind = _member(journal)
-
-    journal.add_savings_transaction(ind, "2026-01-01", "Deposit", 100)
-    assert len(fired) == 1
-
-    journal.fund_add_transaction(CHRISTMAS, ind, "2026-01-01", "Deposit", 100)
-    journal.fund_add_transaction(BENEVOLENT, ind, "2026-01-01", "Contribution", 50)
-    assert len(fired) == 1, "fund writes must not post yet (Phase 5 changes this)"
 
 
 # --------------------------------------------------------------------------- #

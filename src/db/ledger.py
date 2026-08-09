@@ -187,23 +187,6 @@ class LedgerRepository(Repository):
             "SELECT MIN(date) FROM ("
             "  SELECT date FROM ledger UNION ALL SELECT date FROM savings)")
 
-    def gl_projection_rows(self):
-        """Every row the GL projects from, in posting order.
-
-        (id, date, event_type, added, deducted, principal_portion,
-        interest_portion, interest_amount) — the columns GLService needs to
-        decide which journal an event becomes.
-        """
-        return self._rows(
-            "SELECT id, date, event_type, added, deducted, principal_portion, "
-            "interest_portion, interest_amount FROM ledger ORDER BY date, id")
-
-    def gl_projection_row(self, row_id):
-        """The same projection columns for one row (the live write-path hook)."""
-        return self._row(
-            "SELECT date, event_type, added, deducted, principal_portion, "
-            "interest_portion, interest_amount FROM ledger WHERE id=?", (row_id,))
-
     def max_id(self):
         """Highest row id, snapshotted before a bulk insert.
 

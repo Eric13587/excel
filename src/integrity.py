@@ -1,7 +1,7 @@
 """Journal integrity verification.
 
 Answers one question: *can this journal be trusted right now?* — structurally,
-referentially, and as a set of books.
+referentially, and as a set of member records.
 
 Design principle: **assert, don't enforce.** Several invariants this reports on
 cannot yet be database constraints, either because tightening them needs a table
@@ -27,12 +27,6 @@ PASS, WARN, FAIL = "pass", "warn", "fail"
 
 # Money is stored as floats, so equality is only meaningful to the cent.
 TOLERANCE = 0.005
-
-# Chart-of-accounts codes whose GL balance must agree with a subledger.
-GL_LOANS_RECEIVABLE = "1100"
-GL_MEMBER_DEPOSITS = "2000"
-GL_CHRISTMAS_SAVINGS = "2010"
-GL_BENEVOLENT_FUND = "2300"
 
 # The vocabularies Phase 4 will enforce as CHECK constraints.
 LEDGER_EVENT_TYPES = ("Loan Issued", "Loan Top-Up", "Interest Earned",
@@ -144,7 +138,6 @@ def _check_schema(conn, report):
                    f"{version}, latest is {latest} — migrations pending")
 
     for kind, name in (("index", "idx_loans_member_ref"),
-                       ("index", "idx_journal_entries_source_ref"),
                        ("index", "idx_ledger_individual_date")):
         present = conn.execute("SELECT 1 FROM sqlite_master WHERE type=? AND name=?",
                                (kind, name)).fetchone() is not None
@@ -191,38 +184,6 @@ def _check_referential(conn, report):
 # --------------------------------------------------------------------------- #
 
 def _check_accounting(conn, report):
-    if not _table_exists(conn, "journal_lines"):
-        return
-
-    n = _scalar(conn, "SELECT COUNT(*) FROM (SELECT entry_id FROM journal_lines "
-                      "GROUP BY 1 HAVING ABS(SUM(debit)-SUM(credit)) > ?)", (TOLERANCE,))
-    report.add("every journal entry balances", "accounting", PASS if not n else FAIL,
-               "all balanced" if not n else f"{n} unbalanced entry/entries", n)
-
-    net = _scalar(conn, "SELECT COALESCE(SUM(debit)-SUM(credit),0) FROM journal_lines")
-    report.add("trial balance nets to zero", "accounting",
-               PASS if abs(net) <= TOLERANCE else FAIL, f"debits - credits = {net:,.2f}")
-
-    n = _scalar(conn, "SELECT COUNT(*) FROM (SELECT source, source_ref FROM journal_entries "
-                      "WHERE source_ref IS NOT NULL GROUP BY 1,2 HAVING COUNT(*)>1)")
-    report.add("no subledger row posted twice", "accounting", PASS if not n else FAIL,
-               "idempotent" if not n else f"{n} duplicated (source, source_ref)", n)
-
-    # --- control accounts: the GL must agree with the subledger it summarises ---
-    _control(conn, report, "Loans Receivable", GL_LOANS_RECEIVABLE, "debit",
-             "SELECT COALESCE(SUM(balance),0) FROM loans", "loans.balance")
-    _control(conn, report, "Member Deposits", GL_MEMBER_DEPOSITS, "credit",
-             "SELECT COALESCE(SUM(CASE transaction_type WHEN 'Withdrawal' "
-             "THEN -amount ELSE amount END),0) FROM savings", "savings")
-    if _table_exists(conn, "christmas_savings"):
-        _control(conn, report, "Christmas Savings", GL_CHRISTMAS_SAVINGS, "credit",
-                 "SELECT COALESCE(SUM(CASE transaction_type WHEN 'Withdrawal' "
-                 "THEN -amount ELSE amount END),0) FROM christmas_savings", "christmas_savings")
-    if _table_exists(conn, "benevolent_ledger"):
-        _control(conn, report, "Benevolent Fund", GL_BENEVOLENT_FUND, "credit",
-                 "SELECT COALESCE(SUM(CASE transaction_type WHEN 'Withdrawal' "
-                 "THEN -amount ELSE amount END),0) FROM benevolent_ledger", "benevolent_ledger")
-
     # --- cached loan balances vs the ledger they are derived from ---
     drifted = conn.execute(
         """SELECT l.individual_id, l.ref, l.balance, COALESCE((
@@ -380,117 +341,6 @@ def _check_accounting(conn, report):
                    f"their issue note did not parse", n)
 
 
-def _check_projection(conn, report):
-    """The GL projection's own health, independent of whether it reconciles.
-
-    Since migration 005 the projection is maintained incrementally from a change
-    queue rather than rebuilt wholesale, so two things are worth stating
-    explicitly: whether the queue has been drained, and whether any projected
-    entry has outlived the subledger row it was derived from. The opposite kind
-    of drift — a subledger row with no journal — is what the control-account
-    comparisons above already measure.
-    """
-    if not _table_exists(conn, "gl_outbox"):
-        return
-    cat = "projection"
-
-    established = _scalar(conn, "SELECT COUNT(*) FROM settings "
-                                "WHERE key='gl_projection_established' AND value='1'")
-    report.add("projection baseline established", cat, PASS if established else WARN,
-               "established" if established else
-               "not yet — the next sync will rebuild in full")
-
-    depth = _scalar(conn, "SELECT COUNT(*) FROM gl_outbox")
-    report.add("projection change queue drained", cat, PASS if not depth else WARN,
-               "empty" if not depth else
-               f"{depth} change(s) not yet posted — run Treasury → Sync", depth)
-
-    stale = conn.execute(
-        "SELECT COUNT(*) FROM journal_entries e WHERE ("
-        "  (e.source_ref LIKE 'ledger:%' AND NOT EXISTS (SELECT 1 FROM ledger l"
-        "     WHERE l.id = CAST(substr(e.source_ref, 8) AS INTEGER)))"
-        "  OR (e.source_ref LIKE 'savings:%' AND NOT EXISTS (SELECT 1 FROM savings s"
-        "     WHERE s.id = CAST(substr(e.source_ref, 9) AS INTEGER)))"
-        "  OR (e.source_ref LIKE 'christmas:%' AND NOT EXISTS (SELECT 1 FROM christmas_savings c"
-        "     WHERE c.id = CAST(substr(e.source_ref, 11) AS INTEGER)))"
-        "  OR (e.source_ref LIKE 'benevolent:%' AND NOT EXISTS (SELECT 1 FROM benevolent_ledger b"
-        "     WHERE b.id = CAST(substr(e.source_ref, 12) AS INTEGER)))"
-        ") AND e.source IN ('loan_disbursement','repayment','interest','savings',"
-        "                   'christmas','benevolent')").fetchone()[0]
-    report.add("projected entries have a live source row", cat, PASS if not stale else WARN,
-               "all live" if not stale else
-               f"{stale} entry/entries outlived their subledger row", stale)
-
-
-def _check_periods(conn, report):
-    """The fiscal-period register, once migration 008 has created it.
-
-    Nothing here is a failure. An empty register is the normal state for a
-    journal that has not started closing periods, and is exactly how 008 ships.
-    """
-    if not _table_exists(conn, "fiscal_periods"):
-        return
-    cat = "fiscal periods"
-
-    rows = conn.execute(
-        "SELECT status, COUNT(*) FROM fiscal_periods GROUP BY status").fetchall()
-    counts = dict(rows)
-    total = sum(counts.values())
-    report.add("periods declared", cat, PASS,
-               "none — nothing is frozen" if not total else
-               f"{total} ({counts.get('closed', 0)} closed, {counts.get('open', 0)} open)",
-               total)
-
-    if _table_exists(conn, "account_snapshots"):
-        # Stored figures are only trustworthy if they still match the journal
-        # they were taken from. Recomputing is O(journal), but this is the tool
-        # you run to find out whether anything is wrong.
-        bad = conn.execute(
-            "SELECT s.as_of, s.account_code, s.closing_balance, "
-            "       COALESCE((SELECT SUM(l.debit) - SUM(l.credit) "
-            "                   FROM journal_lines l "
-            "                   JOIN journal_entries e ON e.id = l.entry_id "
-            "                  WHERE l.account_code = s.account_code "
-            "                    AND e.entry_date <= s.as_of), 0) "
-            "FROM account_snapshots s").fetchall()
-        drift = [r for r in bad if abs(round(r[2] - r[3], 2)) > TOLERANCE]
-        report.add("period snapshots match the journal", cat,
-                   PASS if not drift else FAIL,
-                   f"{len(bad)} snapshot row(s) verified" if not drift else
-                   f"{len(drift)} of {len(bad)} disagree "
-                   f"(first: {drift[0][1]} at {drift[0][0]}, "
-                   f"{drift[0][2]:,.2f} vs {drift[0][3]:,.2f})",
-                   len(drift))
-
-    settled = _scalar(conn, "SELECT MAX(end_date) FROM fiscal_periods WHERE status='closed'")
-    if settled:
-        report.add("books settled through", cat, PASS, str(settled))
-
-        # Activity dated inside a closed period that was written after the
-        # close. Migration 009 makes this impossible; until then it is the
-        # measurement that says whether turning the lock on is safe.
-        n = _scalar(conn,
-            "SELECT COUNT(*) FROM audit_log a JOIN fiscal_periods p "
-            "  ON p.status='closed' "
-            "WHERE a.entity IN ('ledger','savings','christmas_savings','benevolent_ledger') "
-            "  AND a.ts > p.closed_at "
-            "  AND json_extract(a.before_image, '$.date') BETWEEN p.start_date AND p.end_date")
-        report.add("no edits inside a closed period", cat, PASS if not n else WARN,
-                   "none recorded" if not n else
-                   f"{n} money row(s) changed after their period was closed", n)
-
-
-def _control(conn, report, label, code, side, subledger_sql, subledger_name):
-    """Compare a GL control account against the subledger it summarises."""
-    expr = ("SUM(debit)-SUM(credit)") if side == "debit" else ("SUM(credit)-SUM(debit)")
-    gl = _scalar(conn, f"SELECT COALESCE({expr},0) FROM journal_lines WHERE account_code=?", (code,))
-    sub = _scalar(conn, subledger_sql)
-    delta = gl - sub
-    report.add(f"control {code} {label}", "accounting",
-               PASS if abs(delta) <= TOLERANCE else WARN,
-               f"GL {gl:,.2f} vs {subledger_name} {sub:,.2f} — delta {delta:,.2f}")
-
-
 # --------------------------------------------------------------------------- #
 # Phase 4 readiness
 # --------------------------------------------------------------------------- #
@@ -565,8 +415,6 @@ def verify(target, quick=False):
     _check_schema(conn, report)
     _check_referential(conn, report)
     _check_accounting(conn, report)
-    _check_projection(conn, report)
-    _check_periods(conn, report)
     _check_phase4_readiness(conn, report)
     return report
 

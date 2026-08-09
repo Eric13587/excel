@@ -138,9 +138,9 @@ def test_expected_indexes_exist(journal):
                      "idx_loans_individual", "idx_loans_status_due",
                      "idx_savings_individual_date", "idx_christmas_individual_date",
                      "idx_benevolent_individual_date", "idx_suspensions_individual",
-                     "idx_journal_entries_date", "idx_individuals_name_nocase",
+                     "idx_individuals_name_nocase",
                      "idx_audit_ts", "idx_loans_member_ref",
-                     "idx_journal_entries_source_ref"):
+                     ):
         assert expected in names, f"missing index {expected}"
 
 
@@ -155,23 +155,6 @@ def test_loan_ref_is_unique_per_member(journal):
     journal.conn.commit()
     with pytest.raises(sqlite3.IntegrityError):
         cur.execute(ins, (a, 200))
-
-
-def test_journal_source_ref_cannot_double_post(journal):
-    cur = journal.conn.cursor()
-    cur.execute("INSERT INTO journal_entries (entry_date, source, source_ref) "
-                "VALUES ('2026-01-01', 'repayment', 'ledger:1')")
-    journal.conn.commit()
-    with pytest.raises(sqlite3.IntegrityError):
-        cur.execute("INSERT INTO journal_entries (entry_date, source, source_ref) "
-                    "VALUES ('2026-01-01', 'repayment', 'ledger:1')")
-    journal.conn.rollback()
-    # Manual entries carry no source_ref and must still be freely insertable.
-    cur.execute("INSERT INTO journal_entries (entry_date, source, source_ref) "
-                "VALUES ('2026-01-01', 'manual', NULL)")
-    cur.execute("INSERT INTO journal_entries (entry_date, source, source_ref) "
-                "VALUES ('2026-01-01', 'manual', NULL)")
-    journal.conn.commit()
 
 
 def test_cascade_does_not_touch_other_members(journal):
@@ -315,9 +298,6 @@ def test_strict_schema_rejects_bad_writes(journal):
          "VALUES (?, 'L-ZZ', 'Frozen', '2026-01-01')", (ind,)),
         ("loan with no start date",
          "INSERT INTO loans (individual_id, ref, status) VALUES (?, 'L-YY', 'Active')", (ind,)),
-        ("one-sided journal line",
-         "INSERT INTO journal_lines (entry_id, account_code, debit, credit) "
-         "VALUES (1, '1000', 5, 5)", ()),
     ):
         with pytest.raises(sqlite3.IntegrityError):
             cur.execute(sql, params)

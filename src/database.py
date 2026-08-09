@@ -13,11 +13,9 @@ logger = logging.getLogger(__name__)
 from src import migrations
 from src.db import import_rules
 from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
-                    JournalRepository, LedgerRepository, LoanRepository,
-                    MemberRepository, PeriodRepository, RepairRepository,
-                    SettingsRepository, SnapshotRepository, SourceJournal)
-from src.exceptions import (PERIOD_LOCK_MARKER, PeriodClosedError,
-                            TransactionError)
+                    LedgerRepository, LoanRepository, MemberRepository,
+                    RepairRepository, SettingsRepository, SourceJournal)
+from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
 # How many timestamped on-open backups to keep per journal.
@@ -66,8 +64,6 @@ class DatabaseManager:
         db.ledger     ledger
         db.funds      savings, christmas_savings, benevolent_ledger,
                       benevolent_accounts
-        db.journal    chart_of_accounts, journal_entries, journal_lines,
-                      general_ledger
         db.settings   settings
         db.imports    import_history
         db.audit      audit_log
@@ -109,12 +105,6 @@ class DatabaseManager:
         if pre_existing:
             self._check_integrity()
         self._configure_connection()
-        # Optional write-path hooks: called with a list of just-inserted row ids
-        # after a ledger/savings insert, so the general ledger can post the
-        # matching journals live (see GLService.post_ledger_rows). Left as None
-        # in tests / headless contexts; a failing hook never breaks the insert.
-        self.ledger_post_hook = None
-        self.savings_post_hook = None
         # Repository layer (Phase 2). DatabaseManager delegates to these as each
         # one lands, so its public API is unchanged for existing callers.
         self.settings = SettingsRepository(self.conn)
@@ -122,12 +112,9 @@ class DatabaseManager:
         self.funds = FundRepository(self.conn)
         self.loans = LoanRepository(self.conn)
         self.ledger = LedgerRepository(self.conn)
-        self.journal = JournalRepository(self.conn)
         self.repair = RepairRepository(self.conn)
         self.imports = ImportHistoryRepository(self.conn)
         self.audit = AuditRepository(self.conn)
-        self.periods = PeriodRepository(self.conn)
-        self.snapshots = SnapshotRepository(self.conn)
         if bootstrap == "auto" and self._is_empty_journal():
             # A brand-new journal is built in its final shape. The legacy path
             # below creates the pre-migration tables and then has migration 004
@@ -428,14 +415,6 @@ class DatabaseManager:
         self._evaluate_foreign_keys()
         return counts
 
-    def _fire_post_hook(self, hook, ids):
-        """Invoke a write-path hook defensively — never break the core write."""
-        if hook and ids:
-            try:
-                hook(ids)
-            except Exception as e:
-                logger.warning("GL post hook failed (will reconcile on next sync): %s", e)
-    
     def close(self):
         """Close the database connection.
 
@@ -518,12 +497,6 @@ class DatabaseManager:
             self.conn.commit()
         except sqlite3.Error as e:
             self.conn.rollback()
-            # The period lock (migration 009) is enforced by triggers, so every
-            # write path hits it — including ones that never reach a service.
-            # Translating it here once means the caller gets an exception that
-            # says what to do instead of a generic transaction failure.
-            if PERIOD_LOCK_MARKER in str(e):
-                raise PeriodClosedError.from_trigger(str(e)) from e
             raise TransactionError(f"Transaction failed: {str(e)}") from e
         except Exception:
             self.conn.rollback()
@@ -582,11 +555,6 @@ class DatabaseManager:
         Shared by both bootstrap paths, so a new journal cannot end up with the
         schema but not the chart of accounts or the default settings.
         """
-        from src.config import DEFAULT_CHART_OF_ACCOUNTS
-        cursor.executemany(
-            "INSERT OR IGNORE INTO chart_of_accounts (code, name, type, normal_balance) "
-            "VALUES (?, ?, ?, ?)", DEFAULT_CHART_OF_ACCOUNTS)
-
         for filename in self._SEED_MIGRATIONS:
             path = os.path.join(migrations.migrations_dir(), filename)
             try:
@@ -597,6 +565,65 @@ class DatabaseManager:
                 continue
             for statement in statements:
                 cursor.execute(statement)
+
+    def _general_ledger_removed(self):
+        """True once migration 011 has withdrawn the general ledger."""
+        try:
+            return self.conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE version >= 11 LIMIT 1"
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            return False        # pre-migration journal: nothing recorded yet
+
+    def _create_legacy_gl_tables(self, cursor):
+        """The general-ledger tables as migrations 001 and 004 expect them.
+
+        Retained only so already-applied history runs unmodified on a new
+        journal; migration 011 drops all of it a moment later.
+        """
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS general_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT, category TEXT, type TEXT, amount REAL,
+                notes TEXT, batch_id TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chart_of_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                normal_balance TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                description TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS journal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_date TEXT NOT NULL,
+                memo TEXT, source TEXT, source_ref TEXT,
+                status TEXT DEFAULT 'posted',
+                reversal_of INTEGER, created_at TEXT, created_by TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS journal_lines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                account_code TEXT NOT NULL,
+                debit REAL DEFAULT 0, credit REAL DEFAULT 0, line_memo TEXT,
+                FOREIGN KEY(entry_id) REFERENCES journal_entries(id),
+                FOREIGN KEY(account_code) REFERENCES chart_of_accounts(code)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_entry "
+                       "ON journal_lines(entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_account "
+                       "ON journal_lines(account_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_source "
+                       "ON journal_entries(source, source_ref)")
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -896,69 +923,19 @@ class DatabaseManager:
             )
         """)
         
-        # Legacy single-entry treasury table — FROZEN. No longer written to;
-        # retained so GLService.migrate_legacy_gl can convert any historical
-        # rows into balanced double-entry journals. New treasury activity is
-        # posted via journal_entries/journal_lines.
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS general_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                category TEXT,
-                type TEXT,
-                amount REAL,
-                notes TEXT,
-                batch_id TEXT
-            )
-        """)
+        # ----------------------------------------------------------------- #
+        # General-ledger tables, created only so the already-applied history
+        # in migrations 001 and 004 can run over them; 011 drops them again.
+        #
+        # Skipped once 011 has run. create_tables executes on *every* open, so
+        # without this guard each reopen would resurrect the tables that
+        # migration had just dropped — and 011, already recorded as applied,
+        # would never run again to clear them.
+        # ----------------------------------------------------------------- #
+        if not self._general_ledger_removed():
+            self._create_legacy_gl_tables(cursor)
 
-        # ===== Double-entry General Ledger =====
-        # chart_of_accounts is the account master; journal_entries are balanced
-        # transaction headers; journal_lines carry the debit/credit detail. Every
-        # posted entry satisfies SUM(debit) == SUM(credit), so the books balance
-        # by construction (enforced in GLService.post_journal, not the schema).
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chart_of_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,            -- Asset|Liability|Equity|Income|Expense
-                normal_balance TEXT NOT NULL,  -- 'debit' | 'credit'
-                is_active INTEGER DEFAULT 1,
-                description TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS journal_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_date TEXT NOT NULL,
-                memo TEXT,
-                source TEXT,            -- manual|loan_disbursement|repayment|savings|interest|migration|backfill
-                source_ref TEXT,        -- link back to the originating subledger row (idempotency key)
-                status TEXT DEFAULT 'posted',  -- posted|reversed|reversal
-                reversal_of INTEGER,    -- journal_entries.id this reverses, if any
-                created_at TEXT,
-                created_by TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS journal_lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_id INTEGER NOT NULL,
-                account_code TEXT NOT NULL,
-                debit REAL DEFAULT 0,
-                credit REAL DEFAULT 0,
-                line_memo TEXT,
-                FOREIGN KEY(entry_id) REFERENCES journal_entries(id),
-                FOREIGN KEY(account_code) REFERENCES chart_of_accounts(code)
-            )
-        """)
-        # Indexes for the hot lookups (posting balance checks, trial balance).
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_entry ON journal_lines(entry_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_code)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_source ON journal_entries(source, source_ref)")
 
-        # Seed the standard chart of accounts (idempotent — UNIQUE code + IGNORE).
         self._seed_reference_data(cursor)
 
         # Normalise a legacy corruption where an edited repayment stored the
@@ -1353,7 +1330,6 @@ class DatabaseManager:
                 installment_amount, interest_amount, batch_id,
                 principal_balance, interest_balance, principal_portion, interest_portion,
                 previous_state))
-        self._fire_post_hook(self.ledger_post_hook, [new_id])
         return new_id
 
     def bulk_insert_transactions(self, transactions):
@@ -1369,15 +1345,8 @@ class DatabaseManager:
             ("principal_portion", 0), ("interest_portion", 0), ("previous_state", None)))
             for tx in transactions]
 
-        # lastrowid is unreliable after executemany; if a GL hook is registered,
-        # snapshot the max id first and read back the new rows afterwards.
-        prev_max = self.ledger.max_id() if self.ledger_post_hook else None
-
         with self.transaction():
             self.ledger.add_many(rows)
-
-        if prev_max is not None:
-            self._fire_post_hook(self.ledger_post_hook, self.ledger.ids_above(prev_max))
 
     def update_transaction(self, id, date, added, deducted, notes, principal_portion=None,
                            interest_portion=None, mark_edited=False, interest_amount=None):
@@ -1647,9 +1616,8 @@ class DatabaseManager:
             new_balance = current_balance - amount
         
         with self.transaction():
-            new_id = self.funds.add("savings", individual_id, date, transaction_type,
-                                    amount, new_balance, notes, batch_id)
-        self._fire_post_hook(self.savings_post_hook, [new_id])
+            self.funds.add("savings", individual_id, date, transaction_type,
+                           amount, new_balance, notes, batch_id)
         return new_balance
     
     def get_savings_balance(self, individual_id):
@@ -1709,11 +1677,7 @@ class DatabaseManager:
         """Append a fund transaction with a running balance. Withdrawals reduce
         the balance; everything else (Deposit/Contribution/Interest) increases it.
 
-        Unlike add_savings_transaction this fires no Python post hook. Since
-        migration 005 it does not need one: the gl_outbox triggers record the
-        write, so Christmas and Benevolent activity reaches the books on the
-        next GLService.sync() like everything else.
-        """
+"""
         current = self.fund_balance(table, individual_id)
         new_balance = round(current - amount, 2) if transaction_type == "Withdrawal" \
             else round(current + amount, 2)
@@ -2372,11 +2336,3 @@ class DatabaseManager:
         """
         return SourceJournal.validate(source_path)
 
-    # ==========================================
-    # Treasury / General Ledger
-    # ==========================================
-    # The single-entry general_ledger API (add/get/delete) has been retired in
-    # favour of the double-entry ledger (see GLService). The general_ledger
-    # table is kept read-only as a historical source that GLService.migrate_
-    # legacy_gl converts into balanced journals; new treasury activity is posted
-    # as journal entries through the Treasury dialog.

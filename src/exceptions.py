@@ -104,32 +104,6 @@ class LoanSuspendedError(LoanMasterError):
         super().__init__(message, details)
 
 
-class UnbalancedJournalError(LoanMasterError):
-    """Raised when a journal entry's debits do not equal its credits."""
-
-    def __init__(self, total_debit: float, total_credit: float):
-        details = {
-            'total_debit': round(total_debit, 2),
-            'total_credit': round(total_credit, 2),
-            'difference': round(total_debit - total_credit, 2),
-        }
-        message = (
-            f"Journal does not balance: debits {total_debit:,.2f} "
-            f"!= credits {total_credit:,.2f}"
-        )
-        super().__init__(message, details)
-
-
-class UnknownAccountError(LoanMasterError):
-    """Raised when a journal line references an account not in the chart."""
-
-    def __init__(self, account_code: str):
-        super().__init__(
-            f"Account '{account_code}' is not in the chart of accounts",
-            {'account_code': account_code},
-        )
-
-
 class ChristmasLockedError(LoanMasterError):
     """Raised when a Christmas-fund withdrawal is attempted outside the unlock month."""
 
@@ -138,75 +112,4 @@ class ChristmasLockedError(LoanMasterError):
         super().__init__(
             f"Christmas withdrawals are locked until {month_name}",
             {'unlock_month': unlock_month},
-        )
-
-
-class ImmutableEntryError(LoanMasterError):
-    """Raised when a posted journal entry is altered instead of reversed.
-
-    A posted entry is a statement about what the books said at a point in time.
-    Correcting it by editing it destroys that statement; correcting it by
-    posting the inverse leaves both on the record. This is the Python-side
-    guard — migration 006 enforces the same rule with database triggers, so it
-    holds for a code path that never reaches :class:`GLService`.
-    """
-
-    def __init__(self, entry_id: int, reason: str):
-        super().__init__(
-            f"Journal entry #{entry_id} cannot be altered: {reason}",
-            {'entry_id': entry_id, 'reason': reason},
-        )
-
-
-# The phrase every migration-009 trigger ends its RAISE(ABORT) message with.
-# It is the contract that lets DatabaseManager.transaction turn a trigger abort
-# into PeriodClosedError; change it in one place and you change it in both.
-PERIOD_LOCK_MARKER = "closed fiscal period"
-
-
-class PeriodClosedError(LoanMasterError):
-    """Raised when a write lands in a fiscal period that has been closed.
-
-    A closed period means the figures published for it are the figures. The
-    correction for a mistake found afterwards is an entry in an open period,
-    not a change to a settled one.
-    """
-
-    ADVICE = "Post the correction in an open period instead."
-
-    def __init__(self, date: str = None, period_label: str = None,
-                 what: str = "This entry"):
-        if date and period_label:
-            message = (f"{what} is dated {date}, which falls in {period_label} "
-                       f"— a closed fiscal period. {self.ADVICE}")
-        else:
-            message = (f"{what} falls in a closed fiscal period. {self.ADVICE}")
-        super().__init__(message, {'date': date, 'period': period_label})
-
-    @classmethod
-    def from_trigger(cls, sqlite_message: str):
-        """Build one from a migration-009 trigger abort.
-
-        The trigger knows the date is locked but not which entry the caller was
-        writing, so the message stays general and carries the advice that
-        matters.
-        """
-        err = cls(what="That change")
-        err.details['sqlite'] = sqlite_message
-        return err
-
-
-class PeriodNotClosableError(LoanMasterError):
-    """Raised when a period is not in a state where closing it is meaningful.
-
-    Closing freezes the figures, so it is refused while they are still moving
-    (unposted subledger changes, an earlier period still open) or still wrong
-    (the trial balance does not balance as at the period end).
-    """
-
-    def __init__(self, period: dict, blockers: list):
-        label = period.get('label', 'This period') if period else 'This period'
-        super().__init__(
-            f"{label} cannot be closed:\n  - " + "\n  - ".join(blockers),
-            {'period': label, 'blockers': blockers},
         )

@@ -66,8 +66,7 @@ def test_a_new_journal_has_the_same_reference_data_as_a_migrated_one():
     as applied but never inserted. Right shape, wrong contents."""
     fast, legacy = _journal("auto"), _journal("legacy")
     try:
-        for table, columns in (("settings", "key, value"),
-                               ("chart_of_accounts", "code, name, type, normal_balance")):
+        for table, columns in (("settings", "key, value"),):
             rows = [sorted(db.conn.execute(
                 f"SELECT {columns} FROM {table}").fetchall()) for db in (fast, legacy)]
             assert rows[0] == rows[1], f"{table} differs between the two paths"
@@ -78,13 +77,10 @@ def test_a_new_journal_has_the_same_reference_data_as_a_migrated_one():
 
 
 def test_a_new_journal_is_seeded_and_usable():
-    """Schema without the chart of accounts is a journal that cannot post."""
+    """Settings the application cannot run without, and a usable member."""
     db = _journal("auto")
     try:
-        from src.config import DEFAULT_CHART_OF_ACCOUNTS
-        assert db.conn.execute(
-            "SELECT COUNT(*) FROM chart_of_accounts").fetchone()[0] == len(
-                DEFAULT_CHART_OF_ACCOUNTS)
+        assert db.settings.fy_start_month
         ind = db.add_individual("New", "07", "n@x")
         db.add_savings_transaction(ind, "2026-01-01", "Deposit", 100, "")
         assert db.get_savings_balance(ind) == 100
@@ -114,14 +110,26 @@ def test_the_generated_schema_is_committed_and_current():
         f"{dump_schema.OUTPUT} is stale — run: python -m tools.dump_schema")
 
 
+def test_the_general_ledger_is_gone():
+    """Migration 011 withdrew it. The tables are created by the legacy
+    bootstrap so migrations 001 and 004 still run unmodified, then dropped —
+    so a finished journal must hold none of them."""
+    schema = dump_schema.current_schema()
+    for table in ("chart_of_accounts", "journal_entries", "journal_lines",
+                  "general_ledger", "gl_outbox", "fiscal_periods",
+                  "account_snapshots"):
+        assert f"CREATE TABLE {table}" not in schema, f"{table} survived migration 011"
+    for prefix in ("trg_outbox_", "trg_journal_", "trg_period_lock_",
+                   "trg_fiscal_periods_"):
+        assert prefix not in schema, f"{prefix}* triggers survived migration 011"
+
+
 def test_every_table_the_migrations_create_is_present():
     schema = dump_schema.current_schema()
     for table in ("individuals", "loans", "ledger", "savings", "christmas_savings",
                   "benevolent_ledger", "benevolent_accounts", "loan_suspensions",
-                  "chart_of_accounts", "journal_entries", "journal_lines",
-                  "general_ledger", "audit_log", "settings", "import_history",
-                  "schema_migrations", "gl_outbox", "fiscal_periods",
-                  "account_snapshots"):
+                  "audit_log", "settings", "import_history",
+                  "schema_migrations"):
         assert f"CREATE TABLE {table}" in schema or f'CREATE TABLE "{table}"' in schema, \
             f"{table} is missing from the generated schema"
 
@@ -131,11 +139,7 @@ def test_the_trigger_families_are_all_installed():
     exactly the failure mode a table rebuild causes."""
     schema = dump_schema.current_schema()
     for prefix, expected, what in (
-            ("trg_outbox_", 12, "GL change queue (005)"),
-            ("trg_audit_", 13, "audit trail (007)"),
-            ("trg_journal_", 4, "journal immutability (006)"),
-            ("trg_period_lock_", 13, "fiscal-period lock (009)"),
-            ("trg_fiscal_periods_", 3, "period register integrity (008)")):
+            ("trg_audit_", 13, "audit trail (007)"),):
         found = schema.count(f"CREATE TRIGGER {prefix}")
         assert found == expected, f"{what}: expected {expected} triggers, found {found}"
 
@@ -155,6 +159,6 @@ def test_a_corrupt_bootstrap_file_falls_back_instead_of_failing(monkeypatch, tmp
         assert db.migration_report.ok
         assert migrations.schema_version(db.conn) == max(
             v for v, _, _ in migrations.discover())
-        assert db.conn.execute("SELECT COUNT(*) FROM chart_of_accounts").fetchone()[0] > 0
+        assert db.settings.fy_start_month
     finally:
         db.close()

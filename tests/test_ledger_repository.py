@@ -132,40 +132,6 @@ def test_get_recent_quarters_reads_the_earliest_date(journal):
     assert quarters[0] < quarters[-1]
 
 
-# --------------------------------------------------------------------------- #
-# Writes
-# --------------------------------------------------------------------------- #
-
-def test_add_returns_the_new_id_and_fires_the_hook(journal):
-    fired = []
-    journal.ledger_post_hook = fired.extend
-    ind = _member(journal)
-    row_id = _row(journal, ind, "2026-01-01")
-    assert journal.get_transaction(row_id)["date"] == "2026-01-01"
-    assert fired == [row_id]
-
-
-def test_bulk_insert_reports_its_id_range_to_the_hook(journal):
-    """lastrowid is unreliable after executemany, so the hook is handed the
-    ids above a pre-insert snapshot of MAX(id)."""
-    fired = []
-    journal.ledger_post_hook = fired.extend
-    ind = _member(journal)
-    existing = _row(journal, ind, "2026-01-01")
-    fired.clear()
-
-    journal.bulk_insert_transactions([
-        {"individual_id": ind, "date": "2026-02-01", "event_type": "Repayment",
-         "loan_id": "L-001", "deducted": 100},
-        {"individual_id": ind, "date": "2026-03-01", "event_type": "Repayment",
-         "loan_id": "L-001", "deducted": 100},
-    ])
-
-    assert len(fired) == 2
-    assert all(i > existing for i in fired)
-    assert len(journal.get_ledger(ind)) == 3
-
-
 def test_bulk_insert_of_nothing_is_a_noop(journal):
     journal.bulk_insert_transactions([])
 

@@ -15,11 +15,10 @@ Entry point is `loan.py`; the package is imported as `src.*`.
 (idempotent ALTERs in `create_tables`). `src/engine.py` (LoanEngine) is a
 facade over `src/services/*` where business logic lives. `src/views/*` are
 the PyQt6 screens; they call the engine, not the DB, for writes.
-`GLService` projects member activity into the double-entry general ledger:
-write-path hooks (`db.ledger_post_hook` / `db.savings_post_hook`) post
-immediately, and the `gl_outbox` triggers record every subledger change so
-`GLService.sync()` applies only what moved. `sync(full=True)` re-derives
-everything (Treasury → Rebuild Ledger).
+There is no general ledger. The double-entry GL, the Treasury screen, fiscal
+periods and period-end snapshots were withdrawn in migration 011; `ledger`,
+`savings`, `christmas_savings` and `benevolent_ledger` are the record of member
+money, and `loans.balance` is derived from `ledger` by `BalanceRecalculator`.
 
 ## Rules of the road
 

@@ -234,11 +234,17 @@ def test_the_connection_survives_a_restore(db):
 
 
 def test_restoring_an_older_schema_re_applies_migrations(db, tmp_path):
-    """A backup may predate the current code."""
+    """A backup may predate the current code.
+
+    Only the newest migration is rewound. Migrations are history and are not
+    re-runnable out of order — 008-010 build general-ledger objects that 011
+    has since dropped — so a real backup carries the schema of its own moment
+    and is brought forward from there, which is what this covers.
+    """
     legacy = str(tmp_path / "legacy.db")
     old = DatabaseManager(legacy, auto_backup=False, bootstrap="legacy")
     old.add_individual("Legacy", "07", "l@x")
-    old.conn.execute("DELETE FROM schema_migrations WHERE version >= 8")
+    old.conn.execute("DELETE FROM schema_migrations WHERE version >= 11")
     old.conn.commit()
     old.close()
 

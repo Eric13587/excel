@@ -23,17 +23,6 @@
 
 
 -- ---------- tables ----------
-CREATE TABLE account_snapshots (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    period_id       INTEGER NOT NULL REFERENCES fiscal_periods(id) ON DELETE CASCADE,
-    account_code    TEXT    NOT NULL REFERENCES chart_of_accounts(code),
-    as_of           TEXT    NOT NULL,
-    debit_total     REAL    NOT NULL,
-    credit_total    REAL    NOT NULL,
-    closing_balance REAL    NOT NULL,
-    created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (period_id, account_code)
-);
 CREATE TABLE "audit_log" (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -70,16 +59,6 @@ CREATE TABLE "benevolent_ledger" (
     batch_id         TEXT,
     created_at       TEXT
 );
-CREATE TABLE "chart_of_accounts" (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    code           TEXT    NOT NULL UNIQUE CHECK (code GLOB '[0-9]*'),
-    name           TEXT    NOT NULL,
-    type           TEXT    NOT NULL CHECK (type IN
-                           ('Asset','Liability','Equity','Income','Expense')),
-    normal_balance TEXT    NOT NULL CHECK (normal_balance IN ('debit','credit')),
-    is_active      INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
-    description    TEXT
-);
 CREATE TABLE "christmas_savings" (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     individual_id    INTEGER NOT NULL REFERENCES individuals(id)
@@ -93,36 +72,6 @@ CREATE TABLE "christmas_savings" (
     notes            TEXT    NOT NULL DEFAULT '',
     batch_id         TEXT,
     created_at       TEXT
-);
-CREATE TABLE fiscal_periods (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    label      TEXT    NOT NULL UNIQUE,
-    start_date TEXT    NOT NULL,
-    end_date   TEXT    NOT NULL,
-    status     TEXT    NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
-    closed_at  TEXT,
-    closed_by  TEXT,
-    note       TEXT,
-    CHECK (end_date >= start_date),
-    CHECK (date(start_date) IS NOT NULL AND date(end_date) IS NOT NULL),
-    -- A closed period records when it was closed; an open one has not been.
-    CHECK ((status = 'closed' AND closed_at IS NOT NULL)
-        OR (status = 'open'   AND closed_at IS NULL))
-);
-CREATE TABLE general_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                category TEXT,
-                type TEXT,
-                amount REAL,
-                notes TEXT,
-                batch_id TEXT
-            );
-CREATE TABLE gl_outbox (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_table TEXT    NOT NULL,
-    row_id       INTEGER NOT NULL,
-    queued_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE "import_history" (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,34 +96,6 @@ CREATE TABLE "individuals" (
     updated_at        TEXT,
     CHECK ((is_retired = 0 AND retired_date IS NULL)
         OR (is_retired = 1 AND retired_date IS NOT NULL))
-);
-CREATE TABLE "journal_entries" (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_date  TEXT    NOT NULL
-                        CHECK (entry_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'),
-    memo        TEXT,
-    source      TEXT    NOT NULL DEFAULT 'manual' CHECK (source IN
-                        ('manual','loan_disbursement','repayment','interest','savings',
-                         'christmas','benevolent','provision','reversal','migration','backfill')),
-    source_ref  TEXT,
-    status      TEXT    NOT NULL DEFAULT 'posted'
-                        CHECK (status IN ('posted','reversed','reversal')),
-    reversal_of INTEGER REFERENCES journal_entries(id) ON UPDATE CASCADE ON DELETE RESTRICT,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-    created_by  TEXT,
-    CHECK ((status = 'reversal' AND reversal_of IS NOT NULL)
-        OR (status <> 'reversal' AND reversal_of IS NULL))
-);
-CREATE TABLE "journal_lines" (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    entry_id     INTEGER NOT NULL REFERENCES journal_entries(id)
-                         ON UPDATE CASCADE ON DELETE CASCADE,
-    account_code TEXT    NOT NULL REFERENCES chart_of_accounts(code)
-                         ON UPDATE CASCADE ON DELETE RESTRICT,
-    debit        REAL    NOT NULL DEFAULT 0 CHECK (debit >= 0),
-    credit       REAL    NOT NULL DEFAULT 0 CHECK (credit >= 0),
-    line_memo    TEXT,
-    CHECK ((debit = 0) <> (credit = 0))
 );
 CREATE TABLE "ledger" (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,29 +201,18 @@ CREATE TABLE settings (
             );
 
 -- ---------- indexs ----------
-CREATE INDEX idx_account_snapshots_as_of
-    ON account_snapshots(as_of, account_code);
 CREATE INDEX idx_audit_entity ON audit_log(entity, entity_id);
 CREATE INDEX idx_audit_ts ON audit_log(ts);
 CREATE INDEX idx_benevolent_batch ON benevolent_ledger(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX idx_benevolent_individual_date ON benevolent_ledger(individual_id, date, id);
 CREATE INDEX idx_christmas_batch ON christmas_savings(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX idx_christmas_individual_date ON christmas_savings(individual_id, date, id);
-CREATE INDEX idx_fiscal_periods_range ON fiscal_periods(start_date, end_date);
-CREATE INDEX idx_fiscal_periods_status ON fiscal_periods(status);
-CREATE INDEX idx_gl_outbox_table_row ON gl_outbox(source_table, row_id);
 CREATE UNIQUE INDEX idx_individuals_id_no ON individuals(id_no)
     WHERE id_no IS NOT NULL AND id_no != '';
 CREATE INDEX idx_individuals_import ON individuals(import_id);
 CREATE INDEX idx_individuals_name_nocase ON individuals(name COLLATE NOCASE);
 CREATE UNIQUE INDEX idx_individuals_pf_no ON individuals(pf_no)
     WHERE pf_no IS NOT NULL AND pf_no != '';
-CREATE INDEX idx_journal_entries_date ON journal_entries(entry_date, id);
-CREATE INDEX idx_journal_entries_source ON journal_entries(source, source_ref);
-CREATE UNIQUE INDEX idx_journal_entries_source_ref
-    ON journal_entries(source, source_ref) WHERE source_ref IS NOT NULL;
-CREATE INDEX idx_journal_lines_account ON journal_lines(account_code);
-CREATE INDEX idx_journal_lines_entry ON journal_lines(entry_id);
 CREATE INDEX idx_ledger_batch ON ledger(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX idx_ledger_date ON ledger(date, id);
 CREATE INDEX idx_ledger_import ON ledger(import_id) WHERE import_id IS NOT NULL;
@@ -423,61 +333,8 @@ END;
 CREATE TRIGGER trg_benev_created AFTER INSERT ON benevolent_ledger
 WHEN NEW.created_at IS NULL
 BEGIN UPDATE benevolent_ledger SET created_at = datetime('now') WHERE id = NEW.id; END;
-CREATE TRIGGER trg_fiscal_periods_closed_range_frozen
-BEFORE UPDATE OF start_date, end_date, label ON fiscal_periods
-WHEN OLD.status = 'closed'
-BEGIN
-    SELECT RAISE(ABORT, 'a closed period cannot be redrawn — reopen it first');
-END;
-CREATE TRIGGER trg_fiscal_periods_no_overlap_ins
-BEFORE INSERT ON fiscal_periods
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p
-              WHERE p.start_date <= NEW.end_date
-                AND p.end_date   >= NEW.start_date)
-BEGIN
-    SELECT RAISE(ABORT, 'fiscal periods may not overlap');
-END;
-CREATE TRIGGER trg_fiscal_periods_no_overlap_upd
-BEFORE UPDATE OF start_date, end_date ON fiscal_periods
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p
-              WHERE p.id <> OLD.id
-                AND p.start_date <= NEW.end_date
-                AND p.end_date   >= NEW.start_date)
-BEGIN
-    SELECT RAISE(ABORT, 'fiscal periods may not overlap');
-END;
 CREATE TRIGGER trg_individuals_updated AFTER UPDATE ON individuals
 BEGIN UPDATE individuals SET updated_at = datetime('now') WHERE id = NEW.id; END;
-CREATE TRIGGER trg_journal_entry_immutable_del
-BEFORE DELETE ON journal_entries
-WHEN OLD.source NOT IN ('loan_disbursement','repayment','interest',
-                        'savings','christmas','benevolent')
-BEGIN
-    SELECT RAISE(ABORT, 'posted journal entries cannot be deleted — post a reversal instead');
-END;
-CREATE TRIGGER trg_journal_entry_immutable_upd
-BEFORE UPDATE OF entry_date, memo, source, source_ref ON journal_entries
-WHEN OLD.source NOT IN ('loan_disbursement','repayment','interest',
-                        'savings','christmas','benevolent')
-BEGIN
-    SELECT RAISE(ABORT, 'posted journal entries are immutable — post a reversal instead');
-END;
-CREATE TRIGGER trg_journal_line_immutable_del
-BEFORE DELETE ON journal_lines
-WHEN (SELECT e.source FROM journal_entries e WHERE e.id = OLD.entry_id)
-     NOT IN ('loan_disbursement','repayment','interest',
-             'savings','christmas','benevolent')
-BEGIN
-    SELECT RAISE(ABORT, 'posted journal lines cannot be deleted — post a reversal instead');
-END;
-CREATE TRIGGER trg_journal_line_immutable_upd
-BEFORE UPDATE ON journal_lines
-WHEN (SELECT e.source FROM journal_entries e WHERE e.id = OLD.entry_id)
-     NOT IN ('loan_disbursement','repayment','interest',
-             'savings','christmas','benevolent')
-BEGIN
-    SELECT RAISE(ABORT, 'posted journal lines are immutable — post a reversal instead');
-END;
 CREATE TRIGGER trg_ledger_loan_pk AFTER INSERT ON ledger
 WHEN NEW.loan_pk IS NULL
 BEGIN
@@ -491,148 +348,6 @@ WHEN NEW.created_at IS NULL
 BEGIN UPDATE loans SET created_at = datetime('now') WHERE id = NEW.id; END;
 CREATE TRIGGER trg_loans_updated AFTER UPDATE ON loans
 BEGIN UPDATE loans SET updated_at = datetime('now') WHERE id = NEW.id; END;
-CREATE TRIGGER trg_outbox_benevolent_del AFTER DELETE ON benevolent_ledger
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('benevolent_ledger', OLD.id);
-END;
-CREATE TRIGGER trg_outbox_benevolent_ins AFTER INSERT ON benevolent_ledger
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('benevolent_ledger', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_benevolent_upd AFTER UPDATE OF
-    date, transaction_type, amount ON benevolent_ledger
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('benevolent_ledger', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_christmas_del AFTER DELETE ON christmas_savings
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('christmas_savings', OLD.id);
-END;
-CREATE TRIGGER trg_outbox_christmas_ins AFTER INSERT ON christmas_savings
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('christmas_savings', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_christmas_upd AFTER UPDATE OF
-    date, transaction_type, amount ON christmas_savings
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('christmas_savings', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_ledger_del AFTER DELETE ON ledger
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('ledger', OLD.id);
-END;
-CREATE TRIGGER trg_outbox_ledger_ins AFTER INSERT ON ledger
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('ledger', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_ledger_upd AFTER UPDATE OF
-    date, event_type, added, deducted, principal_portion, interest_portion,
-    interest_amount ON ledger
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('ledger', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_savings_del AFTER DELETE ON savings
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('savings', OLD.id);
-END;
-CREATE TRIGGER trg_outbox_savings_ins AFTER INSERT ON savings
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('savings', NEW.id);
-END;
-CREATE TRIGGER trg_outbox_savings_upd AFTER UPDATE OF
-    date, transaction_type, amount ON savings
-BEGIN
-    INSERT INTO gl_outbox (source_table, row_id) VALUES ('savings', NEW.id);
-END;
-CREATE TRIGGER trg_period_lock_benevolent_del BEFORE DELETE ON benevolent_ledger
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND OLD.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_benevolent_ins BEFORE INSERT ON benevolent_ledger
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND NEW.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that date falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_benevolent_upd BEFORE UPDATE OF
-    date, transaction_type, amount ON benevolent_ledger
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND (OLD.date BETWEEN p.start_date AND p.end_date
-                OR NEW.date BETWEEN p.start_date AND p.end_date))
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_christmas_del BEFORE DELETE ON christmas_savings
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND OLD.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_christmas_ins BEFORE INSERT ON christmas_savings
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND NEW.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that date falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_christmas_upd BEFORE UPDATE OF
-    date, transaction_type, amount ON christmas_savings
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND (OLD.date BETWEEN p.start_date AND p.end_date
-                OR NEW.date BETWEEN p.start_date AND p.end_date))
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_journal_ins BEFORE INSERT ON journal_entries
-WHEN NEW.source NOT IN ('loan_disbursement','repayment','interest',
-                        'savings','christmas','benevolent')
- AND EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND NEW.entry_date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that date falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_ledger_del BEFORE DELETE ON ledger
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND OLD.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_ledger_ins BEFORE INSERT ON ledger
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND NEW.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that date falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_ledger_upd BEFORE UPDATE OF
-    date, event_type, added, deducted, principal_portion, interest_portion,
-    interest_amount ON ledger
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND (OLD.date BETWEEN p.start_date AND p.end_date
-                OR NEW.date BETWEEN p.start_date AND p.end_date))
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_savings_del BEFORE DELETE ON savings
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND OLD.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_savings_ins BEFORE INSERT ON savings
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND NEW.date BETWEEN p.start_date AND p.end_date)
-BEGIN
-    SELECT RAISE(ABORT, 'that date falls in a closed fiscal period');
-END;
-CREATE TRIGGER trg_period_lock_savings_upd BEFORE UPDATE OF
-    date, transaction_type, amount ON savings
-WHEN EXISTS (SELECT 1 FROM fiscal_periods p WHERE p.status='closed'
-              AND (OLD.date BETWEEN p.start_date AND p.end_date
-                OR NEW.date BETWEEN p.start_date AND p.end_date))
-BEGIN
-    SELECT RAISE(ABORT, 'that row falls in a closed fiscal period');
-END;
 CREATE TRIGGER trg_savings_created AFTER INSERT ON savings
 WHEN NEW.created_at IS NULL
 BEGIN UPDATE savings SET created_at = datetime('now') WHERE id = NEW.id; END;

@@ -129,16 +129,8 @@ class MainApp(QMainWindow):
                 f"{self.db.migration_report.summary()}\n\n"
                 "It has been opened on its existing schema and is safe to use, "
                 "but some integrity protections are not active.\n\n"
-                "Treasury \u2192 Health Check shows the details, and the Repair "
-                "tools under Mass Operations can fix most causes.")
-
-        # Live general-ledger posting: member loan/savings activity posts to the
-        # double-entry GL the moment it is written. Idempotent and defensive, so
-        # it never breaks a core write; edits/undos reconcile on the next sync.
-        from src.services.gl_service import GLService
-        self.gl = GLService(self.db)
-        self.db.ledger_post_hook = self.gl.post_ledger_rows
-        self.db.savings_post_hook = self.gl.post_savings_rows
+                "Mass Operations \u2192 Journal Health Check shows the details, and "
+                "the Repair tools there can fix most causes.")
 
         # Persistent date defaults
         self.last_operation_date = QDate.currentDate()

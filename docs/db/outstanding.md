@@ -150,7 +150,12 @@ Any future migration that carries data must be added to
 **Merged.** `main` carries the whole project as of the merge commit
 "Merge: database architecture migration, Phases 1-8". Not pushed — see C3.
 
-### C2. No fiscal period has been closed
+### C2. Fiscal periods — removed with the general ledger
+
+Superseded: migration 011 withdrew the GL, and fiscal periods and snapshots
+went with it. The original note follows for the record.
+
+#### (historical) No fiscal period has been closed
 
 Phases 7 and 8 are installed and inert. The period register is empty, so the
 lock never fires and no snapshot exists. That was deliberate — closing a period

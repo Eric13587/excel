@@ -10,7 +10,6 @@ the suite stays green at every step. Repositories added so far:
 
 * :class:`~src.db.fund.FundRepository` — ``savings``, ``christmas_savings``,
   ``benevolent_ledger`` and ``benevolent_accounts``.
-* :class:`~src.db.journal.JournalRepository` — the double-entry general ledger.
 * :class:`~src.db.repair.RepairRepository` — cross-table orphan queries.
 * :class:`~src.db.repair.ImportHistoryRepository` — ``import_history`` and undo.
 * :class:`~src.db.repair.AuditRepository` — the trigger-maintained ``audit_log``.
@@ -18,25 +17,21 @@ the suite stays green at every step. Repositories added so far:
 * :class:`~src.db.ledger.LedgerRepository` — the ``ledger`` subledger.
 * :class:`~src.db.loan.LoanRepository` — ``loans`` and ``loan_suspensions``.
 * :class:`~src.db.member.MemberRepository` — the ``individuals`` table.
-* :class:`~src.db.period.PeriodRepository` — the ``fiscal_periods`` register.
-* :class:`~src.db.period.SnapshotRepository` — period-end ``account_snapshots``.
 * :class:`~src.db.settings.SettingsRepository` — the ``settings`` table.
 
 See docs/db/repository-layer.md for the full sequencing.
 """
 from src.db.base import Repository
 from src.db.fund import FundRepository
-from src.db.journal import JournalRepository
 from src.db.ledger import LedgerPosition, LedgerRepository, position_from_frame
 from src.db.loan import LoanRepository
 from src.db.member import MemberRepository
-from src.db.period import PeriodRepository, SnapshotRepository
 from src.db.repair import AuditRepository, ImportHistoryRepository, RepairRepository
 from src.db.settings import SettingsRepository
 from src.db.source import SourceJournal
 
 __all__ = ["AuditRepository", "FundRepository", "ImportHistoryRepository",
-           "JournalRepository", "LedgerPosition", "position_from_frame",
+           "LedgerPosition", "position_from_frame",
            "LedgerRepository", "LoanRepository", "MemberRepository",
-           "PeriodRepository", "RepairRepository", "SnapshotRepository", "Repository", "SettingsRepository",
+           "RepairRepository", "Repository", "SettingsRepository",
            "SourceJournal"]

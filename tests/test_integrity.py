@@ -50,8 +50,8 @@ def test_fresh_journal_has_no_failures(journal):
 
 def test_report_covers_every_category(journal):
     categories = {c.category for c in integrity.verify(journal).checks}
-    assert categories == {"structural", "schema", "referential", "accounting",
-                          "projection", "fiscal periods", "phase 4 readiness"}
+    assert categories == {"structural", "schema", "referential",
+                          "accounting", "phase 4 readiness"}
 
 
 def test_live_connection_enforcement_is_reported(journal):
@@ -82,31 +82,6 @@ def test_detects_orphaned_rows(journal):
     assert orphans.count >= 2                     # the loan and the ledger row
     assert _check(report, "foreign keys enforceable").status == integrity.FAIL
     assert not report.ok
-
-
-def test_detects_unbalanced_journal_entry(journal):
-    cur = journal.conn.cursor()
-    cur.execute("INSERT INTO journal_entries (entry_date, source, status) "
-                "VALUES ('2026-01-01', 'manual', 'posted')")
-    entry = cur.lastrowid
-    cur.execute("INSERT INTO journal_lines (entry_id, account_code, debit, credit) "
-                "VALUES (?, '1000', 100, 0)", (entry,))
-    cur.execute("INSERT INTO journal_lines (entry_id, account_code, debit, credit) "
-                "VALUES (?, '4900', 0, 60)", (entry,))
-    journal.conn.commit()
-
-    report = integrity.verify(journal)
-    assert _check(report, "every journal entry balances").status == integrity.FAIL
-    assert _check(report, "trial balance nets to zero").status == integrity.FAIL
-
-
-def test_detects_control_account_break(journal):
-    """A loan on the books with nothing posted to Loans Receivable."""
-    _seed_member_with_loan(journal)
-    report = integrity.verify(journal)
-    control = _check(report, "control 1100 Loans Receivable")
-    assert control.status == integrity.WARN
-    assert "1,000.00" in control.detail
 
 
 def test_detects_cached_loan_balance_drift(journal):
@@ -165,29 +140,6 @@ def test_cli_exit_zero_on_healthy_journal(journal, capsys):
     assert "0 failed" in capsys.readouterr().out
 
 
-def test_cli_exit_one_on_failure(journal, capsys):
-    cur = journal.conn.cursor()
-    cur.execute("INSERT INTO journal_entries (entry_date, source) VALUES ('2026-01-01','manual')")
-    cur.execute("INSERT INTO journal_lines (entry_id, account_code, debit, credit) "
-                "VALUES (?, '1000', 100, 0)", (cur.lastrowid,))
-    journal.conn.commit()
-    path = journal.db_name
-    journal.close()
-
-    assert integrity.main([path]) == 1
-    assert "FAIL" in capsys.readouterr().out
-
-
-def test_cli_strict_fails_on_warnings(journal, capsys):
-    _seed_member_with_loan(journal)          # produces a control-account warning
-    path = journal.db_name
-    journal.close()
-
-    assert integrity.main([path]) == 0
-    assert integrity.main([path, "--strict"]) == 1
-    capsys.readouterr()
-
-
 def test_cli_quiet_prints_one_line(journal, capsys):
     path = journal.db_name
     journal.close()
@@ -198,46 +150,6 @@ def test_cli_quiet_prints_one_line(journal, capsys):
 def test_cli_reports_a_missing_file(capsys):
     assert integrity.main([os.path.join(tempfile.mkdtemp(), "nope.db")]) == 1
     assert "Cannot open" in capsys.readouterr().err
-
-
-# --------------------------------------------------------------------------- #
-# Projection health (Phase 5b)
-# --------------------------------------------------------------------------- #
-
-def test_projection_checks_report_an_undrained_queue(journal):
-    from src.services.gl_service import GLService
-    svc = GLService(journal)
-    _seed_member_with_loan(journal)
-    svc.sync()
-    assert _check(integrity.verify(journal), "projection change queue drained").status \
-        == integrity.PASS
-
-    journal.add_savings_transaction(
-        journal.conn.execute("SELECT id FROM individuals").fetchone()[0],
-        "2026-02-01", "Deposit", 100, "")
-    check = _check(integrity.verify(journal), "projection change queue drained")
-    assert check.status == integrity.WARN and check.count == 1
-
-
-def test_projection_baseline_is_reported_before_the_first_sync(journal):
-    _seed_member_with_loan(journal)
-    assert _check(integrity.verify(journal), "projection baseline established").status \
-        == integrity.WARN
-
-
-def test_detects_an_entry_that_outlived_its_source_row(journal):
-    from src.services.gl_service import GLService
-    svc = GLService(journal)
-    _seed_member_with_loan(journal)
-    svc.sync()
-
-    # Delete the row behind the entry without letting the queue see it.
-    journal.conn.execute("DROP TRIGGER trg_outbox_ledger_del")
-    journal.conn.execute("DELETE FROM ledger")
-    journal.conn.commit()
-
-    check = _check(integrity.verify(journal), "projected entries have a live source row")
-    assert check.status == integrity.WARN and check.count == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -314,44 +226,6 @@ def test_inserting_activity_is_not_a_money_change(journal):
     journal.conn.commit()
     journal.add_savings_transaction(ind, "2026-03-01", "Deposit", 100, "")
     assert journal.audit.money_change_count() == 0
-
-
-def test_period_checks_report_an_empty_register(journal):
-    """How migration 008 ships: nothing declared, so nothing is frozen."""
-    check = _check(integrity.verify(journal), "periods declared")
-    assert check.status == integrity.PASS and check.count == 0
-
-
-def test_period_checks_report_what_is_settled(journal):
-    from src.services.period_service import FiscalPeriodService
-    from src.services.gl_service import GLService
-    GLService(journal).sync()
-    svc = FiscalPeriodService(journal)
-    pid = svc.create("Q1", "2026-01-01", "2026-03-31")
-    svc.close(pid)
-
-    report = integrity.verify(journal)
-    assert _check(report, "books settled through").detail == "2026-03-31"
-    assert _check(report, "no edits inside a closed period").status == integrity.PASS
-
-
-def test_snapshot_drift_is_a_failure_not_a_warning(journal):
-    """A stored figure that disagrees with the journal is not a nuance."""
-    from src.services.period_service import FiscalPeriodService
-    from src.services.gl_service import GLService
-    _seed_member_with_loan(journal)
-    GLService(journal).sync()
-    svc = FiscalPeriodService(journal)
-    svc.close(svc.create("Q1", "2026-01-01", "2026-03-31"))
-    assert _check(integrity.verify(journal),
-                  "period snapshots match the journal").status == integrity.PASS
-
-    journal.conn.execute("UPDATE account_snapshots SET closing_balance = 12345 "
-                         "WHERE account_code='1100'")
-    journal.conn.commit()
-    check = _check(integrity.verify(journal), "period snapshots match the journal")
-    assert check.status == integrity.FAIL and check.count == 1
-    assert not integrity.verify(journal).ok
 
 
 # --------------------------------------------------------------------------- #
