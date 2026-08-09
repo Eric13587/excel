@@ -108,14 +108,58 @@ def project_loan(db, individual_id, loan_ref, commit=True):
 
     loan = db.get_loan_by_ref(individual_id, loan_ref)
     if loan:
+        # unearned_interest is deliberately NOT written. It is what the loan
+        # was written to charge and has not charged yet — a term, not a
+        # derivation. reconstruct() seeds the derivation with the interest
+        # already accrued, so result.unearned_interest lands at zero for any
+        # fully-replayed loan; writing it would erase the remaining balance of a
+        # loan still running.
+        status = "Active" if result.principal_balance > 0 else "Paid"
         db.conn.execute(
-            "UPDATE loans SET balance=?, interest_balance=?, unearned_interest=? "
-            "WHERE id=?",
-            (result.principal_balance, result.interest_balance,
-             result.unearned_interest, loan["id"]))
+            "UPDATE loans SET balance=?, interest_balance=?, status=?, "
+            "next_due_date=? WHERE id=?",
+            (result.principal_balance, result.interest_balance, status,
+             _next_due(db, individual_id, loan_ref, loan), loan["id"]))
     if commit:
         db.conn.commit()
     return changed
+
+
+def _next_due(db, individual_id, loan_ref, loan):
+    """When the next deduction falls due.
+
+    Deliberately the same rule the old recalculators used — a month after the
+    last repayment, or after the issue date when none has been taken (honouring
+    the deduct_same_month setting) — rather than the derivation's own cursor.
+    The two agree on a healthy loan, and preserving the existing rule keeps this
+    a like-for-like replacement rather than a behavioural change smuggled in
+    alongside one.
+    """
+    from datetime import datetime
+
+    from dateutil.relativedelta import relativedelta
+
+    row = db.conn.execute(
+        "SELECT MAX(date) FROM ledger WHERE individual_id=? AND loan_id=? "
+        "AND event_type='Repayment'",          # a buy-off ends the loan; it
+        (individual_id, loan_ref)).fetchone()  # does not schedule another month
+    last_repayment = row[0] if row else None
+    base = last_repayment
+    if not base:
+        issued = db.conn.execute(
+            "SELECT MIN(date) FROM ledger WHERE individual_id=? AND loan_id=? "
+            "AND event_type='Loan Issued'", (individual_id, loan_ref)).fetchone()
+        base = (issued[0] if issued else None) or loan.get("start_date")
+    if not base:
+        return loan.get("next_due_date")
+    try:
+        base_dt = datetime.strptime(str(base).split()[0], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return loan.get("next_due_date")
+    if last_repayment:
+        return (base_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
+    same_month = db.settings.deduct_same_month
+    return (base_dt if same_month else base_dt + relativedelta(months=1)).strftime("%Y-%m-%d")
 
 
 def project_member(db, individual_id, commit=True):

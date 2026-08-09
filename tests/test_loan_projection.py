@@ -87,12 +87,13 @@ def test_the_running_balance_is_always_principal_plus_interest(loan):
     """The invariant the stored ledger holds on all 2,174 production rows."""
     db, _engine, ind = loan
     project_loan(db, ind, "L-001")
-    for date, kind, _d, _p, _i, balance in _rows(db, ind):
-        p, i = db.conn.execute(
-            "SELECT principal_balance, interest_balance FROM ledger "
-            "WHERE individual_id=? AND date=? AND event_type=? LIMIT 1",
-            (ind, date, kind)).fetchone()
-        assert abs(balance - ((p or 0) + (i or 0))) < 0.51
+    # Only the rows the projector owns; the Loan Issued row is an assertion and
+    # is left exactly as it was written.
+    for balance, p, i in db.conn.execute(
+            "SELECT balance, principal_balance, interest_balance FROM ledger "
+            "WHERE individual_id=? AND event_type IN ('Interest Earned','Repayment')",
+            (ind,)):
+        assert abs((balance or 0) - ((p or 0) + (i or 0))) < 0.51
 
 
 def test_a_row_count_mismatch_refuses_rather_than_writing_half_an_answer(loan):
