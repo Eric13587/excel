@@ -22,7 +22,7 @@ from PyQt6.QtCore import Qt, QDate
 from . import __version__
 from .database import DatabaseManager
 from .logging_setup import (setup_logging, install_crash_handler,
-                            install_qt_message_handler)
+                            install_qt_message_handler, get_log_dir)
 from .views.dashboard import Dashboard
 from .views.ledger import LedgerView
 
@@ -152,7 +152,14 @@ class MainApp(QMainWindow):
         self.show_dashboard()
 
         self.create_menus()
+        self._build_status_bar()
         self.refresh_window_title()
+
+    def _build_status_bar(self):
+        """A status bar gives setStatusTip somewhere to show and a permanent
+        home for which journal is open."""
+        self.status_journal = QLabel()
+        self.statusBar().addPermanentWidget(self.status_journal)
 
     def apply_app_theme(self):
         """Push the theme's dialog stylesheet onto the QApplication.
@@ -165,31 +172,81 @@ class MainApp(QMainWindow):
             app.setStyleSheet(self.dashboard.theme_manager.dialog_stylesheet())
 
     def refresh_window_title(self):
-        """Title carries the configured organization name when one is set."""
+        """Title carries the configured organization name when one is set.
+
+        The title shows the journal's file name only; the full path (which can
+        be long and can leak a location in a shared screenshot) lives in the
+        status bar tooltip.
+        """
         from src import branding
         org = branding.get_org_name(self.db)
+        name = os.path.basename(self.db_path)
         prefix = f"{org} — LoanMaster {__version__}" if org else f"LoanMaster {__version__}"
-        self.setWindowTitle(f"{prefix} - [{self.db_path}]")
+        self.setWindowTitle(f"{prefix} — {name}")
+        if hasattr(self, "status_journal"):
+            self.status_journal.setText(f"{org}  •  {name}" if org else name)
+            self.status_journal.setToolTip(self.db_path)
 
     def create_menus(self):
-        """Create application menus."""
-        self.menuBar()
-        
-        # Global Undo/Redo Actions (No Edit Menu)
-        
-        # Undo Action
+        """Build the application menu bar: File / Edit / Tools / Help."""
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+        exit_action = QAction("E&xit", self)
+        exit_action.setShortcut(QKeySequence.StandardKey.Quit)
+        exit_action.setStatusTip("Close LoanMaster")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        # Undo/Redo keep their existing shortcuts; a menu action's shortcut is
+        # active whenever this window is, so no separate addAction is needed.
+        edit_menu = menubar.addMenu("&Edit")
         undo_action = QAction("Undo", self)
         undo_action.setShortcut(QKeySequence("Ctrl+Alt+Z"))
-        undo_action.setStatusTip("Undo last operation")
+        undo_action.setStatusTip("Undo the last operation")
         undo_action.triggered.connect(self.undo_operation)
-        self.addAction(undo_action)
-        
-        # Redo Action
+        edit_menu.addAction(undo_action)
         redo_action = QAction("Redo", self)
         redo_action.setShortcut(QKeySequence("Ctrl+Alt+Y"))
-        redo_action.setStatusTip("Redo last operation")
+        redo_action.setStatusTip("Redo the last undone operation")
         redo_action.triggered.connect(self.redo_operation)
-        self.addAction(redo_action)
+        edit_menu.addAction(redo_action)
+
+        tools_menu = menubar.addMenu("&Tools")
+        settings_action = QAction("Settings…", self)
+        settings_action.setStatusTip("Organization, financial and appearance settings")
+        settings_action.triggered.connect(self.open_settings)
+        tools_menu.addAction(settings_action)
+        health_action = QAction("Journal Health Check…", self)
+        health_action.setStatusTip("Run every integrity check on this journal")
+        health_action.triggered.connect(self.show_health_check)
+        tools_menu.addAction(health_action)
+
+        help_menu = menubar.addMenu("&Help")
+        about_action = QAction("About LoanMaster", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+        log_action = QAction("Open Log Folder", self)
+        log_action.setStatusTip("Open the folder with the application log, to send to support")
+        log_action.triggered.connect(self.open_log_folder)
+        help_menu.addAction(log_action)
+
+    def open_settings(self):
+        """Open the settings dialog (owned by the dashboard)."""
+        self.dashboard.open_settings()
+
+    def show_about(self):
+        QMessageBox.about(
+            self, "About LoanMaster",
+            f"<b>LoanMaster {__version__}</b><br>"
+            "Loan, savings & fund management for SACCOs.<br><br>"
+            f"Log folder:<br>{get_log_dir()}")
+
+    def open_log_folder(self):
+        """Open the log folder in the file manager, for sending logs to support."""
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(get_log_dir()))
 
     def undo_operation(self):
         """Perform undo."""
@@ -248,14 +305,19 @@ class MainApp(QMainWindow):
         self.stack.setCurrentWidget(self.ledger_view)
 
     def closeEvent(self, event):
-        """Confirm before exiting."""
-        reply = QMessageBox.question(self, "Exit", "Are you sure you want to exit?",
-                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                    QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            event.accept()
-        else:
-            event.ignore()
+        """Close cleanly. Writes commit as they happen, so there is nothing
+        unsaved to guard — only interrupt if a report is still generating."""
+        worker = getattr(self.dashboard, "report_worker", None)
+        if worker is not None and worker.isRunning():
+            reply = QMessageBox.question(
+                self, "Report in progress",
+                "A report is still being generated. Quit anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        event.accept()
 
 
 def main():
