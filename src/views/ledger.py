@@ -563,6 +563,12 @@ class LedgerView(QWidget):
                          table.item(i, c).setBackground(bg_color)
                          table.item(i, c).setForeground(fg_color)
 
+            # Show the periods where deductions were skipped, in place. Without
+            # this a suspension is invisible in the one view where its effect is
+            # obvious — a gap in the dates — and the gap looks like missing data.
+            if loan_ref != "-" and loan_info:
+                self._insert_suspension_markers(table, loan_info.get('id'), loan_ref)
+
             table.itemChanged.connect(self.on_item_changed)
             table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             table.customContextMenuRequested.connect(lambda pos, t=table: self.open_context_menu(pos, t))
@@ -1263,6 +1269,125 @@ class LedgerView(QWidget):
                 f"The operation has not been performed. Free some disk space or "
                 f"check permissions on the 'backups' folder, then try again.")
             return False
+
+    def _insert_suspension_markers(self, table, loan_id, loan_ref):
+        """Draw each recorded suspension as a band in the loan's own table.
+
+        A suspension shows up in the ledger as a gap in the dates and nothing
+        else, which reads as missing data rather than a decision somebody took.
+        The band says what happened, for how long, and offers the way out right
+        where the question occurs — rather than behind a button in a header that
+        gives no clue there is anything to look at.
+
+        The row is spanned and non-selectable so it cannot be mistaken for a
+        transaction; `on_item_changed` already ignores it, because a marker has
+        no id cell.
+        """
+        if not loan_id:
+            return
+        try:
+            spans = self.engine.db.get_loan_suspensions_for_loan(loan_id)
+        except Exception:                       # noqa: BLE001 - decoration only
+            logger.exception("Could not read suspensions for loan %s", loan_id)
+            return
+        if not spans:
+            return
+
+        for span in sorted(spans, key=lambda sp: str(sp["start_date"]), reverse=True):
+            start = str(span["start_date"])
+            until = span["suspend_until"]
+            # Sit the band immediately before the first row dated on or after
+            # the suspension started, which is where the gap opens.
+            position = table.rowCount()
+            for row in range(table.rowCount()):
+                cell = table.item(row, 0)
+                if cell and cell.text() >= start:
+                    position = row
+                    break
+
+            table.insertRow(position)
+            months = self._months_between(start, until)
+            label = (f"⏸  Deductions suspended from {start}"
+                     + (f" to {until}" if until else " (no end date)")
+                     + (f"  ·  {months} month(s) skipped" if months else ""))
+            if span["status"] == "active":
+                label += "  ·  currently suspended"
+
+            text = QTableWidgetItem(label)
+            text.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            text.setToolTip("Recorded on " + str(span.get("created_at") or "an unknown date")
+                            + ".\nUse Clear to remove this suspension.")
+            table.setItem(position, 0, text)
+            table.setSpan(position, 0, 1, 9)
+
+            clear = QPushButton("Clear")
+            clear.setToolTip("Remove this suspension. You will be asked whether the "
+                             "skipped months should now be deducted.")
+            clear.setStyleSheet(self.theme_manager.button_css("warning", padding="2px 8px"))
+            clear.clicked.connect(
+                lambda _checked, sid=span["id"], ref=loan_ref: self._clear_suspension(sid, ref))
+            table.setCellWidget(position, 9, clear)
+
+            band = QColor(self.theme_manager.get_color("bg_header"))
+            text.setBackground(band)
+            text.setForeground(QColor(self.theme_manager.get_color("text_secondary")))
+
+    @staticmethod
+    def _months_between(start, until):
+        """Whole months a suspension covers, or None when it is open-ended."""
+        if not until:
+            return None
+        try:
+            a = datetime.strptime(str(start)[:10], "%Y-%m-%d")
+            b = datetime.strptime(str(until)[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
+        return max(0, (b.year - a.year) * 12 + b.month - a.month)
+
+    def _clear_suspension(self, suspension_id, loan_ref):
+        """Remove one suspension from the band in the table.
+
+        Asks the same question the Suspensions dialog asks, because the answer
+        matters either way: removing the record and re-collecting the months are
+        different acts, and doing the second silently would charge a member for
+        months somebody decided to waive.
+        """
+        span = self.engine.db.loans.suspension(suspension_id)
+        if span is None:
+            self.refresh_table()
+            return
+        until = span["suspend_until"] or "no end date"
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear Suspension")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"Clear the suspension on {loan_ref} from "
+                    f"{span['start_date']} to {until}?")
+        box.setInformativeText("What should happen to the months it skipped?")
+        keep = box.addButton("Leave them skipped", QMessageBox.ButtonRole.AcceptRole)
+        collect = box.addButton("Deduct them now", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (keep, collect):
+            return
+
+        rebuild = clicked is collect
+        if rebuild and self._backup_before("clear-suspension", loan_ref) is False:
+            return
+        try:
+            _span, created = self.engine.loan_service.remove_suspension(
+                self.current_individual_id, loan_ref, suspension_id, rebuild=rebuild)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot Rebuild", str(e))
+            return
+        self.refresh_table()
+        self.refresh_loans_list()
+        if rebuild:
+            QMessageBox.information(
+                self, "Suspension Cleared",
+                f"{loan_ref} was rebuilt — {created} deduction(s) now cover the period.")
 
     def manage_suspensions_dialog(self, loan_id, loan_ref):
         """List a loan's recorded suspensions, and remove one.
