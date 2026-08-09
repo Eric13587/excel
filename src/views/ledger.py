@@ -469,14 +469,17 @@ class LedgerView(QWidget):
                 if i == 0:
                     self.running_gross_map = {} # Helper if needed, but simple var works
                     self.current_gross = 0.0
-                    
+                    # Gross-up multiplier from the configurable org interest
+                    # rate (default 0.15 -> x 1.15, the previous hardcode).
+                    self._gross_mult = 1 + self.engine.db.settings.default_interest_rate
+
                 if event == "Loan Issued":
                     prin_delta = added
-                    # Gross = Principal + 15% Interest
-                    self.current_gross += added * 1.15 
+                    # Gross = Principal + interest at the configured rate
+                    self.current_gross += added * self._gross_mult
                 elif event == "Loan Top-Up":
                     prin_delta = added
-                    self.current_gross += added * 1.15
+                    self.current_gross += added * self._gross_mult
                 elif event == "Interest Earned":
                     int_delta = added  # Accrual
                     # Internal accounting, doesn't change Gross Obligation

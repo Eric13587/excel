@@ -144,6 +144,10 @@ class IndividualCard(QFrame):
 
 
 
+class _ReportCancelled(Exception):
+    """Raised inside the worker's progress callback to unwind on cancel."""
+
+
 class ReportWorker(QThread):
     """Background worker for report generation."""
     progress = pyqtSignal(int, int, str) # current, total, message
@@ -159,22 +163,34 @@ class ReportWorker(QThread):
         self.output_path = output_path
         self.report_type = report_type
         self.columns = columns
-        
+        self._cancelled = False
+
+    def cancel(self):
+        """Request a cooperative stop.
+
+        The flag is checked in the progress callback, so the worker unwinds
+        through its normal ``finally`` (closing the SQLite connection) instead
+        of being killed mid-write by ``terminate()``.
+        """
+        self._cancelled = True
+
     def run(self):
         db_manager = None
         try:
             # Create thread-local DB connection
             db_manager = DatabaseManager(self.db_name)
-            
+
             # Create generator with thread-local DB
-            # Note: printer_view_getter usage in thread might be risky for PDF. 
-            # If PDF export is requested, we might need to rethink this, 
+            # Note: printer_view_getter usage in thread might be risky for PDF.
+            # If PDF export is requested, we might need to rethink this,
             # but for Excel/CSV this fixes the SQLite error.
             generator = ReportGenerator(db_manager, printer_view_getter=self.printer_view_getter)
-            
+
             def callback(current, total, msg):
+                if self._cancelled:
+                    raise _ReportCancelled()
                 self.progress.emit(current, total, msg)
-                
+
             if self.report_type == 'savings':
                 success, msg = generator.generate_quarterly_savings_report(
                     self.start_date, 
@@ -190,7 +206,17 @@ class ReportWorker(QThread):
                     progress_callback=callback
                 )
             self.finished.emit(success, msg)
-            
+
+        except _ReportCancelled:
+            # Cooperative cancel: remove any half-written output so the user
+            # can't mistake a truncated file for a finished report.
+            try:
+                if self.output_path and os.path.exists(self.output_path):
+                    os.remove(self.output_path)
+            except OSError:
+                logger.warning("Could not remove cancelled report output: %s",
+                               self.output_path, exc_info=True)
+            self.finished.emit(False, "Cancelled")
         except Exception as e:
             self.finished.emit(False, str(e))
         finally:
@@ -1055,6 +1081,15 @@ class Dashboard(QWidget):
             fy_combo.setCurrentText(current_fy_str)
         fin_form.addRow("Financial Year Start:", fy_combo)
 
+        interest_rate = QDoubleSpinBox()
+        interest_rate.setRange(0, 100)
+        interest_rate.setDecimals(2)
+        interest_rate.setSuffix(" %")
+        interest_rate.setValue(self.db.settings.default_interest_rate * 100)
+        interest_rate.setToolTip("Flat rate used to gross-up a loan's total "
+                                 "obligation on the ledger and statements.")
+        fin_form.addRow("Loan Interest Rate:", interest_rate)
+
         deduct_cb = QCheckBox("Allow Deduction in Same Month of Issue")
         deduct_cb.setChecked(self.db.settings.deduct_same_month)
         fin_form.addRow(deduct_cb)
@@ -1109,6 +1144,7 @@ class Dashboard(QWidget):
             self.db.set_setting(branding.ORG_NAME_KEY, org_name_edit.text().strip())
             self.db.set_setting(branding.ORG_LOGO_KEY, logo_edit.text().strip())
             self.db.set_setting("fy_start_month", fy_combo.currentText())
+            self.db.set_setting("default_interest_rate", interest_rate.value() / 100)
             self.db.set_setting("deduct_same_month",
                                 "true" if deduct_cb.isChecked() else "false")
             self.db.set_setting("christmas_unlock_month", unlock_combo.currentIndex() + 1)
@@ -1810,12 +1846,14 @@ class Dashboard(QWidget):
                     progress.setLabelText(msg)
                     if progress.wasCanceled():
                         if getattr(self, 'report_worker', None):
-                            self.report_worker.terminate()
-                        
+                            self.report_worker.cancel()
+
                 def on_finished(success, message):
                     progress.close()
                     if success:
                         QMessageBox.information(self, "Success", f"Report saved to:\n{file_path}")
+                    elif message == "Cancelled":
+                        pass  # user asked to stop; nothing to report
                     else:
                         QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
                     self.report_worker = None

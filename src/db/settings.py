@@ -27,6 +27,7 @@ DEDUCT_SAME_MONTH = "deduct_same_month"
 CHRISTMAS_UNLOCK_MONTH = "christmas_unlock_month"
 DEFAULT_SAVINGS_INCREMENT = "default_savings_increment"
 DEFAULT_CHRISTMAS_INCREMENT = "default_christmas_increment"
+DEFAULT_INTEREST_RATE = "default_interest_rate"
 EXCEL_HEADER_BG = "excel_header_bg"
 EXCEL_TOTAL_BG = "excel_total_bg"
 
@@ -52,6 +53,10 @@ DEFAULTS = {
     CHRISTMAS_UNLOCK_MONTH: "12",
     DEFAULT_SAVINGS_INCREMENT: "2500",
     DEFAULT_CHRISTMAS_INCREMENT: "0",
+    # Flat interest rate a loan's gross obligation is grossed-up by for display
+    # (principal x (1 + rate)). 0.15 reproduces the previous hardcoded x 1.15,
+    # so an unset journal shows exactly the same figures as before.
+    DEFAULT_INTEREST_RATE: "0.15",
     EXCEL_HEADER_BG: "#E2E8F0",     # slate-200, matches branding.EXCEL_HEADER_BG
     EXCEL_TOTAL_BG: "#F1F5F9",      # slate-100, matches branding.EXCEL_TOTAL_BG
 }
@@ -143,6 +148,12 @@ class SettingsRepository(Repository):
     @property
     def default_christmas_increment(self):
         return self._float(DEFAULT_CHRISTMAS_INCREMENT)
+
+    @property
+    def default_interest_rate(self):
+        """Flat interest rate (e.g. 0.15) used to gross-up a loan's obligation
+        for display. Grossed-up total = principal x (1 + this)."""
+        return self._float(DEFAULT_INTEREST_RATE)
 
     @property
     def excel_header_bg(self):

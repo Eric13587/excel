@@ -38,5 +38,6 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
     ('christmas_unlock_month',      '12'),        -- month Christmas withdrawals are permitted
     ('default_savings_increment',   '2500'),      -- fallback monthly savings amount
     ('default_christmas_increment', '0'),         -- fallback monthly Christmas amount
+    ('default_interest_rate',       '0.15'),      -- flat rate loans are grossed-up by for display
     ('excel_header_bg',             '#E2E8F0'),   -- slate-200, Excel column headers
     ('excel_total_bg',              '#F1F5F9');   -- slate-100, Excel total rows

@@ -273,22 +273,26 @@ class StatementGenerator:
                 current_gross = 0.0
                 snapshot_balance = 0.0
                 snapshot_gross = 0.0
-                
+                # Gross-up multiplier from the configurable org interest rate
+                # (default 0.15 -> x 1.15, matching the LedgerView and the
+                # figure this previously hardcoded).
+                gross_mult = 1 + self.db.settings.default_interest_rate
+
                 # Full Replay Simulation
                 for _, row in group.iterrows():
                     event = row['event_type']
                     added = float(row['added'])
                     deducted = float(row['deducted'])
                     date_str = str(row['date'])
-                    
+
                     if date_str > to_date:
                         break
-                    
+
                     # Simulation Logic (Matches LedgerView)
                     if event == "Loan Issued" or event == "Loan Top-Up":
-                        # Gross increases by Principal + 15% Interest (Standard Rule)
-                        # TODO: Should we read rate from loan config? defaulting to 0.15 matches UI.
-                        current_gross += added * 1.15
+                        # Gross increases by Principal + interest at the
+                        # configured rate.
+                        current_gross += added * gross_mult
                     elif event == "Repayment" or event == "Loan Buyoff":
                         current_gross -= deducted
                         
