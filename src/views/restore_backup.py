@@ -214,7 +214,7 @@ class RestoreBackupDialog(QDialog):
                      "up to date.")
         if not result["integrity_ok"]:
             extra += ("\n\nWarning: the restored journal did not pass its "
-                      "integrity check. Check Treasury → Health Check.")
+                      "integrity check. Check Mass Operations → Journal Health Check.")
         QMessageBox.information(
             self, "Restored",
             f"The journal has been restored from:\n{os.path.basename(path)}\n\n"

@@ -127,10 +127,10 @@ class IntegrityReportDialog(QDialog):
 
         if failures:
             self.advice.setText(
-                "A problem means the figures are affected. Treasury → Rebuild Ledger "
-                "fixes anything to do with the general ledger being out of step. "
-                "For the rest, the Repair tools under Mass Operations are the place "
-                "to start — and restore a recent backup if you are unsure.")
+                "A problem means the figures are affected. Start with the Repair "
+                "tools under Mass Operations: 'Repair Loans' re-derives loan "
+                "balances from the ledger, and 'Repair Orphaned Records' fixes "
+                "broken member links. If you are unsure, restore a recent backup.")
         elif warnings:
             self.advice.setText(
                 "Warnings are not errors: the books balance. They flag figures that "
@@ -138,14 +138,17 @@ class IntegrityReportDialog(QDialog):
                 "records rather than something the software can decide.")
         else:
             self.advice.setText(
-                "Structure, member links, the general ledger and the period "
-                "projection all agree.")
+                "Structure, member links, the ledger and the period projection "
+                "all agree.")
 
         self.table.setRowCount(len(checks))
         for row, check in enumerate(checks):
-            label, role, _ = _MEANING.get(check.status, ("?", "text_primary", ""))
+            label, role, meaning = _MEANING.get(check.status, ("?", "text_primary", ""))
             status_item = QTableWidgetItem(label)
             status_item.setForeground(QColor(self.theme_manager.get_color(role)))
+            if meaning:
+                # What this status means for the reader, e.g. "Fix these first".
+                status_item.setToolTip(meaning)
             self.table.setItem(row, 0, status_item)
             self.table.setItem(row, 1, QTableWidgetItem(check.name))
             self.table.setItem(row, 2, QTableWidgetItem(check.category))
