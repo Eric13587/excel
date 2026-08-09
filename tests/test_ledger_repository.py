@@ -137,15 +137,44 @@ def test_bulk_insert_of_nothing_is_a_noop(journal):
 
 
 def test_update_core_writes_optional_columns_only_when_supplied(journal):
+    """The *repository* leaves unsupplied columns alone. DatabaseManager sits
+    above it and deliberately does not — see the next test."""
     ind = _member(journal)
     row_id = _row(journal, ind, "2026-01-01", deducted=100,
                   principal_portion=60, interest_portion=40, interest_amount=7)
 
-    journal.update_transaction(row_id, "2026-01-15", 0, 120, "edited")
+    journal.ledger.update_core(row_id, "2026-01-15", 0, 120, "edited")
+    journal.conn.commit()
     row = journal.get_transaction(row_id)
     assert (row["date"], row["deducted"], row["notes"]) == ("2026-01-15", 120, "edited")
     assert (row["principal_portion"], row["interest_portion"]) == (60, 40)   # untouched
     assert row["interest_amount"] == 7                                       # untouched
+
+
+def test_editing_an_amount_forgets_the_split_it_belonged_to(journal):
+    """A split is derived, so an amount edit must not keep the one computed for
+    the previous amount. Every recalculator used to replay that stale split,
+    which is how a repayment edited from 5,750 to 9,000 kept reducing principal
+    by 5,000."""
+    ind = _member(journal)
+    row_id = _row(journal, ind, "2026-01-01", deducted=100,
+                  principal_portion=60, interest_portion=40)
+
+    journal.update_transaction(row_id, "2026-01-15", 0, 120, "edited")
+    row = journal.get_transaction(row_id)
+    assert row["deducted"] == 120
+    assert (row["principal_portion"], row["interest_portion"]) == (0, 0)
+
+
+def test_an_explicit_split_is_an_assertion_and_is_kept(journal):
+    ind = _member(journal)
+    row_id = _row(journal, ind, "2026-01-01", deducted=100,
+                  principal_portion=60, interest_portion=40)
+
+    journal.update_transaction(row_id, "2026-01-15", 0, 120, "edited",
+                               principal_portion=90, interest_portion=30)
+    row = journal.get_transaction(row_id)
+    assert (row["principal_portion"], row["interest_portion"]) == (90, 30)
 
 
 def test_update_core_writes_the_portions_as_a_pair(journal):

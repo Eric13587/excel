@@ -1350,10 +1350,29 @@ class DatabaseManager:
 
     def update_transaction(self, id, date, added, deducted, notes, principal_portion=None,
                            interest_portion=None, mark_edited=False, interest_amount=None):
-        """Update a transaction with parameterized queries (SQL injection safe)."""
+        """Edit a ledger row, then re-derive everything that follows from it.
+
+        The principal/interest split and the running balances are *derived*, so
+        changing an amount without recomputing them leaves the row asserting a
+        split that belonged to a different payment. Every recalculator then
+        replayed that stale split, which is how a repayment edited from 5,750 to
+        9,000 kept reducing principal by 5,000.
+
+        When the caller does not supply a split, the old one is cleared and the
+        derivation works it out. When the caller does supply one it is an
+        assertion and is kept.
+        """
+        from src.services.loan_projection import clear_derived, project_loan
+
+        row = self.conn.execute(
+            "SELECT individual_id, loan_id FROM ledger WHERE id=?", (id,)).fetchone()
         with self.transaction():
             self.ledger.update_core(id, date, added, deducted, notes, principal_portion,
                                     interest_portion, mark_edited, interest_amount)
+            if principal_portion is None and interest_portion is None:
+                clear_derived(self, id)
+            if row and row[1]:
+                project_loan(self, row[0], row[1], commit=False)
 
     def update_balance(self, id, balance):
         with self.transaction():

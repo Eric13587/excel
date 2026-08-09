@@ -177,3 +177,46 @@ Step 2 is independently valuable. Step 1 is now "leave it alone until step 3".
 * The 0.36 ms figure is for a 7-event loan. The largest production loan has 23
   ledger rows, so the real figure is a small multiple of that, not an order of
   magnitude.
+
+
+---
+
+## 9. Step 3, delivered
+
+**3a — the projection, applied.** `src/services/loan_projection.py` writes what
+`derive()` computes into the `ledger` and `loans` rows. Applied to the
+production journal: **704 rows corrected across 84 members in 131 ms**, with
+every asserted total unchanged — `loans.balance` 8,621,262.18 before and after,
+ledger row count, repayment sum and accrual sum all identical. A second pass
+corrects 0 rows. Integrity 26 checks / 0 failures, replay still 111 of 111.
+
+What it corrected was per-row interest detail that had frozen. On JAMES MWANGI's
+L-001 the stored `interest_balance` read 832 on every accrual row while the
+amounts actually accrued were 250 and 1,326, and every repayment showed
+`interest_portion` 832 regardless. No member's outstanding principal moved.
+
+**3b — edits re-derive.** `update_transaction` now clears the split when the
+caller does not supply one and re-derives the loan. A split *is* derived, so
+keeping the one computed for a different amount is what made every recalculator
+replay a stale value.
+
+That exposed a defect in `reconstruct()`, which passed a `0/0` split through as
+an assertion. A cleared split is the *absence* of one, and treating it as fact
+made a 20,000 back-dated payment reduce principal by zero.
+
+**3c — the restriction is gone.** The loan table allowed editing only the newest
+repayment, because editing an earlier one corrupted everything after it. Any
+repayment is now editable, and the rows below reprice. Verified on real data:
+editing the first of seven repayments by +3,000 moved the balance by exactly
+−3,000.
+
+The derived columns — Prin. Bal, Int. Bal, Total Bal — were already read-only
+and stay that way. They are results, not inputs.
+
+### What the four recalculators are now
+
+Still there, still called from 32 sites, and no longer load-bearing for
+correctness on the edit path — `update_transaction` re-derives regardless of
+which one a caller later invokes. Removing them is now a mechanical follow-up
+rather than a question of behaviour, which is what step 1 should have been all
+along.

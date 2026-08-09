@@ -317,12 +317,6 @@ class LedgerView(QWidget):
         for loan_ref in sorted_loan_ids:
             group = loan_groups.get_group(loan_ref).sort_values(by=['date', 'id'])
             
-            # Find latest repayment ID for this group to enforce edit constraints
-            repayments = group[group['event_type'] == "Repayment"]
-            latest_repayment_id = -1
-            if not repayments.empty:
-                latest_repayment_id = repayments.iloc[-1]['id'] # Since sorted ascending
-            
             group_box = QGroupBox()
             group_layout = QVBoxLayout()
             header_layout = QHBoxLayout()
@@ -529,17 +523,23 @@ class LedgerView(QWidget):
                 for c in range(3, 9):
                     table.item(i, c).setFlags(no_edit)
                 
-                # Payment Editable Logic
+                # Any repayment may be edited, not only the newest.
+                #
+                # The old restriction existed because editing an earlier one
+                # corrupted everything after it: the amount changed while the
+                # principal/interest split it had been given did not, and every
+                # recalculator then replayed that stale split. Editing the first
+                # of four repayments left the three below it untouched.
+                #
+                # DatabaseManager.update_transaction now clears the split and
+                # re-derives the loan, so an edit anywhere in the history
+                # reprices the rows below it. The columns that hold derived
+                # values (Prin. Bal, Int. Bal, Total Bal) stay read-only — they
+                # are results, not inputs.
                 if row['event_type'] == "Repayment":
-                     # Payment is col 5
-                     # Only allow if it is the latest repayment
-                     current_id = int(row['id'])
-                     if current_id == latest_repayment_id:
-                        table.item(i, 5).setFlags(edit_flag)
-                     else:
-                        table.item(i, 5).setFlags(no_edit)
-                        # Optional: Add tooltip or style to indicate locked?
-                        table.item(i, 5).setToolTip("Only the latest repayment can be edited.")
+                    table.item(i, 5).setFlags(edit_flag)
+                    table.item(i, 5).setToolTip(
+                        "Editing this repayment re-derives every row below it.")
 
                 # Color logic
                 if row['event_type'] == 'Loan Issued':
