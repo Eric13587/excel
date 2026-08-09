@@ -155,7 +155,8 @@ class ReportWorker(QThread):
     
     finished = pyqtSignal(bool, str)     # success, message
     
-    def __init__(self, db_name, printer_view_getter, start_date, output_path, report_type='loan', columns=None):
+    def __init__(self, db_name, printer_view_getter, start_date, output_path,
+                 report_type='loan', columns=None, end_date=None, fund=None):
         super().__init__()
         self.db_name = db_name
         self.printer_view_getter = printer_view_getter
@@ -163,6 +164,8 @@ class ReportWorker(QThread):
         self.output_path = output_path
         self.report_type = report_type
         self.columns = columns
+        self.end_date = end_date          # 'fund' custom-range reports only
+        self.fund = fund                  # 'fund' reports: which ledger
         self._cancelled = False
 
     def cancel(self):
@@ -193,15 +196,24 @@ class ReportWorker(QThread):
 
             if self.report_type == 'savings':
                 success, msg = generator.generate_quarterly_savings_report(
-                    self.start_date, 
-                    self.output_path, 
+                    self.start_date,
+                    self.output_path,
+                    columns=self.columns,
+                    progress_callback=callback
+                )
+            elif self.report_type == 'fund':
+                success, msg = generator.generate_fund_report(
+                    self.fund,
+                    self.output_path,
+                    self.start_date,
+                    self.end_date,
                     columns=self.columns,
                     progress_callback=callback
                 )
             else:
                 success, msg = generator.generate_quarterly_report(
-                    self.start_date, 
-                    self.output_path, 
+                    self.start_date,
+                    self.output_path,
                     columns=self.columns,
                     progress_callback=callback
                 )
@@ -1668,21 +1680,59 @@ class Dashboard(QWidget):
                           for i in range(col_list.count())
                           if col_list.item(i).checkState() == Qt.CheckState.Checked]
 
+        # Generate off the GUI thread with progress + safe cancel, instead of
+        # freezing the window until the file is written.
+        db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
         if fund == "savings" and not custom:
-            success, msg = generator.generate_quarterly_savings_report(start, path, columns=chosen_columns)
+            worker = ReportWorker(db_name, self.get_printer_view, start, path,
+                                  report_type='savings', columns=chosen_columns)
         else:
-            success, msg = generator.generate_fund_report(fund, path, start, end, columns=chosen_columns)
+            worker = ReportWorker(db_name, self.get_printer_view, start, path,
+                                  report_type='fund', columns=chosen_columns,
+                                  end_date=end, fund=fund)
+        self._run_report_worker(worker, path)
 
-        if success:
-            from .file_actions import report_saved
-            report_saved(self, "Success", path)
-        else:
-            QMessageBox.critical(self, "Error", f"Failed to generate report:\n{msg}")
+    def _run_report_worker(self, worker, file_path):
+        """Drive a ReportWorker with a modal progress dialog and safe cancel.
+
+        Shared by the loan and fund/savings report flows so each generates off
+        the GUI thread with real progress and cooperative cancellation instead
+        of freezing the window. On success the saved file is offered for opening
+        via report_saved.
+        """
+        progress = QProgressDialog("Generating Report...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        self.report_worker = worker
+
+        def on_progress(curr, total, msg):
+            progress.setMaximum(total)
+            progress.setValue(curr)
+            progress.setLabelText(msg)
+            if progress.wasCanceled() and getattr(self, 'report_worker', None):
+                self.report_worker.cancel()
+
+        def on_finished(success, message):
+            progress.close()
+            if success:
+                from .file_actions import report_saved
+                report_saved(self, "Success", file_path)
+            elif message == "Cancelled":
+                pass  # user asked to stop; nothing to report
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
+            self.report_worker = None
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.start()
 
     def generate_quarterly_report(self):
         """Generate quarterly loan interest report."""
         from ..reports import ReportGenerator
-        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox,
+        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox, QFileDialog,
                                      QComboBox, QPushButton, QListWidget, QListWidgetItem, QGroupBox,
                                      QHBoxLayout, QVBoxLayout)
         from PyQt6.QtCore import Qt
@@ -1827,41 +1877,12 @@ class Dashboard(QWidget):
             )
             
             if file_path:
-                # Pass printer_view_getter for PDF support
-                # generator already instantiated
-                
-                # Setup Progress Dialog
-                progress = QProgressDialog("Generating Report...", "Cancel", 0, 100, self)
-                progress.setWindowModality(Qt.WindowModality.WindowModal)
-                progress.setMinimumDuration(0)
-                progress.setValue(0)
-                
-                # Setup Thread
+                # Generate off the GUI thread with progress + safe cancel.
                 db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
-                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path, report_type='loan', columns=chosen_columns)
-                
-                def on_progress(curr, total, msg):
-                    progress.setMaximum(total)
-                    progress.setValue(curr)
-                    progress.setLabelText(msg)
-                    if progress.wasCanceled():
-                        if getattr(self, 'report_worker', None):
-                            self.report_worker.cancel()
-
-                def on_finished(success, message):
-                    progress.close()
-                    if success:
-                        QMessageBox.information(self, "Success", f"Report saved to:\n{file_path}")
-                    elif message == "Cancelled":
-                        pass  # user asked to stop; nothing to report
-                    else:
-                        QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
-                    self.report_worker = None
-                    
-                self.report_worker.progress.connect(on_progress)
-                self.report_worker.finished.connect(on_finished)
-                
-                self.report_worker.start()
+                worker = ReportWorker(db_name, self.get_printer_view, start_date,
+                                      file_path, report_type='loan',
+                                      columns=chosen_columns)
+                self._run_report_worker(worker, file_path)
 
     def open_mass_savings_dialog(self):
         """Open dialog for Mass Savings Increment."""
