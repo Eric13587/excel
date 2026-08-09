@@ -829,6 +829,39 @@ class Dashboard(QWidget):
                 self.refresh_list(select_id=ind_id)
                 QMessageBox.information(self, "Retired", msg)
     
+    @staticmethod
+    def _format_names(names, cap=10):
+        """Join names for a summary, capping a long list so the dialog stays readable."""
+        names = list(names)
+        if len(names) <= cap:
+            return ", ".join(names)
+        return ", ".join(names[:cap]) + f", and {len(names) - cap} more"
+
+    def _show_batch_summary(self, dest, saved, html_fallbacks=(), skipped_empty=(), failed=()):
+        """Report a batch statement run: what saved, what was skipped, what failed.
+
+        Replaces a bare "Saved N" that hid every statement which errored, had no
+        activity, or fell back to HTML.
+        """
+        total_saved = len(saved) + len(html_fallbacks)
+        lines = [f"Saved {total_saved} statement(s) to:\n{dest}"]
+        if html_fallbacks:
+            lines.append(f"\n{len(html_fallbacks)} saved as HTML (PDF unavailable): "
+                         + self._format_names(html_fallbacks))
+        if skipped_empty:
+            lines.append(f"\n{len(skipped_empty)} skipped — no activity in this period: "
+                         + self._format_names(skipped_empty))
+        if failed:
+            lines.append(f"\n{len(failed)} failed — see the log: "
+                         + self._format_names(failed))
+        text = "\n".join(lines)
+        if failed:
+            QMessageBox.warning(self, "Batch complete with problems", text)
+        elif total_saved == 0:
+            QMessageBox.warning(self, "Nothing saved", text)
+        else:
+            QMessageBox.information(self, "Batch complete", text)
+
     def batch_print_all(self):
         """Print all statements to a selected folder."""
         # Get date range first
@@ -845,9 +878,9 @@ class Dashboard(QWidget):
             QMessageBox.information(self, "Info", "No individuals to print.")
             return
         
-        count = 0
+        saved, html_fallbacks, skipped_empty, failed = [], [], [], []
         total_steps = len(individuals)
-        
+
         progress = QProgressDialog("Generating Statements...", "Cancel", 0, total_steps, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0) # Show immediately
@@ -859,14 +892,20 @@ class Dashboard(QWidget):
                 
             progress.setLabelText(f"Generating Statement for {ind[1]}...")
             success, path, fmt = self._statement_generator.generate_pdf_statement(ind[0], ind[1], folder, date_range[0], date_range[1])
-            
-            if success:
-                count += 1
+
+            if success and fmt == "html":
+                html_fallbacks.append(ind[1])
+            elif success:
+                saved.append(ind[1])
+            elif fmt == "empty":
+                skipped_empty.append(ind[1])
+            else:
+                failed.append(ind[1])
             progress.setValue(i + 1)
             QApplication.processEvents() # Ensure UI remains responsive
-        
+
         progress.close()
-        QMessageBox.information(self, "Success", f"Saved {count} statement(s) to:\n{folder}")
+        self._show_batch_summary(folder, saved, html_fallbacks, skipped_empty, failed)
     
     def batch_print_selected(self):
         """Open dialog to select which statements to print."""
@@ -984,8 +1023,8 @@ class Dashboard(QWidget):
             to_str = self.print_config_data["to"]
             config = self.print_config_data["config"]
             
-            count = 0
-            
+            saved, html_fallbacks, skipped_empty, failed = [], [], [], []
+
             # Filter checks that are checked
             selected_checks = [cb for cb in checkboxes if cb.isChecked()]
             total_steps = len(selected_checks)
@@ -1005,27 +1044,31 @@ class Dashboard(QWidget):
                     
                     progress.setLabelText(f"Generating Statement for {name}...")
                     
-                    success = False
                     if self.print_mode == "pdf":
                         # Updated signature returns (success, path, format)
                         res = self._statement_generator.generate_pdf_statement(ind_id, name, folder, from_str, to_str, config=config)
-                        if isinstance(res, tuple):
-                             success = res[0]
+                        success, fmt = (res[0], res[2]) if isinstance(res, tuple) else (res, "pdf")
+                        if success and fmt == "html":
+                            html_fallbacks.append(name)
+                        elif success:
+                            saved.append(name)
+                        elif fmt == "empty":
+                            skipped_empty.append(name)
                         else:
-                             success = res
+                            failed.append(name)
                     elif self.print_mode == "excel":
-                        success = self._statement_generator.generate_excel_statement(ind_id, name, folder, from_str, to_str, config=config)
-                        
-                    if success:
-                        count += 1
-                    
+                        if self._statement_generator.generate_excel_statement(ind_id, name, folder, from_str, to_str, config=config):
+                            saved.append(name)
+                        else:
+                            failed.append(name)
+
                     progress.setValue(i + 1)
                     QApplication.processEvents()
-                
+
                 progress.close()
-            
-            if count > 0:
-                QMessageBox.information(self, "Success", f"Saved {count} check(s) to:\n{folder}")
+
+            if saved or html_fallbacks or skipped_empty or failed:
+                self._show_batch_summary(folder, saved, html_fallbacks, skipped_empty, failed)
             else:
                 QMessageBox.warning(self, "Warning", "No statements saved.")
 
