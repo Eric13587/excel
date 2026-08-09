@@ -1686,9 +1686,51 @@ class LedgerView(QWidget):
                      table.blockSignals(False)
                      return
                  
-                 # Special logic for Payment Amount
+                 # Special logic for Payment Amount.
+                 #
+                 # Editing a repayment re-derives every row below it on the loan
+                 # (DatabaseManager.update_transaction clears the split and
+                 # replays), so a stray keystroke here silently reprices the
+                 # loan's whole history. Confirm the change, show its scope, and
+                 # snapshot the journal first — the same safety the rebuild and
+                 # delete paths already get.
+                 from PyQt6.QtCore import QTimer
+                 tx = self.engine.get_transaction(trans_id)
+                 old_amount = float(tx['deducted']) if tx else 0.0
+
+                 def _revert_repayment():
+                     # Redraw from the DB so the cell matches stored state.
+                     table.blockSignals(False)
+                     QTimer.singleShot(0, self.refresh_table)
+
+                 # Re-entering the same value is a no-op: don't back up and
+                 # re-derive for a change that isn't one.
+                 if abs(new_amount - old_amount) < 0.005:
+                     _revert_repayment()
+                     return
+
+                 loan_ref = table.item(row, 2).text()
+                 rows_below = table.rowCount() - row - 1
+                 confirm = QMessageBox.question(
+                     self, "Change this repayment?",
+                     f"Change this repayment from {old_amount:,.0f} to "
+                     f"{new_amount:,.0f}?\n\n"
+                     f"This re-derives the {rows_below} entr"
+                     f"{'y' if rows_below == 1 else 'ies'} below it on this "
+                     f"loan — their balances and interest split are recalculated. "
+                     f"A backup is saved first.",
+                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                     QMessageBox.StandardButton.No)
+                 if confirm != QMessageBox.StandardButton.Yes:
+                     _revert_repayment()
+                     return
+
+                 if self._backup_before("edit-repayment", loan_ref) is False:
+                     _revert_repayment()     # backup failed; the user was told
+                     return
+
                  self.engine.update_repayment_amount(self.current_individual_id, trans_id, new_amount, notes)
-                 
+
             else:
                  # Generic Edit fallback (Date, Notes, or weird edits)
                  # Reconstruct added/deducted
