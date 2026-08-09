@@ -144,11 +144,25 @@ class MainApp(QMainWindow):
         
         self.stack.addWidget(self.dashboard)
         self.stack.addWidget(self.ledger_view)
-        
+
+        # Theme dialogs at the application level (they have no ThemeManager of
+        # their own). Reuses the dashboard's manager so all three agree.
+        self.apply_app_theme()
+
         self.show_dashboard()
 
         self.create_menus()
         self.refresh_window_title()
+
+    def apply_app_theme(self):
+        """Push the theme's dialog stylesheet onto the QApplication.
+
+        Called at startup and whenever the theme changes, so open-anew dialogs
+        match the rest of the window.
+        """
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(self.dashboard.theme_manager.dialog_stylesheet())
 
     def refresh_window_title(self):
         """Title carries the configured organization name when one is set."""

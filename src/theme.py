@@ -135,3 +135,57 @@ class ThemeManager:
     def status_label_css(self, role, size=13):
         """Bold status text colored by a semantic role (success/danger/…)."""
         return f"font-size: {size}px; font-weight: bold; color: {self.get_color(role)};"
+
+    def dialog_stylesheet(self):
+        """App-level stylesheet that themes dialogs, scoped under ``QDialog``.
+
+        Dialogs were never handed a ThemeManager, so in dark mode they rendered
+        with the OS default (light) palette — inconsistent with the dark main
+        window, and with a few hardcoded labels going unreadable. Setting this on
+        the QApplication makes every QDialog/QMessageBox track the theme.
+
+        The scoping matters: every selector is under ``QDialog``, so the main
+        views — which style themselves per-widget — are left completely alone,
+        keeping the regression surface to dialog contents only.
+        """
+        c = self.get_color
+        return f"""
+        QDialog, QMessageBox {{ background-color: {c('bg_secondary')}; }}
+        QDialog QLabel, QMessageBox QLabel {{
+            color: {c('text_primary')};
+            background: transparent;
+        }}
+        QDialog QLineEdit, QDialog QComboBox, QDialog QSpinBox,
+        QDialog QDoubleSpinBox, QDialog QDateEdit, QDialog QPlainTextEdit,
+        QDialog QTextEdit {{
+            background-color: {c('input_bg')};
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+            border-radius: 4px;
+            padding: 3px;
+        }}
+        QDialog QCheckBox, QDialog QRadioButton {{ color: {c('text_primary')}; }}
+        QDialog QGroupBox {{
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+            border-radius: 4px;
+            margin-top: 8px;
+        }}
+        QDialog QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 3px;
+        }}
+        QDialog QListWidget, QDialog QTableWidget, QDialog QTableView,
+        QDialog QAbstractItemView {{
+            background-color: {c('bg_secondary')};
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+        }}
+        QDialog QHeaderView::section {{
+            background-color: {c('bg_primary')};
+            color: {c('text_primary')};
+            border: none;
+            padding: 4px;
+        }}
+        """

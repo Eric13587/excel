@@ -193,7 +193,7 @@ class ImportDialog(QDialog):
         file_layout = QVBoxLayout()
         
         self.file_label = QLabel("No file selected")
-        self.file_label.setStyleSheet("color: gray; font-style: italic;")
+        self.file_label.setStyleSheet("color: #6B7280; font-style: italic;")
         self.select_btn = QPushButton("Select Database File...")
         self.select_btn.clicked.connect(self.select_file)
         
@@ -252,7 +252,7 @@ class ImportDialog(QDialog):
         
         # Info Label
         self.info_lbl = QLabel("Duplicates will be matched by Name.\nNew IDs will be generated to prevent conflicts.")
-        self.info_lbl.setStyleSheet("color: #666; font-size: 11px;")
+        self.info_lbl.setStyleSheet("color: #6B7280; font-size: 11px;")
         self.info_lbl.setWordWrap(True)
         self.layout.addWidget(self.info_lbl)
         
@@ -289,7 +289,8 @@ class ImportDialog(QDialog):
         if file_path:
             self.selected_file_path = file_path
             self.file_label.setText(file_path)
-            self.file_label.setStyleSheet("color: black;")
+            # Clear the placeholder style; inherit the themed primary text color.
+            self.file_label.setStyleSheet("")
             self.import_btn.setEnabled(True)
 
     def get_data(self):
@@ -733,7 +734,7 @@ class ImportPreviewDialog(QDialog):
             self.conflict_layout.addWidget(self.res_btn)
             
             self.conflict_lbl = QLabel("Conflicts must be resolved before importing.")
-            self.conflict_lbl.setStyleSheet("color: #666; font-style: italic;")
+            self.conflict_lbl.setStyleSheet("color: #6B7280; font-style: italic;")
             self.conflict_lbl.setWordWrap(True)
             self.conflict_layout.addWidget(self.conflict_lbl)
         else:
@@ -897,7 +898,7 @@ class ExcelImportDialog(QDialog):
         # File row
         file_row = QHBoxLayout()
         self.file_label = QLabel("No file selected")
-        self.file_label.setStyleSheet("color: gray; font-style: italic;")
+        self.file_label.setStyleSheet("color: #6B7280; font-style: italic;")
         pick = QPushButton("Select Excel File…")
         pick.clicked.connect(self._pick_file)
         file_row.addWidget(self.file_label, 1)
@@ -907,7 +908,7 @@ class ExcelImportDialog(QDialog):
         # Detection info
         self.info = QLabel("")
         self.info.setWordWrap(True)
-        self.info.setStyleSheet("color: #444; font-size: 12px;")
+        self.info.setStyleSheet("color: #6B7280; font-size: 12px;")
         layout.addWidget(self.info)
 
         # Contribution-only controls
@@ -963,7 +964,8 @@ class ExcelImportDialog(QDialog):
         self.rows = rows
         self.mapping = self.importer.detect_mapping(headers)
         self.file_label.setText(path.split("/")[-1])
-        self.file_label.setStyleSheet("color: #111;")
+        # Clear the placeholder style; inherit the themed primary text color.
+        self.file_label.setStyleSheet("")
 
         f = self.mapping["fields"]
         detected = ", ".join(f"{k}→{v}" for k, v in f.items()) or "none"

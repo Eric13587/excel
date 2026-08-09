@@ -1221,6 +1221,9 @@ class Dashboard(QWidget):
                 if hasattr(main_win, "ledger_view"):
                     main_win.ledger_view.theme_manager = self.theme_manager
                     main_win.ledger_view.apply_theme()
+                # Re-theme dialogs (application-level stylesheet) to match.
+                if hasattr(main_win, "apply_app_theme"):
+                    main_win.apply_app_theme()
                 QMessageBox.information(self, "Settings Saved", f"Settings updated. Theme changed to {selected_theme}.")
             else:
                 QMessageBox.information(self, "Settings Saved", "Settings have been updated successfully.")
