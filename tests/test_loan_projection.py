@@ -121,3 +121,42 @@ def test_projecting_a_member_covers_every_loan(loan):
 def test_a_loan_with_no_events_is_skipped(loan):
     db, _engine, ind = loan
     assert project_loan(db, ind, "L-999") == 0
+
+
+def test_the_projector_never_touches_unearned_interest(loan):
+    """Regression, and an expensive one.
+
+    unearned_interest is what the loan was written to charge and has not charged
+    yet — a term, not a derivation. reconstruct() seeds the replay with the
+    interest already accrued, so the derived value lands at zero for a
+    fully-replayed loan.
+
+    Writing it zeroed the column on 96 production loans. catch_up_loan accrues
+    min(monthly_interest, unearned), so zero unearned means *no interest row is
+    ever created again* — every future deduction would be pure principal. It
+    surfaced as "the Interest Earned row has disappeared", which is what a user
+    noticed before any test did.
+    """
+    db, _engine, ind = loan
+    before = db.get_loan_by_ref(ind, "L-001")["unearned_interest"]
+    assert before > 0
+
+    project_loan(db, ind, "L-001")
+
+    assert db.get_loan_by_ref(ind, "L-001")["unearned_interest"] == before
+
+
+def test_catch_up_still_accrues_after_a_projection(loan):
+    """The symptom, stated directly: projecting a loan must not stop it
+    charging interest."""
+    db, engine, ind = loan
+    project_loan(db, ind, "L-001")
+
+    before = db.conn.execute(
+        "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND event_type='Interest Earned'",
+        (ind,)).fetchone()[0]
+    engine.loan_service.catch_up_loan(ind, "L-001", target_date="2025-07-01")
+    after = db.conn.execute(
+        "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND event_type='Interest Earned'",
+        (ind,)).fetchone()[0]
+    assert after > before, "catch-up stopped creating interest rows"
