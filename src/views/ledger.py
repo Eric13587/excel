@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, QDate, QTimer
 from ..theme import ThemeManager
 from ..engine import LoanEngine
 from ..exceptions import ChristmasLockedError
+from ..money import format_money
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +288,7 @@ class LedgerView(QWidget):
         loans = self.engine.db.get_active_loans(self.current_individual_id)
         today = datetime.now().strftime("%Y-%m-%d")
         for loan in loans:
-            item_text = f"{loan['ref']} | Bal: {loan['balance']:.2f} | Due: {loan['next_due_date']}"
+            item_text = f"{loan['ref']} | Bal: {format_money(loan['balance'])} | Due: {loan['next_due_date']}"
             list_item = QListWidgetItem(item_text)
             if loan['next_due_date'] < today:
                 list_item.setForeground(QColor(self.theme_manager.get_color('danger')))
@@ -494,25 +495,25 @@ class LedgerView(QWidget):
                     if deducted > 0: payment = deducted
                     # Unknown events usually don't affect standard Gross logic unless restructuring
                 
-                # Format to show signs
-                p_text = f"{prin_delta:+.0f}" if prin_delta != 0 else "-"
-                i_text = f"{int_delta:+.0f}" if int_delta != 0 else "-"
-                pay_text = f"{payment:,.0f}" if payment != 0 else "-"
-                
+                # Format to show signs (thousands-separated like the balances)
+                p_text = f"{prin_delta:+,.0f}" if prin_delta != 0 else "-"
+                i_text = f"{int_delta:+,.0f}" if int_delta != 0 else "-"
+                pay_text = format_money(payment) if payment != 0 else "-"
+
                 table.setItem(i, 3, QTableWidgetItem(p_text))
                 table.setItem(i, 4, QTableWidgetItem(i_text))
                 table.setItem(i, 5, QTableWidgetItem(pay_text))
-                
+
                 # Balances
                 p_bal = float(row.get('principal_balance', 0))
                 i_bal = float(row.get('interest_balance', 0))
-                
-                table.setItem(i, 6, QTableWidgetItem(f"{p_bal:,.0f}"))
-                table.setItem(i, 7, QTableWidgetItem(f"{i_bal:,.0f}"))
-                
+
+                table.setItem(i, 6, QTableWidgetItem(format_money(p_bal)))
+                table.setItem(i, 7, QTableWidgetItem(format_money(i_bal)))
+
                 # Total Balance (Gross Obligation) v2
                 # Use the simulated value
-                table.setItem(i, 8, QTableWidgetItem(f"{self.current_gross:,.0f}"))
+                table.setItem(i, 8, QTableWidgetItem(format_money(self.current_gross)))
                 
                 table.setItem(i, 9, QTableWidgetItem(str(row['notes'])))
                 
@@ -522,9 +523,12 @@ class LedgerView(QWidget):
                 table.item(i, 1).setFlags(no_edit)
                 table.item(i, 2).setFlags(no_edit)
                 
-                # Make all columns no_edit by default
+                # Make all columns no_edit by default, and right-align the money
+                # columns so figures line up by place value and are scannable.
                 for c in range(3, 9):
                     table.item(i, c).setFlags(no_edit)
+                    table.item(i, c).setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 
                 # Any repayment may be edited, not only the newest.
                 #
@@ -595,7 +599,7 @@ class LedgerView(QWidget):
         self.refresh_benevolent()
 
         name = self.engine.db.get_individual_name(self.current_individual_id)
-        self.title_label.setText(f"<b>Ledger for {name} | Total Debt: {total_balance:.2f}</b>")
+        self.title_label.setText(f"<b>Ledger for {name} | Total Debt: {format_money(total_balance)}</b>")
 
     # ==================================================================== #
     # Shared helpers for the fund tabs
@@ -1778,7 +1782,7 @@ class LedgerView(QWidget):
             deduction = self.engine.add_loan_event(self.current_individual_id, p, d, dt, interest_rate)
             self.refresh_table()
             self.refresh_loans_list()
-            QMessageBox.information(self, "Success", f"New Monthly Deduction: {deduction:.2f}")
+            QMessageBox.information(self, "Success", f"New Monthly Deduction: {format_money(deduction)}")
         except ValueError:
             QMessageBox.critical(self, "Error", "Please enter valid numbers.")
 
@@ -1804,7 +1808,7 @@ class LedgerView(QWidget):
             self, "Confirm Delete",
             f"Permanently delete loan {loan_ref} and all {entries} of its ledger "
             f"entries?\n\n"
-            + (f"This loan still shows {outstanding:,.2f} outstanding.\n\n"
+            + (f"This loan still shows {format_money(outstanding)} outstanding.\n\n"
                if abs(outstanding) > 0.005 else "")
             + "The member's other loans and savings are not affected. This cannot "
               "be undone; a backup is saved first.",

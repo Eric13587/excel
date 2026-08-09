@@ -18,6 +18,7 @@ from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, I
 from src.reports import ReportGenerator
 from ..theme import ThemeManager
 from ..database import DatabaseManager
+from ..money import format_money
 
 
 class IndividualCard(QFrame):
@@ -807,7 +808,7 @@ class Dashboard(QWidget):
             
             msg = f"Are you sure you want to retire '{name}'?\n\n"
             if savings_bal > 0:
-                msg += f"\u2022 Savings balance of {savings_bal:,.0f} will be auto-withdrawn\n"
+                msg += f"\u2022 Savings balance of {format_money(savings_bal)} will be auto-withdrawn\n"
             if has_loans:
                 msg += "\u2022 Outstanding loans will remain active until cleared\n"
                 msg += "\u2022 They will still appear in Loan Reports\n"
@@ -824,7 +825,7 @@ class Dashboard(QWidget):
                 
                 msg = f"'{name}' has been retired."
                 if withdrawn > 0:
-                    msg += f"\nSavings withdrawal of {withdrawn:,.0f} was created."
+                    msg += f"\nSavings withdrawal of {format_money(withdrawn)} was created."
                 
                 self.refresh_list(select_id=ind_id)
                 QMessageBox.information(self, "Retired", msg)
@@ -1985,10 +1986,10 @@ class Dashboard(QWidget):
             
             if bal > 0:
                 cb.setChecked(True)
-                cb.setText(label_text + f" (Bal: {bal:,.0f}) [Auto: {auto_amt:,.0f}]")
+                cb.setText(label_text + f" (Bal: {format_money(bal)}) [Auto: {format_money(auto_amt)}]")
             else:
                  # Even if bal is 0, show what auto would correspond to (likely 2500)
-                 cb.setText(label_text + f" [Auto: {auto_amt:,.0f}]")
+                 cb.setText(label_text + f" [Auto: {format_money(auto_amt)}]")
             
             cb.setProperty("ind_id", ind[0])
             checkboxes.append(cb)
