@@ -77,11 +77,12 @@ Ranked by what it would actually buy:
    would let the preview screen show exactly what the commit will do, from the
    same code that does it. **Highest value, lowest risk.**
 
-2. **Posting a transaction** — validate → normalise → guard → write →
-   recalculate is currently spelled out slightly differently in
-   `add_transaction`, `add_savings_transaction` and `fund_add_transaction`. The
-   back-dated running-balance bug existed in all three and was fixed in each
-   separately; a shared post-write step would have fixed it once.
+2. **Posting a transaction** — partly done. The running-total repair is now one
+   shared post-write step (`DatabaseManager._mutate_fund`) rather than a
+   docstring asking the caller to remember, which is what the `balance` column
+   depended on before. Validation and normalisation are still spelled out
+   slightly differently across `add_transaction`, `add_savings_transaction` and
+   `fund_add_transaction`.
 
 3. **Report generation** — gather → filter (retired, date range) → compute →
    render. The retired-member filter is currently four near-identical blocks in

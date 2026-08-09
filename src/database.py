@@ -1694,6 +1694,29 @@ class DatabaseManager:
         with self.transaction():
             self.funds.recalculate("savings", individual_id)
 
+    def _mutate_fund(self, table, trans_id, change):
+        """Apply a change to one fund row, then re-derive that member's balances.
+
+        The `balance` column is a *running total*, so it is a property of the
+        whole ordered series, not of the row holding it. Editing an amount,
+        moving a date, or deleting a row invalidates every row from that point
+        on — and the API used to leave that to the caller ("caller recalculates
+        afterwards"), which meant the column was only correct where somebody had
+        remembered. It was not correct: an edited middle row kept its old total,
+        and a row moved to an earlier date carried its old total to the top of
+        the table.
+
+        Recalculating inside the same transaction makes it structural instead of
+        remembered.
+        """
+        row = self.funds.get(table, trans_id)
+        if row is None:
+            return
+        member_id = row["individual_id"]
+        with self.transaction():
+            change()
+            self.funds.recalculate(table, member_id)
+
     def _is_back_dated(self, table, individual_id, date):
         """True when this row is not the member's latest in that fund.
 
@@ -1716,14 +1739,15 @@ class DatabaseManager:
                                        order="date, id")
 
     def delete_savings_transaction(self, trans_id):
-        """Delete a savings transaction (caller recalculates afterwards)."""
-        with self.transaction():
-            self.funds.delete("savings", trans_id)
+        """Delete a savings transaction and re-derive the running balances."""
+        self._mutate_fund("savings", trans_id,
+                          lambda: self.funds.delete("savings", trans_id))
 
     def update_savings_transaction(self, trans_id, new_date, new_amount, new_notes):
-        """Update a savings transaction."""
-        with self.transaction():
-            self.funds.update("savings", trans_id, new_date, new_amount, new_notes)
+        """Edit a savings transaction and re-derive the running balances."""
+        self._mutate_fund("savings", trans_id,
+                          lambda: self.funds.update("savings", trans_id, new_date,
+                                                    new_amount, new_notes))
 
     def recalculate_savings_balances(self, individual_id):
         """Recalculate running balances for savings.
@@ -1768,12 +1792,16 @@ class DatabaseManager:
             self.funds.recalculate(table, individual_id)
 
     def fund_delete_transaction(self, table, trans_id):
-        with self.transaction():
-            self.funds.delete(table, trans_id)
+        """Delete a fund transaction and re-derive the running balances."""
+        self._mutate_fund(table, trans_id, lambda: self.funds.delete(table, trans_id))
 
     def fund_delete_batch(self, table, batch_id):
+        """Delete a whole batch and re-derive every affected member's balances."""
+        members = self.funds.members_in_batch(table, batch_id)
         with self.transaction():
             self.funds.delete_batch(table, batch_id)
+            for member_id in members:
+                self.funds.recalculate(table, member_id)
 
     def fund_delete_all(self, table, individual_id):
         with self.transaction():
@@ -1783,9 +1811,9 @@ class DatabaseManager:
         return self.funds.get(table, trans_id)
 
     def fund_update_transaction(self, table, trans_id, date, amount, notes):
-        """Edit a fund transaction's date/amount/notes (caller should recalc after)."""
-        with self.transaction():
-            self.funds.update(table, trans_id, date, amount, notes)
+        """Edit a fund transaction and re-derive the running balances."""
+        self._mutate_fund(table, trans_id,
+                          lambda: self.funds.update(table, trans_id, date, amount, notes))
 
     # ========== BENEVOLENT ENROLMENT ==========
 
