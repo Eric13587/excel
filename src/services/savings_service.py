@@ -7,6 +7,7 @@ This service handles all savings-related operations including:
 """
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+from src.services.policy import Operation, default_policy
 
 
 class SavingsService:
@@ -127,6 +128,10 @@ class SavingsService:
 
     def catch_up_savings(self, individual_id, monthly_amount=None, batch_id=None, target_date=None):
         """Auto-increment savings from last entry up to current month (or target date).
+
+        Refuses for a member who has left the SACCO: catch-up invents
+        contributions going forward, and someone who retired in March should not
+        acquire nine months of deposits. See src/services/policy.py.
         
         If monthly_amount is None/0, uses the amount from the last transaction.
         
@@ -139,6 +144,8 @@ class SavingsService:
         Returns:
             Number of deposits added.
         """
+        default_policy.enforce(self.db, Operation("savings.catch_up",
+                                                  member_id=individual_id))
         transactions = self.db.get_savings_transactions(individual_id)
         
         # Logic to determine start date

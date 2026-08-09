@@ -14,7 +14,6 @@ def _make_source(d):
     src = DatabaseManager(os.path.join(d, "src.db"))
     ind = src.add_individual("Jane Doe", "0712", "j@x",
                              employment_status="Active", pf_no="PF-5", id_no="ID-9")
-    src.retire_individual(ind, "2026-02-01")  # -> is_retired=1, status='Retired'
     loan_id = src.add_loan_record(ind, "L-001", 10000, 12000, 12000, 1000, 100,
                                   "2025-01-01", "2025-02-01")
     if not loan_id:
@@ -25,6 +24,9 @@ def _make_source(d):
     b.enroll(ind, 200, "2025-01-01")
     b.deduct_single(ind)
     src.add_savings_transaction(ind, "2025-01-10", "Deposit", 1000, "")
+    # Retired only after their history exists — a member cannot contribute after
+    # leaving, and src/services/policy.py now refuses it.
+    src.retire_individual(ind, "2026-02-01")  # -> is_retired=1, status='Retired'
     return os.path.join(d, "src.db"), ind
 
 

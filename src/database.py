@@ -1549,18 +1549,69 @@ class DatabaseManager:
 
     # ========== RETIREMENT OPERATIONS ==========
 
+    def set_membership_status(self, ind_id, status, effective_date=None):
+        """Record that a member has left the SACCO — or come back.
+
+        The one supported way to change membership, because three columns have
+        to move together: `employment_status` (what the policy rules read),
+        `is_retired` (what the reports still read) and `retired_date`. Migration
+        004 constrains the last two to agree, and that CHECK is evaluated before
+        any AFTER trigger can mirror a value, so a bare UPDATE of one column is
+        rejected rather than quietly half-applied.
+
+        Args:
+            ind_id: the member.
+            status: one of :data:`src.services.policy.MEMBERSHIP_STATUSES`.
+            effective_date: when it took effect, ``YYYY-MM-DD``. Required for
+                every status except Active; defaults to today.
+        """
+        from src.services.policy import ACTIVE, MEMBERSHIP_STATUSES
+        if status not in MEMBERSHIP_STATUSES:
+            raise ValueError(f"{status!r} is not a membership status "
+                             f"({', '.join(MEMBERSHIP_STATUSES)})")
+        if status == ACTIVE:
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE individuals SET employment_status=?, is_retired=0, "
+                    "retired_date=NULL WHERE id=?", (ACTIVE, ind_id))
+            return
+        when = effective_date or datetime.now().strftime("%Y-%m-%d")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE individuals SET employment_status=?, is_retired=1, "
+                "retired_date=? WHERE id=?", (status, when, ind_id))
+
+    def membership_status(self, ind_id):
+        """``(status, effective_date)``; status is 'Active' when nothing is set."""
+        from src.services.policy import ACTIVE, RETIRED
+        row = self.conn.execute(
+            "SELECT employment_status, is_retired, retired_date FROM individuals "
+            "WHERE id=?", (ind_id,)).fetchone()
+        if row is None:
+            return (None, None)
+        status, is_retired, when = row
+        return (status or (RETIRED if is_retired else ACTIVE), when)
+
     def retire_individual(self, ind_id, date_str):
         """Mark an individual as retired.
+
+        Kept for existing callers; delegates to set_membership_status so the
+        three columns cannot drift apart.
 
         Args:
             ind_id: The individual's ID.
             date_str: Retirement date in YYYY-MM-DD format.
         """
-        with self.transaction():
-            self.members.retire(ind_id, date_str)
+        from src.services.policy import RETIRED
+        self.set_membership_status(ind_id, RETIRED, date_str)
 
     def reinstate_individual(self, ind_id):
-        """Clear retirement flag for an individual."""
+        """Return a member to active membership."""
+        from src.services.policy import ACTIVE
+        self.set_membership_status(ind_id, ACTIVE)
+        return
+
+    def _legacy_reinstate(self, ind_id):
         with self.transaction():
             self.members.reinstate(ind_id)
 
@@ -1614,10 +1665,15 @@ class DatabaseManager:
             new_balance = current_balance + amount
         else:  # Withdrawal
             new_balance = current_balance - amount
-        
+
         with self.transaction():
             self.funds.add("savings", individual_id, date, transaction_type,
                            amount, new_balance, notes, batch_id)
+            # The balance computed above is the running total *as at insertion*,
+            # which is only correct when the row is the newest. Back-date one and
+            # it, and every row after it, is wrong. Re-derive in date order.
+            if self._is_back_dated("savings", individual_id, date):
+                self.funds.recalculate("savings", individual_id)
         return new_balance
     
     def get_savings_balance(self, individual_id):
@@ -1638,10 +1694,26 @@ class DatabaseManager:
         with self.transaction():
             self.funds.recalculate("savings", individual_id)
 
+    def _is_back_dated(self, table, individual_id, date):
+        """True when this row is not the member's latest in that fund.
+
+        Cheap enough to ask on every insert: one indexed MAX over one member.
+        """
+        t = self.funds._table(table)
+        latest = self.conn.execute(
+            f"SELECT MAX(date) FROM {t} WHERE individual_id=?", (individual_id,)).fetchone()[0]
+        return latest is not None and str(date) < str(latest)
+
     def get_savings_transactions(self, individual_id, start_date=None, end_date=None):
-        """Get all savings transactions for an individual."""
+        """A member's savings history, in the order it happened.
+
+        Ordered by date rather than by insertion, so a back-dated deposit shows
+        where it belongs instead of at the bottom of the table. `christmas` and
+        `benevolent` already read this way; savings was the outlier.
+        """
         self.create_savings_table()
-        return self.funds.transactions("savings", individual_id, start_date, end_date, order="id")
+        return self.funds.transactions("savings", individual_id, start_date, end_date,
+                                       order="date, id")
 
     def delete_savings_transaction(self, trans_id):
         """Delete a savings transaction (caller recalculates afterwards)."""
@@ -1684,6 +1756,8 @@ class DatabaseManager:
         with self.transaction():
             self.funds.add(table, individual_id, date, transaction_type, amount,
                            new_balance, notes, batch_id)
+            if self._is_back_dated(table, individual_id, date):
+                self.funds.recalculate(table, individual_id)
         return new_balance
 
     def fund_transactions(self, table, individual_id):

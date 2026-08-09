@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 from src.exceptions import LoanNotFoundError, LoanInactiveError, LoanSuspendedError
 from src.config import DEFAULT_INTEREST_RATE
 from src.db import position_from_frame
+from src.services.policy import Operation, default_policy
 
 
 class LoanService:
@@ -208,6 +209,9 @@ class LoanService:
             LoanNotFoundError: If the loan doesn't exist.
             LoanInactiveError: If the loan is not active.
         """
+        default_policy.enforce(self.db, Operation("loan.catch_up",
+                                                  member_id=individual_id,
+                                                  loan_ref=loan_ref))
         loan = self.db.get_loan_by_ref(individual_id, loan_ref)
         if not loan:
             raise LoanNotFoundError(loan_ref, individual_id)

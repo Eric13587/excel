@@ -10,6 +10,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 from src.exceptions import ChristmasLockedError
+from src.services.policy import Operation, default_policy
 
 _TABLE = "christmas_savings"
 
@@ -90,6 +91,8 @@ class ChristmasService:
         'Deposit' per month through the target month (default: current month).
         Returns the number of contributions added.
         """
+        default_policy.enforce(self.db, Operation("christmas.catch_up",
+                                                  member_id=individual_id))
         df = self.get_transactions(individual_id)
         if df.empty:
             return 0

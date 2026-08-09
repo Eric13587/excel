@@ -284,6 +284,15 @@ def mark_all_applied(conn):
     them keeps ``schema_version`` meaningful and stops them re-running on the
     next open.
 
+    .. warning::
+       This marks every migration on disk as applied, whether or not the
+       bootstrap file actually contains its effects. **Adding a migration
+       therefore requires regenerating the bootstrap**
+       (``python -m tools.dump_schema``); without that, new journals stamp the
+       migration as done and silently never run it. This has already happened
+       once, to migration 012. ``tests/test_schema_current.py`` catches it by
+       regenerating and comparing, which is why that test exists.
+
     The equivalence this relies on is asserted by
     ``tests/test_schema_current.py``, which builds a journal both ways and
     compares the schemas.

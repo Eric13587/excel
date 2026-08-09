@@ -213,6 +213,7 @@ CREATE INDEX idx_individuals_import ON individuals(import_id);
 CREATE INDEX idx_individuals_name_nocase ON individuals(name COLLATE NOCASE);
 CREATE UNIQUE INDEX idx_individuals_pf_no ON individuals(pf_no)
     WHERE pf_no IS NOT NULL AND pf_no != '';
+CREATE INDEX idx_individuals_status ON individuals(employment_status);
 CREATE INDEX idx_ledger_batch ON ledger(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX idx_ledger_date ON ledger(date, id);
 CREATE INDEX idx_ledger_import ON ledger(import_id) WHERE import_id IS NOT NULL;
@@ -333,6 +334,42 @@ END;
 CREATE TRIGGER trg_benev_created AFTER INSERT ON benevolent_ledger
 WHEN NEW.created_at IS NULL
 BEGIN UPDATE benevolent_ledger SET created_at = datetime('now') WHERE id = NEW.id; END;
+CREATE TRIGGER trg_individuals_flag_mirrors_status
+AFTER UPDATE OF is_retired ON individuals
+WHEN (NEW.is_retired = 1 AND NEW.employment_status = 'Active')
+  OR (NEW.is_retired = 0 AND NEW.employment_status <> 'Active')
+BEGIN
+    -- Only the generic word is inferable from the flag; a specific reason
+    -- (Resigned, Deceased) has to be set through employment_status.
+    UPDATE individuals
+       SET employment_status = CASE WHEN NEW.is_retired = 1 THEN 'Retired' ELSE 'Active' END
+     WHERE id = NEW.id;
+END;
+CREATE TRIGGER trg_individuals_status_ins
+BEFORE INSERT ON individuals
+WHEN NEW.employment_status IS NOT NULL
+ AND NEW.employment_status NOT IN
+     ('Active','Retired','Resigned','Terminated','Deceased','Suspended')
+BEGIN
+    SELECT RAISE(ABORT, 'unknown employment_status');
+END;
+CREATE TRIGGER trg_individuals_status_mirrors_flag
+AFTER UPDATE OF employment_status ON individuals
+WHEN NEW.employment_status IS NOT NULL
+BEGIN
+    UPDATE individuals
+       SET is_retired = CASE WHEN NEW.employment_status = 'Active' THEN 0 ELSE 1 END
+     WHERE id = NEW.id
+       AND is_retired IS NOT (CASE WHEN NEW.employment_status = 'Active' THEN 0 ELSE 1 END);
+END;
+CREATE TRIGGER trg_individuals_status_upd
+BEFORE UPDATE OF employment_status ON individuals
+WHEN NEW.employment_status IS NOT NULL
+ AND NEW.employment_status NOT IN
+     ('Active','Retired','Resigned','Terminated','Deceased','Suspended')
+BEGIN
+    SELECT RAISE(ABORT, 'unknown employment_status');
+END;
 CREATE TRIGGER trg_individuals_updated AFTER UPDATE ON individuals
 BEGIN UPDATE individuals SET updated_at = datetime('now') WHERE id = NEW.id; END;
 CREATE TRIGGER trg_ledger_loan_pk AFTER INSERT ON ledger

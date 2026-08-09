@@ -282,3 +282,39 @@ def test_repairable_rows_still_arrive(legacy_source):
             [("Deposit", 500.0)]
     finally:
         db.close()
+
+
+# --------------------------------------------------------------------------- #
+# Employment status is free text in a foreign journal
+# --------------------------------------------------------------------------- #
+
+def test_a_legacy_employment_word_is_mapped_not_rejected():
+    """Migration 012 constrains the vocabulary, and the policy rules read
+    anything that is not 'Active' as "this member has left". An unmapped value
+    would therefore stop somebody's contributions silently, so it is translated
+    and the translation is reported."""
+    from src.db.import_rules import normalise_member
+    out = normalise_member({"name": "Legacy Member", "employment_status": "Employed"})
+    assert out.values["employment_status"] == "Active"
+    assert any("Employed" in w for w in out.warnings)
+
+
+def test_departure_words_map_to_their_status():
+    from src.db.import_rules import normalise_member
+    for raw, expected in (("Pensioner", "Retired"), ("Quit", "Resigned"),
+                          ("Dismissed", "Terminated"), ("Late", "Deceased"),
+                          ("ACTIVE", "Active")):
+        out = normalise_member({"name": "M", "employment_status": raw})
+        assert out.values["employment_status"] == expected, raw
+
+
+def test_an_unrecognised_status_falls_back_to_the_retirement_flag():
+    """The flag is the reliable legacy signal; the word may be anything."""
+    from src.db.import_rules import normalise_member
+    still_here = normalise_member({"name": "M", "employment_status": "Seconded"})
+    assert still_here.values["employment_status"] == "Active"
+
+    left = normalise_member({"name": "M", "employment_status": "Seconded",
+                             "is_retired": 1, "retired_date": "2025-01-01"})
+    assert left.values["employment_status"] == "Retired"
+    assert any("Seconded" in w for w in left.warnings)

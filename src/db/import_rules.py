@@ -107,6 +107,41 @@ def _amount(value):
 # Members
 # --------------------------------------------------------------------------- #
 
+# Employment wording seen in journals that predate the vocabulary migration 012
+# constrains. A foreign journal is free-text, so anything unrecognised falls
+# back to the retirement flag rather than being rejected — the same reasoning
+# that kept migration 004's constraints off the import path.
+_STATUS_SYNONYMS = {
+    "": "Active", "active": "Active", "employed": "Active", "working": "Active",
+    "current": "Active", "in service": "Active", "serving": "Active",
+    "retired": "Retired", "retiree": "Retired", "pensioner": "Retired",
+    "resigned": "Resigned", "quit": "Resigned",
+    "terminated": "Terminated", "dismissed": "Terminated", "sacked": "Terminated",
+    "deceased": "Deceased", "dead": "Deceased", "late": "Deceased",
+    "suspended": "Suspended",
+}
+
+
+def _membership_status(row, out, name):
+    """Map a free-text employment status onto the vocabulary the app enforces.
+
+    An unknown value cannot be kept: migration 012 refuses it, and the policy
+    rules read anything that is not 'Active' as "this member has left", which
+    would silently stop their contributions. So it is mapped, and the mapping
+    is reported.
+    """
+    raw = (row.get("employment_status") or "").strip()
+    mapped = _STATUS_SYNONYMS.get(raw.lower())
+    if mapped:
+        if mapped != raw:
+            out.warnings.append(f"{name}: employment status {raw!r} read as {mapped!r}")
+        return mapped
+    fallback = "Retired" if row.get("is_retired") else "Active"
+    out.warnings.append(
+        f"{name}: unrecognised employment status {raw!r} — recorded as {fallback!r}")
+    return fallback
+
+
 def normalise_member(row):
     """Trim identity fields; reject a member with no usable name.
 
@@ -125,7 +160,7 @@ def normalise_member(row):
 
     for key in ("phone", "email", "pf_no", "id_no"):
         out.values[key] = (row.get(key) or "").strip()
-    out.values["employment_status"] = (row.get("employment_status") or "Active").strip() or "Active"
+    out.values["employment_status"] = _membership_status(row, out, name)
     out.values["default_deduction"] = max(_amount(row.get("default_deduction")) or 0.0, 0.0)
 
     retired_date = normalise_date(row.get("retired_date"))
