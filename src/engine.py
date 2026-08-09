@@ -234,12 +234,15 @@ class LoanEngine:
 
 
 
-    def catch_up_loan(self, individual_id, loan_ref):
-        """Perform deductions until loan is caught up to current date.
-        
-        Delegates to LoanService.
+    def catch_up_loan(self, individual_id, loan_ref, target_date=None):
+        """Deduct until the loan is caught up to ``target_date`` (default: today).
+
+        Delegates to LoanService. The target is offered on every catch-up in the
+        application — a SACCO reconciling a past payroll run needs to stop at the
+        month that run covered, not at whatever today happens to be.
         """
-        return self.loan_service.catch_up_loan(individual_id, loan_ref)
+        return self.loan_service.catch_up_loan(individual_id, loan_ref,
+                                               target_date=target_date)
 
     def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None, target_date=None):
         """Process multiple catch-up operations atomically with undo support.
@@ -579,12 +582,13 @@ class LoanEngine:
         """
         return self.savings_service.get_suggested_increment(individual_id)
 
-    def catch_up_savings(self, individual_id, monthly_amount=None):
-        """Auto-increment savings from last entry up to (but not including) current month.
-        
+    def catch_up_savings(self, individual_id, monthly_amount=None, target_date=None):
+        """Auto-increment savings up to ``target_date`` (default: this month).
+
         Delegates to SavingsService.
         """
-        return self.savings_service.catch_up_savings(individual_id, monthly_amount)
+        return self.savings_service.catch_up_savings(individual_id, monthly_amount,
+                                                     target_date=target_date)
 
     def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None, target_date=None):
         """Process multiple catch-up operations atomically with undo support.

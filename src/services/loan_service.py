@@ -193,6 +193,41 @@ class LoanService:
         self.balance_recalculator.recalculate_balances(individual_id)
         return self.catch_up_loan(individual_id, loan_ref, target_date=limit)
 
+    def remove_suspension(self, individual_id, loan_ref, suspension_id, rebuild=False):
+        """Delete a recorded suspension, optionally re-deducting the months it skipped.
+
+        Removing the record and re-deducting the months are genuinely different
+        acts, and conflating them is how a member ends up either double-charged
+        or quietly let off:
+
+        * ``rebuild=False`` — the span never applied *as a record*. Catch-up
+          will deduct those months from now on, but the months already skipped
+          stay skipped and the loan's term stays extended. This is what you want
+          when the suspension was entered by mistake and the deductions did in
+          fact happen elsewhere.
+        * ``rebuild=True`` — the months should have been collected. The
+          schedule is re-derived from issue so they appear, which is the exact
+          inverse of what the Suspend dialog offers when it applies one.
+
+        Returns ``(removed_span, deductions_created)``. Refuses the rebuild on a
+        loan with top-ups or buy-offs, for the same reason
+        :meth:`rebuild_loan_schedule` does.
+        """
+        span = self.db.loans.suspension(suspension_id)
+        if span is None:
+            return None, 0
+        if rebuild and self.has_loan_restructure_events(individual_id, loan_ref):
+            raise ValueError(
+                "This loan has top-ups or buy-offs, so its schedule cannot be "
+                "rebuilt automatically. Remove the suspension without rebuilding, "
+                "then adjust the affected months by hand.")
+
+        self.db.delete_suspension(suspension_id)
+        if not rebuild:
+            return span, 0
+        created = self.rebuild_loan_schedule(individual_id, loan_ref)
+        return span, created
+
     def catch_up_loan(self, individual_id, loan_ref, batch_id=None, target_date=None):
         """Perform deductions until loan is caught up to current date (or target date).
         

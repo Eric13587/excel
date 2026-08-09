@@ -1321,21 +1321,48 @@ class LedgerView(QWidget):
             span = spans[selected[0].row()]
             until = span["suspend_until"] or "indefinite"
             live = span["status"] == "active"
-            if QMessageBox.question(
-                    dialog, "Remove Suspension",
-                    f"Remove the suspension on {loan_ref} from {span['start_date']} "
-                    f"to {until}?\n\n"
-                    + ("This is the live suspension, so the loan will no longer be "
-                       "suspended.\n\n" if live else "")
-                    + "Future catch-ups will deduct those months again. Months "
-                      "already skipped are not restored by this.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            # Removing the record and re-collecting the months are different
+            # acts. Conflating them is how a member ends up double-charged or
+            # quietly let off, so the choice is put in front of the user.
+            box = QMessageBox(dialog)
+            box.setWindowTitle("Remove Suspension")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f"Remove the suspension on {loan_ref} from "
+                        f"{span['start_date']} to {until}?")
+            box.setInformativeText(
+                ("This is the live suspension, so the loan will no longer be "
+                 "suspended.\n\n" if live else "")
+                + "What should happen to the months it skipped?")
+            keep = box.addButton("Leave them skipped", QMessageBox.ButtonRole.AcceptRole)
+            collect = box.addButton("Deduct them now", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            keep.setToolTip("The record goes; the loan keeps its extended term.")
+            collect.setToolTip("Rebuild the schedule so those months are collected.")
+            box.setDefaultButton(keep)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked not in (keep, collect):
                 return
-            self.engine.db.delete_suspension(span["id"])
+
+            rebuild = clicked is collect
+            if rebuild:
+                backup = self._backup_before("remove-suspension", loan_ref)
+                if backup is False:
+                    return
+            try:
+                _span, created = self.engine.loan_service.remove_suspension(
+                    self.current_individual_id, loan_ref, span["id"], rebuild=rebuild)
+            except ValueError as e:
+                QMessageBox.warning(dialog, "Cannot Rebuild", str(e))
+                return
             reload_spans()
             self.refresh_table()
             self.refresh_loans_list()
+            if rebuild:
+                QMessageBox.information(
+                    dialog, "Suspension Removed",
+                    f"The suspension was removed and {loan_ref}'s schedule "
+                    f"rebuilt — {created} deduction(s) now cover the period.")
 
         buttons = QHBoxLayout()
         remove_btn = QPushButton("Remove Selected")
@@ -1631,7 +1658,7 @@ class LedgerView(QWidget):
 
 
     def loans_catch_up_to_current(self, loan_ref=None):
-        """Run auto deductions for all active loans from next_due_date to current month (exclusive)."""
+        """Run auto deductions for active loans up to a month the user chooses."""
         active_loans = self.engine.db.get_active_loans(self.current_individual_id)
         if loan_ref:
             active_loans = [l for l in active_loans if l['ref'] == loan_ref]
@@ -1644,10 +1671,20 @@ class LedgerView(QWidget):
             return
         
         from dateutil.relativedelta import relativedelta
-        
-        # Target: last day of previous month
-        current_month_start = datetime.now().replace(day=1)
-        to_date = (current_month_start - relativedelta(days=1)).strftime("%Y-%m-%d")
+
+        from src.views.catch_up_target import ask_catch_up_target
+
+        # Which month to stop at. It used to be "the month before today" with no
+        # say in it, which invents deductions nobody took when the SACCO is
+        # reconciling an older payroll run.
+        target = ask_catch_up_target(
+            self, what="loan deductions",
+            default=datetime.now() - relativedelta(months=1),
+            hint="Deductions are created for every due month up to and including "
+                 "this one. Set it to the month your last payroll run covered.")
+        if target is None:
+            return
+        to_date = (target.replace(day=1) + relativedelta(months=1, days=-1)).strftime("%Y-%m-%d")
         
         total_deductions = 0
         loans_processed = 0

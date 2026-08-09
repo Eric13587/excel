@@ -123,18 +123,48 @@ was one parameter and the running totals were one shared post-write step. What
 makes the loan table hard is that it edits cells that are *derived* — the
 balance column, the principal/interest split — as though they were facts.
 
-## 7. What I would do, in order
+## 7. Correction: step 1 as first written does not work
 
-1. **Pick one recalculator.** `recalculate_balances` is the one that is right on
-   the back-dated case and has 22 of the 32 call sites. Point the other 10 at
-   it and delete 440 lines. Low risk, immediate correctness win, no schema
-   change.
+The original recommendation — consolidate on `recalculate_balances` and delete
+440 lines — was drawn from the back-dated case alone. Looking further, the three
+do **different jobs**, not the same job differently:
+
+| | what it actually does |
+|---|---|
+| `recalculate_balances` | re-adds the running balance column; keeps stored splits |
+| `recalculate_loan_history` | recomputes the principal/interest **splits** from current terms |
+| `recalculate_smart_loan_ledger` | re-simulates from issue |
+
+On an untouched loan all three leave every row identical — verified row by row,
+contradicting an earlier reading of a faulty differential script. On an edited
+repayment, `recalculate_loan_history` rewrites the splits (750 → 1,250 interest)
+where `recalculate_balances` leaves them alone. Deleting either loses behaviour.
+
+**The real consolidation is `derive()`, which does both jobs in one function** —
+but only when the split is left to it. Given a 9,000 repayment:
+
+```
+recalculate_balances     principal 85,000   (keeps the stale 5,000 split)
+recalculate_loan_history principal 85,000   (rewrites splits, not the balance)
+derive() from stored rows principal 85,000   (replays the stale stored split)
+derive() split unasserted principal 81,750   correct
+```
+
+That last line is the whole argument. The derivation is right; what is wrong is
+asking it to replay a split that a UI edit left stale. In an event model an edit
+records `PaymentReceived(amount=9000)` with no split, and the answer is correct
+by construction.
+
+So the revised order is:
+
+1. **Do not consolidate by deletion.** Two of the three are load-bearing.
 2. **Make the loan write path repair like the funds do** — a shared post-write
    step, so a back-dated row cannot leave the rows below it stale.
-3. **Then** the event model, which makes the derived columns read-only in the
-   UI and removes the "which recalculator?" question permanently.
+3. **The event model**, which subsumes all four: it makes the derived columns
+   read-only in the UI, so a stale split cannot be created in the first place,
+   and removes the "which recalculator?" question rather than answering it.
 
-Steps 1 and 2 are independently valuable and do not commit to step 3.
+Step 2 is independently valuable. Step 1 is now "leave it alone until step 3".
 
 ## 8. The honest caveats
 
