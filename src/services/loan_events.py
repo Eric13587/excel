@@ -83,9 +83,17 @@ def reconstruct(ledger_rows, suspensions=()):
                 current_rate = amount
 
         elif kind in _PAYMENTS:
+            # A split of 0/0 is not an assertion that nothing was allocated — it
+            # is the absence of one, which is what an edited amount leaves
+            # behind once the stale split is cleared. Passing it through as a
+            # fact makes the derivation apply a zero allocation and the payment
+            # reduce nothing. Absent means "work it out".
+            split_recorded = bool(principal) or bool(interest)
             events.append(LoanEvent(
                 date=date, kind=SETTLED if kind == "Loan Buyoff" else PAYMENT_RECEIVED,
-                seq=seq, amount=deducted or 0, principal=principal, interest=interest,
+                seq=seq, amount=deducted or 0,
+                principal=principal if split_recorded else None,
+                interest=interest if split_recorded else None,
                 ref=row_id))
 
     for start, until in suspensions:
