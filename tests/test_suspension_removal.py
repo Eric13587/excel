@@ -128,3 +128,81 @@ def test_a_savings_catch_up_accepts_a_target(loan):
     dates = [r[0] for r in db.conn.execute(
         "SELECT date FROM savings WHERE individual_id=? ORDER BY date", (ind,))]
     assert max(dates) <= "2025-04-30"
+
+
+# --------------------------------------------------------------------------- #
+# Complex histories: rebuild only where a replay is actually faithful
+# --------------------------------------------------------------------------- #
+
+def _edit_first_repayment(db, ind, amount=20000):
+    row_id = db.conn.execute(
+        "SELECT id FROM ledger WHERE individual_id=? AND event_type='Repayment' "
+        "ORDER BY date LIMIT 1", (ind,)).fetchone()[0]
+    date = db.conn.execute("SELECT date FROM ledger WHERE id=?", (row_id,)).fetchone()[0]
+    db.update_transaction(row_id, date, 0, amount, "hand-corrected", mark_edited=True)
+    return row_id
+
+
+def test_a_rebuild_is_refused_when_it_would_wipe_a_hand_edit(loan):
+    """rebuild_loan_schedule regenerates every repayment at the scheduled
+    amount, so a correction of 20,000 came back as 5,750 — silently, and the
+    balance moved by 750. There are 89 such rows across 19 production loans."""
+    db, engine, ind, lid = loan
+    _edit_first_repayment(db, ind)
+    before_rows = db.conn.execute(
+        "SELECT COUNT(*) FROM ledger WHERE individual_id=?", (ind,)).fetchone()[0]
+    before_balance = db.get_loan_by_ref(ind, "L-001")["balance"]
+    span = db.get_loan_suspensions_for_loan(lid)[0]
+
+    with pytest.raises(ValueError, match="hand-edited"):
+        engine.loan_service.remove_suspension(ind, "L-001", span["id"], rebuild=True)
+
+    assert db.conn.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=?",
+                           (ind,)).fetchone()[0] == before_rows
+    assert db.get_loan_by_ref(ind, "L-001")["balance"] == before_balance
+    assert db.get_loan_suspensions_for_loan(lid), "nothing removed when it cannot finish"
+
+
+def test_the_edit_survives_because_the_rebuild_refused(loan):
+    db, engine, ind, lid = loan
+    row_id = _edit_first_repayment(db, ind)
+    span = db.get_loan_suspensions_for_loan(lid)[0]
+    with pytest.raises(ValueError):
+        engine.loan_service.remove_suspension(ind, "L-001", span["id"], rebuild=True)
+    assert db.conn.execute("SELECT deducted FROM ledger WHERE id=?",
+                           (row_id,)).fetchone()[0] == 20000
+
+
+def test_removing_without_rebuilding_still_works_on_an_edited_loan(loan):
+    """The refusal is about regenerating rows, not about removing the record."""
+    db, engine, ind, lid = loan
+    _edit_first_repayment(db, ind)
+    span = db.get_loan_suspensions_for_loan(lid)[0]
+
+    removed, created = engine.loan_service.remove_suspension(ind, "L-001", span["id"])
+    assert removed is not None and created == 0
+    assert db.get_loan_suspensions_for_loan(lid) == []
+
+
+def test_a_rebuilt_plain_loan_agrees_with_its_own_replay(loan):
+    """Where a rebuild *is* allowed, the result must be what the derivation
+    says it should be — otherwise the rebuild is inventing history."""
+    from src.services.loan_derivation import derive
+    from src.services.loan_events import reconstruct_for_loan
+
+    db, engine, ind, lid = loan
+    span = db.get_loan_suspensions_for_loan(lid)[0]
+    engine.loan_service.remove_suspension(ind, "L-001", span["id"], rebuild=True)
+
+    derived = derive(reconstruct_for_loan(db, ind, "L-001"))
+    assert abs(derived.principal_balance
+               - db.get_loan_by_ref(ind, "L-001")["balance"]) < 0.51
+
+
+def test_has_manual_edits_sees_only_this_loan(loan):
+    """Scoped by member and ref, since a ref is unique per member only."""
+    db, engine, ind, _lid = loan
+    assert not engine.loan_service.has_manual_edits(ind, "L-001")
+    _edit_first_repayment(db, ind)
+    assert engine.loan_service.has_manual_edits(ind, "L-001")
+    assert not engine.loan_service.has_manual_edits(ind, "L-999")
