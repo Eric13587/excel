@@ -112,6 +112,27 @@ class IndividualCard(QFrame):
         self.dashboard.open_ledger_by_id(self.ind_id, self.name)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event):
+        """Per-member actions on right-click, so the list needs no button bar."""
+        self.dashboard.select_individual(self)
+        menu = QMenu(self)
+        open_a = menu.addAction("Open Ledger")
+        edit_a = menu.addAction("Edit Details…")
+        retire_a = menu.addAction("Reinstate" if self.is_retired else "Retire")
+        menu.addSeparator()
+        delete_a = menu.addAction("Delete")
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
+        if chosen == open_a:
+            self.dashboard.open_ledger_by_id(self.ind_id, self.name)
+        elif chosen == edit_a:
+            self.dashboard.edit_individual()
+        elif chosen == retire_a:
+            self.dashboard.retire_individual_btn()
+        elif chosen == delete_a:
+            self.dashboard.delete_individual()
+
     def set_selected(self, selected):
         self._is_selected = selected
         self.update_style()
@@ -420,151 +441,13 @@ class Dashboard(QWidget):
 
         self.scroll_area.setWidget(self.scroll_content)
         content_layout.addWidget(self.scroll_area)
-        
-        # Bottom Actions Section
-        self.actions_container = QFrame()
-        self.actions_container.setFixedHeight(72)
-        
-        # Shadow for actions bar
-        action_shadow = QGraphicsDropShadowEffect()
-        action_shadow.setBlurRadius(30)
-        action_shadow.setOffset(0, 10)
-        action_shadow.setColor(QColor(0, 0, 0, 20))
-        self.actions_container.setGraphicsEffect(action_shadow)
-        self.actions_shadow = action_shadow
-        
-        actions_layout = QHBoxLayout(self.actions_container)
-        actions_layout.setContentsMargins(20, 10, 20, 10)
-        actions_layout.setSpacing(15)
-        
-        self.open_btn = QPushButton("Open Ledger")
-        self.open_btn.clicked.connect(self.open_ledger_btn)
-        self.open_btn.setEnabled(False)
-        
-        self.edit_btn = QPushButton("Edit Details")
-        self.edit_btn.clicked.connect(self.edit_individual)
-        self.edit_btn.setEnabled(False)
-        
-        self.delete_btn = QPushButton("Delete")
-        self.delete_btn.clicked.connect(self.delete_individual)
-        self.delete_btn.setEnabled(False)
-        
-        self.retire_btn = QPushButton("Retire")
-        self.retire_btn.clicked.connect(self.retire_individual_btn)
-        self.retire_btn.setEnabled(False)
-        
-        actions_layout.addWidget(self.open_btn)
-        actions_layout.addWidget(self.edit_btn)
-        actions_layout.addWidget(self.retire_btn)
-        actions_layout.addStretch()
-        actions_layout.addWidget(self.delete_btn)
-        
-        content_layout.addWidget(self.actions_container)
-        
-        # --- FOOTER / UTILITY SECTION ---
-        utility_layout = QHBoxLayout()
-        utility_layout.setSpacing(15)
-        
-        self.print_selected_btn = QPushButton("Print Statements")
-        self.print_selected_btn.clicked.connect(self.batch_print_selected)
-        
-        self.reports_btn = QPushButton("Quarterly Reports")
-        reports_menu = QMenu(self)
-        
-        loan_report_action = QAction("Loan Report", self)
-        loan_report_action.triggered.connect(self.generate_quarterly_report)
-        reports_menu.addAction(loan_report_action)
 
-        savings_report_action = QAction("Savings / Shares Report", self)
-        savings_report_action.triggered.connect(
-            lambda: self._open_fund_report_dialog("savings", "Savings / Shares"))
-        reports_menu.addAction(savings_report_action)
+        # Per-member actions (Open Ledger / Edit / Retire / Delete) live on the
+        # card right-click menu; whole-journal actions (Reports, Operations,
+        # Settings) live on the window menu bar — so the list stays uncluttered.
 
-        christmas_report_action = QAction("Christmas Report", self)
-        christmas_report_action.triggered.connect(
-            lambda: self._open_fund_report_dialog("christmas", "Christmas"))
-        reports_menu.addAction(christmas_report_action)
-
-        benevolent_report_action = QAction("Benevolent Report", self)
-        benevolent_report_action.triggered.connect(
-            lambda: self._open_fund_report_dialog("benevolent", "Benevolent"))
-        reports_menu.addAction(benevolent_report_action)
-
-        reports_menu.addSeparator()
-        members_list_action = QAction("Members List (Excel / PDF)…", self)
-        members_list_action.triggered.connect(self.export_members_list)
-        reports_menu.addAction(members_list_action)
-
-        self.reports_btn.setMenu(reports_menu)
-        
-        self.settings_btn = QPushButton("Settings")
-        self.settings_btn.clicked.connect(self.open_settings)
-        
-        self.mass_ops_btn = QPushButton("Mass Operations")
-
-        mass_menu = QMenu(self)
-        deduct_action = QAction("Mass Deduct (Loans)", self)
-        deduct_action.triggered.connect(self.open_mass_deduction_dialog)
-        mass_menu.addAction(deduct_action)
-        
-        savings_action = QAction("Mass Savings (Increments)", self)
-        savings_action.triggered.connect(self.open_mass_savings_dialog)
-        mass_menu.addAction(savings_action)
-
-        christmas_action = QAction("Mass Christmas (Contributions)", self)
-        christmas_action.triggered.connect(self.open_mass_christmas_dialog)
-        mass_menu.addAction(christmas_action)
-
-        benevolent_action = QAction("Mass Benevolent (Deductions)", self)
-        benevolent_action.triggered.connect(self.open_mass_benevolent_dialog)
-        mass_menu.addAction(benevolent_action)
-
-        mass_menu.addSeparator()
-
-        repair_action = QAction("Repair Loans (legacy terms)…", self)
-        repair_action.triggered.connect(self.open_repair_loans_dialog)
-        mass_menu.addAction(repair_action)
-
-        orphan_action = QAction("Repair Orphaned Records…", self)
-        orphan_action.triggered.connect(self.open_orphan_repair_dialog)
-        mass_menu.addAction(orphan_action)
-
-        activity_action = QAction("Activity Log…", self)
-        activity_action.triggered.connect(self.show_activity_log)
-        mass_menu.addAction(activity_action)
-
-        health_action = QAction("Journal Health Check…", self)
-        health_action.triggered.connect(self.show_health_check)
-        mass_menu.addAction(health_action)
-
-        # Backups were written and their paths reported, but opening one meant
-        # finding it on disk — not a thing to ask of someone mid-mistake.
-        restore_action = QAction("Restore From Backup…", self)
-        restore_action.triggered.connect(self.open_restore_dialog)
-        mass_menu.addAction(restore_action)
-
-        mass_menu.addSeparator()
-        
-        self.undo_mass_action = QAction("Undo Last Mass Operation", self)
-        self.undo_mass_action.triggered.connect(self.undo_mass_operation)
-        self.undo_mass_action.setEnabled(True) # Always enabled, check in handler?
-        # Or better: Context menu 'aboutToShow' capable?
-        # For simplicity: Keep enabled, show message if nothing to undo.
-        mass_menu.addAction(self.undo_mass_action)
-        
-        self.mass_ops_btn.setMenu(mass_menu)
-        
-        
-        utility_layout.addWidget(self.print_selected_btn)
-        utility_layout.addWidget(self.reports_btn)
-        utility_layout.addStretch()
-        utility_layout.addWidget(self.settings_btn)
-        utility_layout.addWidget(self.mass_ops_btn)
-        
-        content_layout.addLayout(utility_layout)
-        
         self.main_layout.addWidget(self.content_container)
-        
+
         self.refresh_list()
 
     def apply_theme(self):
@@ -638,7 +521,6 @@ class Dashboard(QWidget):
              # QColor can parse this
              c = QColor(t.get_color("shadow"))
              self.search_shadow.setColor(c)
-             self.actions_shadow.setColor(c)
         except Exception:       # noqa: BLE001 - cosmetic only
              # A theme without a parseable shadow colour must not stop the
              # dashboard painting; debug rather than warning, since the only
@@ -666,42 +548,6 @@ class Dashboard(QWidget):
                 background: {t.get_color('text_secondary')};
             }}
         """)
-
-        # Action Bar
-        self.actions_container.setStyleSheet(f"""
-            QFrame {{
-                background-color: {t.get_color('bg_secondary')}; 
-                border: 1px solid {t.get_color('border')}; 
-                border-radius: 12px;
-            }}
-        """)
-
-        # Action Buttons
-        self.open_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {t.get_color('accent')}; color: white; font-weight: 600; padding: 10px 24px; border-radius: 6px; border: none; }}
-            QPushButton:disabled {{ background-color: {t.get_color('border')}; color: {t.get_color('text_secondary')}; }}
-            QPushButton:hover:!disabled {{ background-color: {t.get_color('accent_hover')}; }}
-        """)
-        
-        self.edit_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {t.get_color('bg_secondary')}; color: {t.get_color('text_primary')}; font-weight: 600; padding: 10px 24px; border-radius: 6px; border: 1px solid {t.get_color('border')}; }}
-            QPushButton:disabled {{ color: {t.get_color('border')}; border-color: {t.get_color('border')}; }}
-            QPushButton:hover:!disabled {{ background-color: {t.get_color('bg_primary')}; border-color: {t.get_color('text_secondary')}; }}
-        """)
-        
-        self.delete_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {t.get_color('danger_bg')}; color: {t.get_color('danger')}; font-weight: 600; padding: 10px 24px; border-radius: 6px; border: 1px solid {t.get_color('danger_border')}; }}
-            QPushButton:disabled {{ background-color: {t.get_color('bg_secondary')}; color: {t.get_color('border')}; border-color: {t.get_color('border')}; }}
-            QPushButton:hover:!disabled {{ background-color: {t.get_color('danger_border')}; border-color: {t.get_color('danger')}; }}
-        """)
-        
-        # Action buttons — semantic roles from the theme palette, so they
-        # follow Light/Dark switches (incl. hover + disabled states).
-        self.retire_btn.setStyleSheet(t.button_css("danger"))
-        self.print_selected_btn.setStyleSheet(t.button_css("accent"))
-        self.reports_btn.setStyleSheet(t.button_css("success"))
-        self.settings_btn.setStyleSheet(t.button_css("neutral"))
-        self.mass_ops_btn.setStyleSheet(t.button_css("purple"))
 
         # Update all cards
         for card in self.card_widgets:
@@ -792,8 +638,7 @@ class Dashboard(QWidget):
         # Clear existing items
         self.card_widgets = []
         self.selected_card = None
-        self.update_action_buttons()
-        
+
         # Remove the previous cards, but keep the empty-state label in place.
         for i in reversed(range(self.scroll_content_layout.count())):
             widget = self.scroll_content_layout.itemAt(i).widget()
@@ -843,32 +688,11 @@ class Dashboard(QWidget):
     def _on_selection_changed(self, card):
         """Callback when selection changes via UIStateManager."""
         self.selected_card = card  # Sync legacy attribute
-        self.update_action_buttons()
 
     def select_individual(self, card):
         """Select a card using UIStateManager."""
         self._ui_state.select(card)
         # Legacy sync is handled via _on_selection_changed callback
-
-    def update_action_buttons(self):
-        enabled = (self.selected_card is not None)
-        self.open_btn.setEnabled(enabled)
-        self.edit_btn.setEnabled(enabled)
-        self.delete_btn.setEnabled(enabled)
-        self.retire_btn.setEnabled(enabled)
-        
-        # Update retire button text/colour; grey out when nothing is selected
-        # (a :disabled rule, since the solid red/green otherwise looks enabled).
-        disabled_css = ("QPushButton:disabled { background-color: "
-                        f"{self.theme_manager.get_color('border')}; "
-                        f"color: {self.theme_manager.get_color('text_secondary')}; }}")
-        if self.selected_card and self.selected_card.is_retired:
-            self.retire_btn.setText("Reinstate")
-            base = "background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;"
-        else:
-            self.retire_btn.setText("Retire")
-            base = "background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;"
-        self.retire_btn.setStyleSheet(f"QPushButton {{ {base} }} {disabled_css}")
 
     def add_individual(self):
         self.loan_controller.add_individual(IndividualDialog)

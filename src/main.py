@@ -187,49 +187,77 @@ class MainApp(QMainWindow):
             self.status_journal.setText(f"{org}  •  {name}" if org else name)
             self.status_journal.setToolTip(self.db_path)
 
+    def _menu_action(self, menu, text, slot, tip=None):
+        """Add one action to a menu, wired to a slot. Returns the QAction."""
+        action = QAction(text, self)
+        if tip:
+            action.setStatusTip(tip)
+        action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
+
     def create_menus(self):
-        """Build the application menu bar: File / Edit / Tools / Help."""
+        """Build the application menu bar.
+
+        Whole-journal actions that used to be a wall of buttons on the dashboard
+        live here — Reports, Operations and Tools — so they are reachable from
+        either screen and the list itself stays uncluttered.
+        """
         menubar = self.menuBar()
+        d = self.dashboard
 
         file_menu = menubar.addMenu("&File")
-        exit_action = QAction("E&xit", self)
+        exit_action = self._menu_action(file_menu, "E&xit", self.close, "Close LoanMaster")
         exit_action.setShortcut(QKeySequence.StandardKey.Quit)
-        exit_action.setStatusTip("Close LoanMaster")
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
 
         # Undo/Redo keep their existing shortcuts; a menu action's shortcut is
         # active whenever this window is, so no separate addAction is needed.
         edit_menu = menubar.addMenu("&Edit")
-        undo_action = QAction("Undo", self)
+        undo_action = self._menu_action(edit_menu, "Undo", self.undo_operation,
+                                        "Undo the last operation")
         undo_action.setShortcut(QKeySequence("Ctrl+Alt+Z"))
-        undo_action.setStatusTip("Undo the last operation")
-        undo_action.triggered.connect(self.undo_operation)
-        edit_menu.addAction(undo_action)
-        redo_action = QAction("Redo", self)
+        redo_action = self._menu_action(edit_menu, "Redo", self.redo_operation,
+                                        "Redo the last undone operation")
         redo_action.setShortcut(QKeySequence("Ctrl+Alt+Y"))
-        redo_action.setStatusTip("Redo the last undone operation")
-        redo_action.triggered.connect(self.redo_operation)
-        edit_menu.addAction(redo_action)
+
+        reports_menu = menubar.addMenu("&Reports")
+        self._menu_action(reports_menu, "Loan (Quarterly) Report…",
+                          d.generate_quarterly_report)
+        self._menu_action(reports_menu, "Savings / Shares Report…",
+                          lambda: d._open_fund_report_dialog("savings", "Savings / Shares"))
+        self._menu_action(reports_menu, "Christmas Report…",
+                          lambda: d._open_fund_report_dialog("christmas", "Christmas"))
+        self._menu_action(reports_menu, "Benevolent Report…",
+                          lambda: d._open_fund_report_dialog("benevolent", "Benevolent"))
+        reports_menu.addSeparator()
+        self._menu_action(reports_menu, "Members List (Excel / PDF)…",
+                          d.export_members_list)
+        self._menu_action(reports_menu, "Statements…", d.batch_print_selected,
+                          "Generate member statements as PDF or Excel")
+
+        ops_menu = menubar.addMenu("&Operations")
+        self._menu_action(ops_menu, "Mass Deduct (Loans)…", d.open_mass_deduction_dialog)
+        self._menu_action(ops_menu, "Mass Savings (Increments)…", d.open_mass_savings_dialog)
+        self._menu_action(ops_menu, "Mass Christmas (Contributions)…", d.open_mass_christmas_dialog)
+        self._menu_action(ops_menu, "Mass Benevolent (Deductions)…", d.open_mass_benevolent_dialog)
+        ops_menu.addSeparator()
+        self._menu_action(ops_menu, "Undo Last Mass Operation", d.undo_mass_operation)
 
         tools_menu = menubar.addMenu("&Tools")
-        settings_action = QAction("Settings…", self)
-        settings_action.setStatusTip("Organization, financial and appearance settings")
-        settings_action.triggered.connect(self.open_settings)
-        tools_menu.addAction(settings_action)
-        health_action = QAction("Journal Health Check…", self)
-        health_action.setStatusTip("Run every integrity check on this journal")
-        health_action.triggered.connect(self.show_health_check)
-        tools_menu.addAction(health_action)
+        self._menu_action(tools_menu, "Settings…", self.open_settings,
+                          "Organization, financial and appearance settings")
+        tools_menu.addSeparator()
+        self._menu_action(tools_menu, "Repair Loans (legacy terms)…", d.open_repair_loans_dialog)
+        self._menu_action(tools_menu, "Repair Orphaned Records…", d.open_orphan_repair_dialog)
+        self._menu_action(tools_menu, "Activity Log…", d.show_activity_log)
+        self._menu_action(tools_menu, "Restore From Backup…", d.open_restore_dialog)
+        self._menu_action(tools_menu, "Journal Health Check…", self.show_health_check,
+                          "Run every integrity check on this journal")
 
         help_menu = menubar.addMenu("&Help")
-        about_action = QAction("About LoanMaster", self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
-        log_action = QAction("Open Log Folder", self)
-        log_action.setStatusTip("Open the folder with the application log, to send to support")
-        log_action.triggered.connect(self.open_log_folder)
-        help_menu.addAction(log_action)
+        self._menu_action(help_menu, "About LoanMaster", self.show_about)
+        self._menu_action(help_menu, "Open Log Folder", self.open_log_folder,
+                          "Open the folder with the application log, to send to support")
 
     def open_settings(self):
         """Open the settings dialog (owned by the dashboard)."""
