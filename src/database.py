@@ -1690,6 +1690,11 @@ class DatabaseManager:
         self.create_savings_table()
         return self.funds.balance("savings", individual_id)
 
+    def get_total_savings(self):
+        """Portfolio-wide savings balance across every member (one query)."""
+        self.create_savings_table()
+        return self.funds.total("savings")
+
     def recalculate_savings_balance(self, individual_id, cursor=None):
         """Recalculate the stored running balance for a member's savings.
 

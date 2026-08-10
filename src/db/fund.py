@@ -59,6 +59,18 @@ class FundRepository(Repository):
             f"THEN -amount ELSE amount END), 0) FROM {t} WHERE individual_id=?",
             (member_id,), 0.0) or 0.0, 2)
 
+    def total(self, table):
+        """Portfolio-wide balance across every member for a fund.
+
+        The whole-journal counterpart of :meth:`balance`, summed the same way
+        (deposits minus withdrawals) so the dashboard total agrees with the sum
+        of the members. One query, not one per member.
+        """
+        t = self._table(table)
+        return round(self._scalar(
+            f"SELECT COALESCE(SUM(CASE transaction_type WHEN 'Withdrawal' "
+            f"THEN -amount ELSE amount END), 0) FROM {t}", (), 0.0) or 0.0, 2)
+
     def transactions(self, table, member_id, start_date=None, end_date=None, order="date, id"):
         """A member's fund history as a DataFrame."""
         t = self._table(table)

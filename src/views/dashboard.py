@@ -365,7 +365,11 @@ class Dashboard(QWidget):
         content_layout = QVBoxLayout(self.content_container)
         content_layout.setContentsMargins(40, 30, 40, 30)
         content_layout.setSpacing(20)
-        
+
+        # Portfolio summary — the home screen's job is money management, so the
+        # totals belong up top rather than one member-ledger at a time.
+        content_layout.addWidget(self._build_summary_band())
+
         # Search Section
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
@@ -691,8 +695,85 @@ class Dashboard(QWidget):
         for card in self.card_widgets:
             card.apply_theme()
 
+        # KPI band tracks the theme too; refresh_summary re-sets the arrears colour.
+        self._style_summary_band()
+        self.refresh_summary()
+
+
+    def _make_stat_card(self, caption):
+        """One KPI tile: a big value over a small caption. Returns (card, value_label)."""
+        card = QFrame()
+        card.setObjectName("statCard")
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 12, 16, 12)
+        v.setSpacing(2)
+        value = QLabel("—")
+        value.setObjectName("statValue")
+        cap = QLabel(caption)
+        cap.setObjectName("statCaption")
+        v.addWidget(value)
+        v.addWidget(cap)
+        return card, value
+
+    def _build_summary_band(self):
+        """A row of KPI tiles: members, active loans, outstanding, arrears, savings."""
+        self.summary_frame = QFrame()
+        row = QHBoxLayout(self.summary_frame)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(16)
+        specs = [
+            ("stat_members", "Members"),
+            ("stat_loans", "Active Loans"),
+            ("stat_outstanding", "Outstanding"),
+            ("stat_arrears", "Loans in Arrears"),
+            ("stat_savings", "Total Savings"),
+        ]
+        for attr, caption in specs:
+            card, value = self._make_stat_card(caption)
+            setattr(self, attr, value)
+            row.addWidget(card)
+        return self.summary_frame
+
+    def _style_summary_band(self):
+        """Theme the KPI tiles (called on build and on theme change)."""
+        if not hasattr(self, "summary_frame"):
+            return
+        t = self.theme_manager
+        self.summary_frame.setStyleSheet(
+            f"#statCard {{ background-color: {t.get_color('card_bg')}; "
+            f"border: 1px solid {t.get_color('card_border')}; border-radius: 10px; }} "
+            f"#statValue {{ font-size: 22px; font-weight: bold; "
+            f"color: {t.get_color('text_primary')}; }} "
+            f"#statCaption {{ font-size: 11px; color: {t.get_color('text_secondary')}; }}")
+
+    def refresh_summary(self):
+        """Recompute the KPI band from cheap aggregate queries (no per-member loop)."""
+        if not hasattr(self, "stat_members"):
+            return
+        try:
+            active_loans = self.db.get_all_active_loans()
+            outstanding = sum(float(loan.get("balance") or 0) for loan in active_loans)
+            members = len(self.db.get_individuals())
+            arrears = self.db.get_overdue_count()
+            savings = self.db.get_total_savings()
+        except Exception:
+            logger.exception("Could not compute the dashboard summary")
+            return
+
+        self.stat_members.setText(f"{members:,}")
+        self.stat_loans.setText(f"{len(active_loans):,}")
+        self.stat_outstanding.setText(format_money(outstanding))
+        self.stat_savings.setText(format_money(savings))
+
+        # Arrears is the number to act on: colour it when there is anything there.
+        self.stat_arrears.setText(f"{arrears:,}")
+        colour = self.theme_manager.get_color("danger" if arrears else "text_primary")
+        self.stat_arrears.setStyleSheet(
+            f"font-size: 22px; font-weight: bold; color: {colour};")
 
     def refresh_list(self, select_id=None):
+        # Keep the portfolio totals in step with every add/edit/delete/import.
+        self.refresh_summary()
         # Clear existing items
         self.card_widgets = []
         self.selected_card = None
