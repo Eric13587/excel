@@ -405,7 +405,19 @@ class Dashboard(QWidget):
         self.scroll_content_layout.setSpacing(12)
         self.scroll_content_layout.setContentsMargins(0, 5, 5, 5) # Right margin for scrollbar
         self.scroll_content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        
+
+        # Empty-state message: shown when there are no members at all, or when a
+        # search matches none. It stays in the layout across refreshes (cards are
+        # removed around it), so a fresh install and a no-match search are no
+        # longer a silent blank panel.
+        self.empty_label = QLabel("")
+        self.empty_label.setObjectName("emptyState")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setContentsMargins(20, 40, 20, 40)
+        self.empty_label.setVisible(False)
+        self.scroll_content_layout.addWidget(self.empty_label)
+
         self.scroll_area.setWidget(self.scroll_content)
         content_layout.addWidget(self.scroll_area)
         
@@ -699,6 +711,9 @@ class Dashboard(QWidget):
         self._style_summary_band()
         self.refresh_summary()
 
+        if hasattr(self, "empty_label"):
+            self.empty_label.setStyleSheet(t.hint_css(15))
+
 
     def _make_stat_card(self, caption):
         """One KPI tile: a big value over a small caption. Returns (card, value_label)."""
@@ -779,15 +794,16 @@ class Dashboard(QWidget):
         self.selected_card = None
         self.update_action_buttons()
         
-        while self.scroll_content_layout.count():
-            item = self.scroll_content_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
+        # Remove the previous cards, but keep the empty-state label in place.
+        for i in reversed(range(self.scroll_content_layout.count())):
+            widget = self.scroll_content_layout.itemAt(i).widget()
+            if widget is not None and widget is not self.empty_label:
+                self.scroll_content_layout.takeAt(i)
                 widget.deleteLater()
-                
+
         individuals = self.db.get_individuals()
         individuals.sort(key=lambda x: x[1].lower())
-        
+
         for idx, ind in enumerate(individuals, 1):
              # ind: [id, name, phone, email, default_deduction, created_at, import_id, is_retired, retired_date]
              ind_details = self.db.get_individual(ind[0])
@@ -795,7 +811,15 @@ class Dashboard(QWidget):
              card = IndividualCard(ind[0], ind[1], ind[2], ind[3], self, is_retired=is_retired)
              self.scroll_content_layout.addWidget(card)
              self.card_widgets.append(card)
-        
+
+        # Fresh install / everyone deleted: guide the user instead of a blank panel.
+        if individuals:
+            self.empty_label.setVisible(False)
+        else:
+            self.empty_label.setText(
+                "No members yet.\nClick “+ New Individual” above to add one.")
+            self.empty_label.setVisible(True)
+
         # Sync to UIStateManager
         self._ui_state.set_cards(self.card_widgets)
         
@@ -809,6 +833,12 @@ class Dashboard(QWidget):
     def filter_list(self, text):
         """Filter cards by text using UIStateManager."""
         self._ui_state.apply_filter(text)
+        # Tell the user when a search matches nobody, rather than showing blank.
+        if self.card_widgets and not self._ui_state.get_visible_cards():
+            self.empty_label.setText(f"No members match “{text}”.")
+            self.empty_label.setVisible(True)
+        elif self.card_widgets:
+            self.empty_label.setVisible(False)
         
     def _on_selection_changed(self, card):
         """Callback when selection changes via UIStateManager."""
