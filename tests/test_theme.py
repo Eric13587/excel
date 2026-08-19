@@ -58,3 +58,45 @@ def test_excel_palette_constants_are_valid_hex():
     for c in (branding.EXCEL_ACCENT_BG, branding.EXCEL_HEADER_BG,
               branding.EXCEL_TOTAL_BG, branding.EXCEL_MUTED_TEXT):
         assert re.fullmatch(r"#[0-9A-Fa-f]{6}", c)
+
+
+
+# --------------------------------------------------------------------------- #
+# Menus
+# --------------------------------------------------------------------------- #
+# Nothing styled a QMenu, so the member right-click, the ledger's context menus
+# and the window menu bar rendered in whatever colours the desktop supplied —
+# white-on-white in light mode on some systems. The same failure the alternating
+# table rows had, fixed the same way: name the colours.
+
+def test_menu_css_names_every_part_of_a_menu():
+    for theme in ("Light", "Dark"):
+        css = ThemeManager(FakeDB(theme)).menu_css()
+        for rule in ("QMenu {", "QMenu::item", "QMenu::item:selected",
+                     "QMenu::separator", "QMenuBar {"):
+            assert rule in css, f"{rule} missing in {theme}"
+
+
+def test_menu_text_is_never_the_menu_background():
+    """The bug, as an assertion."""
+    for theme in ("Light", "Dark"):
+        t = ThemeManager(FakeDB(theme))
+        assert t.get_color("text_primary").lower() != t.get_color("bg_secondary").lower()
+
+
+def test_a_highlighted_menu_item_keeps_readable_text():
+    for theme in ("Light", "Dark"):
+        t = ThemeManager(FakeDB(theme))
+        accent = t.get_color("accent")
+        css = t.menu_css()
+        assert f"background-color: {accent}" in css
+        # Picked from the accent's luminance, never assumed to be white.
+        assert t._text_on(accent) in css
+
+
+def test_menu_css_tracks_the_theme():
+    light = ThemeManager(FakeDB("Light")).menu_css()
+    dark = ThemeManager(FakeDB("Dark")).menu_css()
+    assert light != dark
+    assert Theme.LIGHT["bg_secondary"] in light
+    assert Theme.DARK["bg_secondary"] in dark

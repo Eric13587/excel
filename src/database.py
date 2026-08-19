@@ -128,6 +128,8 @@ class DatabaseManager:
             # with. Failure is reported, never fatal: a journal that cannot be
             # migrated must still open so its data can be exported or repaired.
             self.migration_report = migrations.apply_pending(self.conn)
+        # Needed on both paths — a new journal is bootstrapped, not migrated.
+        self._create_participation_table()
         if not self.migration_report.ok:
             logger.error("Schema migration incomplete — %s", self.migration_report.summary())
         # Cascading deletes may have just become available, and a repaired
@@ -951,6 +953,28 @@ class DatabaseManager:
 
         self.conn.commit()
 
+    def _create_participation_table(self):
+        """Who takes part in which ledger's bulk-edit grid.
+
+        Absence means included, so a journal that has never used the grids
+        behaves exactly as it did and the table only ever holds the exceptions
+        somebody deliberately made. Created outside ``create_tables`` because a
+        brand-new journal is bootstrapped rather than migrated, and both paths
+        need it.
+        """
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS grid_participation (
+                individual_id INTEGER NOT NULL,
+                scope TEXT NOT NULL,        -- savings | christmas_savings |
+                                            -- benevolent_ledger | loans
+                excluded INTEGER NOT NULL DEFAULT 1,
+                note TEXT,
+                created_at TEXT,
+                PRIMARY KEY (individual_id, scope)
+            )
+        """)
+        self.conn.commit()
+
     def _create_audit_infrastructure(self, cursor):
         """created_at/updated_at timestamps + an audit_log trail, maintained by
         triggers so every write is captured regardless of code path.
@@ -1408,6 +1432,10 @@ class DatabaseManager:
 
     def get_overdue_count(self):
         return self.loans.overdue_count(datetime.now().strftime("%Y-%m-%d"))
+
+    def get_overdue_loans(self, as_of=None):
+        """Every loan behind the count returned by :meth:`get_overdue_count`."""
+        return self.loans.overdue(as_of or datetime.now().strftime("%Y-%m-%d"))
 
     def get_loan_by_ref(self, individual_id, ref):
         return self.loans.by_ref(individual_id, ref)

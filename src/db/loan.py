@@ -65,6 +65,25 @@ class LoanRepository(Repository):
             "SELECT COUNT(*) FROM loans WHERE status='Active' AND next_due_date < ?",
             (as_of,), 0)
 
+    def overdue(self, as_of):
+        """Every active loan past its due date, with the member behind it.
+
+        The same population :meth:`overdue_count` counts — deliberately, so the
+        dashboard's arrears figure and the list you get by clicking it can never
+        disagree. Suspended loans are included and flagged rather than filtered,
+        because whether a deliberate hold counts as arrears is the reader's call,
+        not this query's. Oldest due date first: that is the order the arrears
+        are worked in.
+        """
+        return self._dicts(
+            "SELECT l.id AS loan_id, l.individual_id, l.ref, l.balance, "
+            "       l.installment, l.interest_balance, l.next_due_date, "
+            "       l.start_date, l.is_suspended, l.suspend_until, "
+            "       i.name, i.phone, i.pf_no, i.employment_status, i.is_retired "
+            "FROM loans l JOIN individuals i ON i.id = l.individual_id "
+            "WHERE l.status='Active' AND l.next_due_date < ? "
+            "ORDER BY l.next_due_date, i.name, l.ref", (as_of,))
+
     def has_active(self, member_id):
         return self._scalar(
             "SELECT COUNT(*) FROM loans WHERE individual_id=? AND status='Active'",
@@ -302,6 +321,18 @@ class LoanRepository(Repository):
         return self._scalar(
             "SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL "
             "AND status='active' ORDER BY id DESC LIMIT 1", (loan_id,))
+
+    def open_suspension(self, loan_id):
+        """The open span itself rather than just its id, or None.
+
+        Same row :meth:`open_suspension_id` picks; the UI needs its dates to
+        say what is actually in force before offering to end it.
+        """
+        return self._dict(
+            "SELECT id, loan_id, individual_id, loan_ref, start_date, suspend_until, "
+            "resumed_date, status, created_at FROM loan_suspensions WHERE loan_id=? "
+            "AND resumed_date IS NULL AND status='active' ORDER BY id DESC LIMIT 1",
+            (loan_id,))
 
     def set_suspended(self, loan_id, until_date):
         self._execute("UPDATE loans SET is_suspended=1, suspend_until=? WHERE id=?",

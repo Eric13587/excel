@@ -166,6 +166,49 @@ class IndividualCard(QFrame):
 
 
 
+class _ClickableFrame(QFrame):
+    """A KPI tile that can be pressed.
+
+    A number that answers "how many" invites the question "which ones", and the
+    tile is where that question is asked. Plain QFrame swallows clicks, so the
+    press is caught here and handed to the callback the tile was built with.
+    """
+
+    def __init__(self, on_click):
+        super().__init__()
+        self._on_click = on_click
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.pos()):
+            self._on_click()
+        super().mouseReleaseEvent(event)
+
+
+class _NumericItem(QTableWidgetItem):
+    """A cell that shows a formatted number but sorts on the number itself.
+
+    QTableWidgetItem treats Qt.EditRole and Qt.DisplayRole as the same storage,
+    so stashing an int sort key and then calling setText replaces the key with
+    the formatted text — after which "2,787" sorts *before* "230", as strings
+    do. Keeping the number in a role of its own and comparing it here keeps what
+    is displayed and what is ordered independent.
+    """
+
+    SORT_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, text, value):
+        super().__init__(text)
+        self.setData(self.SORT_ROLE, value)
+
+    def __lt__(self, other):
+        mine = self.data(self.SORT_ROLE)
+        theirs = other.data(self.SORT_ROLE) if isinstance(other, QTableWidgetItem) else None
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
+
+
 class _ReportCancelled(Exception):
     """Raised inside the worker's progress callback to unwind on cancel."""
 
@@ -561,17 +604,23 @@ class Dashboard(QWidget):
             self.empty_label.setStyleSheet(t.hint_css(15))
 
 
-    def _make_stat_card(self, caption):
-        """One KPI tile: a big value over a small caption. Returns (card, value_label)."""
-        card = QFrame()
+    def _make_stat_card(self, caption, on_click=None):
+        """One KPI tile: a big value over a small caption. Returns (card, value_label).
+
+        Passing ``on_click`` makes the whole tile pressable and marks it as such
+        — a pointer cursor and a "›" on the caption — so it does not look like
+        the tiles that only display.
+        """
+        card = _ClickableFrame(on_click) if on_click else QFrame()
         card.setObjectName("statCard")
+        card.setProperty("clickable", bool(on_click))
         v = QVBoxLayout(card)
         v.setContentsMargins(16, 12, 16, 12)
         v.setSpacing(2)
         value = QLabel("—")
         value.setObjectName("statValue")
-        cap = QLabel(caption)
-        cap.setObjectName("statCaption")
+        cap = QLabel(f"{caption}  ›" if on_click else caption)
+        cap.setObjectName("statCaptionLink" if on_click else "statCaption")
         v.addWidget(value)
         v.addWidget(cap)
         return card, value
@@ -583,15 +632,20 @@ class Dashboard(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(16)
         specs = [
-            ("stat_members", "Members"),
-            ("stat_loans", "Active Loans"),
-            ("stat_outstanding", "Outstanding"),
-            ("stat_arrears", "Loans in Arrears"),
-            ("stat_savings", "Total Savings"),
+            ("stat_members", "Members", None),
+            ("stat_loans", "Active Loans", None),
+            ("stat_outstanding", "Outstanding", None),
+            # The only tile that names work to be done, so it is the only one
+            # that opens onto the people behind the number.
+            ("stat_arrears", "Loans in Arrears", self.show_arrears_dialog),
+            ("stat_savings", "Total Savings", None),
         ]
-        for attr, caption in specs:
-            card, value = self._make_stat_card(caption)
+        for attr, caption, on_click in specs:
+            card, value = self._make_stat_card(caption, on_click)
             setattr(self, attr, value)
+            if on_click:
+                self.arrears_card = card
+                card.setToolTip("Click to see who is in arrears, and print the list")
             row.addWidget(card)
         return self.summary_frame
 
@@ -605,7 +659,14 @@ class Dashboard(QWidget):
             f"border: 1px solid {t.get_color('card_border')}; border-radius: 10px; }} "
             f"#statValue {{ font-size: 22px; font-weight: bold; "
             f"color: {t.get_color('text_primary')}; }} "
-            f"#statCaption {{ font-size: 11px; color: {t.get_color('text_secondary')}; }}")
+            f"#statCaption {{ font-size: 11px; color: {t.get_color('text_secondary')}; }} "
+            # The pressable tile borrows the accent colour on its caption and
+            # lights its border on hover — the same affordance the member cards
+            # use, so "this one does something" reads without a legend.
+            f"#statCaptionLink {{ font-size: 11px; font-weight: bold; "
+            f"color: {t.get_color('accent')}; }} "
+            f"#statCard[clickable=\"true\"]:hover {{ border-color: "
+            f"{t.get_color('card_hover_border')}; }}")
 
     def refresh_summary(self):
         """Recompute the KPI band from cheap aggregate queries (no per-member loop)."""
@@ -631,6 +692,245 @@ class Dashboard(QWidget):
         colour = self.theme_manager.get_color("danger" if arrears else "text_primary")
         self.stat_arrears.setStyleSheet(
             f"font-size: 22px; font-weight: bold; color: {colour};")
+
+    # ------------------------------------------------------------------ #
+    # Arrears
+    # ------------------------------------------------------------------ #
+
+    def show_arrears_dialog(self):
+        """Who is behind, how far, and a way to print it.
+
+        Opened from the arrears KPI tile and from Reports. The list is the same
+        population the tile counts — including suspended loans, which are shown
+        with their state rather than hidden, since whether a deliberate hold
+        belongs in an arrears chase is the user's judgement and not this
+        dialog's. A filter takes them out for whoever wants only real defaults.
+        """
+        from PyQt6.QtWidgets import QTableWidget, QComboBox, QHeaderView
+        from src.config import PAR_THRESHOLD_DAYS
+        from src.services import arrears as arrears_service
+        from src.reports import ReportGenerator
+
+        as_of = datetime.now().strftime("%Y-%m-%d")
+        try:
+            all_rows = self.engine.get_arrears(as_of)
+        except Exception as e:                  # noqa: BLE001 - report, don't crash
+            logger.exception("Could not compute arrears")
+            QMessageBox.critical(self, "Loans in Arrears",
+                                 f"Could not work out who is in arrears:\n{e}")
+            return
+
+        if not all_rows:
+            QMessageBox.information(
+                self, "Loans in Arrears",
+                "Nothing is in arrears — every active loan is up to date as at "
+                f"{as_of}.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Loans in Arrears")
+        dialog.setMinimumSize(1020, 560)
+        layout = QVBoxLayout(dialog)
+
+        headline = QLabel()
+        headline.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; "
+            f"color: {self.theme_manager.get_color('text_primary')};")
+        layout.addWidget(headline)
+
+        subhead = QLabel()
+        subhead.setWordWrap(True)
+        subhead.setStyleSheet(self.theme_manager.hint_css())
+        layout.addWidget(subhead)
+
+        controls = QHBoxLayout()
+        search = QLineEdit()
+        search.setPlaceholderText("Filter by member, PF number or loan…")
+        search.setClearButtonEnabled(True)
+        controls.addWidget(search, 2)
+
+        band_filter = QComboBox()
+        band_filter.addItem("All classifications", "")
+        for label in arrears_service.BAND_LABELS:
+            band_filter.addItem(label, label)
+        controls.addWidget(band_filter, 1)
+
+        hide_suspended = QCheckBox("Hide suspended loans")
+        hide_suspended.setToolTip(
+            "Suspended loans are past due because deductions were deliberately "
+            "paused, not because a member defaulted.")
+        controls.addWidget(hide_suspended)
+        layout.addLayout(controls)
+
+        columns = ReportGenerator.ARREARS_COLUMNS
+        table = QTableWidget()
+        table.setColumnCount(len(columns))
+        table.setHorizontalHeaderLabels([label for _key, label in columns])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSortingEnabled(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        # Not setStretchLastSection: the last column is the loan's status, and
+        # stretching it to whatever space is left elided "Suspended (open-ended)"
+        # down to "Suspended (open-…". Any slack goes to the member's name
+        # instead, which is the column that can always use more room.
+        layout.addWidget(table)
+
+        hint = QLabel(
+            "Double-click a row to open that member's ledger. “Overdue (est.)” "
+            "is missed instalments × the current instalment, capped at the "
+            "balance — the ledger records what was received, not what was due.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(self.theme_manager.hint_css())
+        layout.addWidget(hint)
+
+        visible = list(all_rows)
+        money_columns = {"installment", "overdue_amount", "balance"}
+        numeric_columns = {"days", "months_missed"} | money_columns
+        # Which arrears row each table row came from, so the export can follow
+        # the order on screen after the user sorts by a column.
+        ROW_INDEX = Qt.ItemDataRole.UserRole + 1
+
+        def _fill_width():
+            """Give any leftover width to the member column, not the last one."""
+            header = table.horizontalHeader()
+            used = sum(header.sectionSize(c) for c in range(table.columnCount()))
+            slack = table.viewport().width() - used
+            if slack > 0:
+                header.resizeSection(0, header.sectionSize(0) + slack)
+
+        def repopulate():
+            text = search.text().strip().lower()
+            band = band_filter.currentData()
+            visible.clear()
+            for row in all_rows:
+                if hide_suspended.isChecked() and row["suspended"]:
+                    continue
+                if band and row["band"] != band:
+                    continue
+                if text and text not in " ".join(
+                        (row["name"], row["pf_no"], row["ref"], row["phone"])).lower():
+                    continue
+                visible.append(row)
+
+            # Sorting is switched off while the rows are written, or Qt re-sorts
+            # mid-fill and the cells land against the wrong rows.
+            table.setSortingEnabled(False)
+            table.setRowCount(len(visible))
+            for r, row in enumerate(visible):
+                for c, (key, _label) in enumerate(columns):
+                    value = (ReportGenerator._arrears_status(row) if key == "status"
+                             else row[key])
+                    if key in numeric_columns:
+                        # Shown with separators, sorted as a number.
+                        shown = (format_money(value) if key in money_columns
+                                 else f"{int(value):,}")
+                        item = _NumericItem(shown, int(value))
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter)
+                    else:
+                        item = QTableWidgetItem(str(value))
+                    if row["suspended"]:
+                        item.setForeground(QColor(self.theme_manager.get_color("warning")))
+                    elif row["days"] > PAR_THRESHOLD_DAYS:
+                        item.setForeground(QColor(self.theme_manager.get_color("danger")))
+                    item.setData(Qt.ItemDataRole.UserRole, row["individual_id"])
+                    item.setData(ROW_INDEX, r)
+                    table.setItem(r, c, item)
+            table.setSortingEnabled(True)
+            table.resizeColumnsToContents()
+            _fill_width()
+
+            totals = arrears_service.summarize(visible)
+            headline.setText(
+                f"{totals['loans']:,} loan(s) · {totals['members']:,} member(s) · "
+                f"{format_money(totals['overdue_amount'])} overdue")
+            held = (f" {totals['suspended']} of them are suspended."
+                    if totals["suspended"] else "")
+            shown = ("" if len(visible) == len(all_rows)
+                     else f" Showing {len(visible)} of {len(all_rows)}.")
+            subhead.setText(
+                f"As at {as_of}. Worst is {totals['worst_days']:,} day(s) past due; "
+                f"{format_money(totals['balance'])} of principal sits behind these "
+                f"loans.{held}{shown}")
+
+        def rows_in_view():
+            """The filtered rows in the order the table is currently showing.
+
+            Printing something other than what is on screen is how a report
+            loses an argument, so the export walks the table rather than the
+            unsorted list behind it.
+            """
+            out = []
+            for r in range(table.rowCount()):
+                item = table.item(r, 0)
+                if item is None:
+                    continue
+                index = item.data(ROW_INDEX)
+                if index is not None and index < len(visible):
+                    out.append(visible[index])
+            return out
+
+        search.textChanged.connect(repopulate)
+        band_filter.currentIndexChanged.connect(repopulate)
+        hide_suspended.stateChanged.connect(repopulate)
+
+        def open_member(item):
+            ind_id = item.data(Qt.ItemDataRole.UserRole)
+            details = self.db.get_individual(ind_id) or {}
+            if not details:
+                return
+            dialog.accept()
+            self.open_ledger_by_id(ind_id, details.get("name", ""))
+
+        table.itemDoubleClicked.connect(open_member)
+
+        buttons = QHBoxLayout()
+        export_btn = QPushButton("Print / Export…")
+        export_btn.setStyleSheet(self.theme_manager.button_css("accent"))
+        export_btn.setToolTip("Save the list shown here as PDF, Excel or CSV")
+        export_btn.clicked.connect(
+            lambda: self._export_arrears(dialog, rows_in_view(), as_of))
+        buttons.addWidget(export_btn)
+        buttons.addStretch()
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_box.rejected.connect(dialog.reject)
+        buttons.addWidget(close_box)
+        layout.addLayout(buttons)
+
+        repopulate()
+        dialog.exec()
+
+    def _export_arrears(self, parent, rows, as_of):
+        """Save the arrears list the user is looking at, and open it."""
+        from src.reports import ReportGenerator
+
+        if not rows:
+            QMessageBox.information(parent, "Print / Export",
+                                    "There is nothing in the list to print.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            parent, "Save Arrears List", f"Loans_In_Arrears_{as_of}.pdf",
+            "PDF Files (*.pdf);;Excel Files (*.xlsx);;CSV Files (*.csv)")
+        if not path:
+            return
+
+        generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
+        progress = QProgressDialog("Preparing the arrears list…", None, 0, 0, parent)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            success, message = generator.generate_arrears_report(path, rows, as_of=as_of)
+        finally:
+            progress.close()
+
+        if success:
+            from .file_actions import report_saved
+            report_saved(parent, "Arrears List", path, what="arrears list")
+        else:
+            QMessageBox.critical(parent, "Arrears List", f"Export failed:\n{message}")
 
     def refresh_list(self, select_id=None):
         # Keep the portfolio totals in step with every add/edit/delete/import.
@@ -1009,6 +1309,24 @@ class Dashboard(QWidget):
                 QMessageBox.warning(self, "Warning", "No statements saved.")
 
     
+    def open_fund_grid(self):
+        """Open the members × months spreadsheet over the three funds.
+
+        A second way into the same data, not a second copy of it: the grid
+        writes through the same posting pipeline the member screens use, so
+        nothing here depends on it and nothing it does is invisible to them.
+        """
+        from .fund_grid import FundGridWindow
+
+        window = FundGridWindow(self, self.db, self.theme_manager,
+                                on_open_member=self.open_ledger_by_id)
+        # The grid's export offers PDF, which needs the hidden web view the
+        # report exports already share.
+        window.printer_view_getter = self.get_printer_view
+        window.exec()
+        # Fund edits move the savings total on the KPI band.
+        self.refresh_summary()
+
     def get_printer_view(self):
         """Get or create the hidden QWebEngineView for printing."""
         if self.printer_view is None:

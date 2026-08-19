@@ -285,11 +285,23 @@ class LoanService:
         if loan.get('is_suspended', 0):
             suspend_until = loan.get('suspend_until')
             limit_date_str_for_check = target_date.strftime("%Y-%m-%d") if target_date and not isinstance(target_date, str) else (target_date or datetime.now().strftime("%Y-%m-%d"))
-            
+            guard_windows = self._suspension_windows(individual_id, loan['id'])
+
             if suspend_until and loan['next_due_date'] > suspend_until:
                 # Suspension period has passed — auto-resume.
                 # Record the resume at the intended boundary, not "now".
                 self.db.resume_loan(loan['id'], resumed_date=suspend_until)
+            elif guard_windows and not self._date_in_suspension(loan['next_due_date'],
+                                                                guard_windows):
+                # Suspended, but the next due month sits *before* the suspension
+                # starts — which is where rebuild_loan_schedule leaves a loan
+                # after resetting it to its issue date. Those months are genuinely
+                # owed, and fast-forwarding the due date over them deleted them
+                # for good: a rebuild wiped every deduction and re-created none.
+                # The main loop skips suspended months by itself, so fall through
+                # and let it. (Loans flagged suspended with no recorded span at
+                # all — pre-migration journals — keep the old behaviour.)
+                pass
             else:
                 # Still suspended — advance next_due_date through suspension period
                 # to extend the loan term, but create no transactions

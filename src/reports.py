@@ -18,6 +18,9 @@ class ReportGenerator:
     def __init__(self, db_manager, printer_view_getter=None):
         self.db = db_manager
         self.printer_view_getter = printer_view_getter
+        # Subtitle for PDFs that are an "as at" listing rather than a period
+        # report; see _export_to_pdf_titled.
+        self._pdf_period_override = None
 
     
     def _get_quarter_dates(self, start_date):
@@ -781,6 +784,84 @@ class ReportGenerator:
             return self._export_to_pdf(df, output_path, None, None, title=title, has_total_row=False)
         return self._export_to_excel(df, output_path, sheet_name=title, has_total_row=False)
 
+    # Arrears listing — the columns, in the order they are printed. Kept beside
+    # the report so the on-screen table and the exported file cannot drift.
+    ARREARS_COLUMNS = [
+        ("name", "Member"),
+        ("pf_no", "PF No"),
+        ("phone", "Phone"),
+        ("ref", "Loan"),
+        ("next_due_date", "Due Since"),
+        ("days", "Days"),
+        ("months_missed", "Missed"),
+        ("installment", "Instalment"),
+        ("overdue_amount", "Overdue (est.)"),
+        ("balance", "Balance"),
+        ("band", "Classification"),
+        ("status", "Status"),
+    ]
+
+    @staticmethod
+    def _arrears_status(row):
+        """The one-word state that explains why a loan is on this list."""
+        if row["suspended"]:
+            until = row["suspend_until"]
+            # "indefinite" is the word the Suspensions dialog already uses for a
+            # span with no end date; the two should not invent separate names.
+            return f"Suspended until {until}" if until else "Suspended (indefinite)"
+        if row["retired"]:
+            return "Retired"
+        return row["employment_status"] or "Active"
+
+    def generate_arrears_report(self, output_path, rows, as_of=None, title="Loans in Arrears"):
+        """Export arrears rows to Excel/PDF/CSV, chosen by file extension.
+
+        Takes the rows rather than fetching them, so what is printed is exactly
+        what the user was looking at — including any filtering they applied.
+        """
+        from src.services import arrears as arrears_service
+
+        as_of = as_of or datetime.now().strftime("%Y-%m-%d")
+        labels = [label for _key, label in self.ARREARS_COLUMNS]
+        table = [
+            {label: (self._arrears_status(row) if key == "status" else row[key])
+             for key, label in self.ARREARS_COLUMNS}
+            for row in rows
+        ]
+        df = pd.DataFrame(table, columns=labels)
+
+        if df.empty:
+            return False, "There are no loans in arrears to report."
+
+        # A totals line, because the first question asked of an arrears list is
+        # "how much?". Blank in the identity columns so it cannot read as a row.
+        totals = arrears_service.summarize(rows)
+        total_row = {label: "" for label in labels}
+        total_row["Member"] = f"TOTAL — {totals['members']} member(s), {totals['loans']} loan(s)"
+        total_row["Overdue (est.)"] = totals["overdue_amount"]
+        total_row["Balance"] = totals["balance"]
+        df.loc[len(df)] = total_row
+
+        subtitle = f"As at {as_of}"
+        if output_path.endswith(".csv"):
+            return self._export_to_csv(df, output_path)
+        if output_path.endswith(".pdf"):
+            return self._export_to_pdf_titled(df, output_path, title, subtitle)
+        return self._export_to_excel(df, output_path, sheet_name="Arrears")
+
+    def _export_to_pdf_titled(self, df, output_path, title, subtitle):
+        """PDF export whose subtitle is a plain string rather than a date range.
+
+        :meth:`_export_to_pdf` builds its own "Period: …" line from two dates,
+        which an as-at listing does not have.
+        """
+        original = self._pdf_period_override
+        self._pdf_period_override = subtitle
+        try:
+            return self._export_to_pdf(df, output_path, None, None, title=title)
+        finally:
+            self._pdf_period_override = original
+
     def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report', has_total_row=True):
         """Export DataFrame to Excel with formatting.
 
@@ -850,7 +931,7 @@ class ReportGenerator:
             html_table = df.to_html(index=False, classes='report-table', float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else str(x))
             
             # 2. Wrap in proper HTML with the shared letterhead + house style
-            period_str = ""
+            period_str = self._pdf_period_override or ""
             if start_date is not None and end_date is not None:
                 period_str = f"Period: {start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
             # Only emphasise the last row when it's actually a TOTAL row.

@@ -105,6 +105,15 @@ class LoanEngine:
     def get_ledger_df(self, individual_id, start_date=None, end_date=None):
         return self.db.get_ledger(individual_id, start_date, end_date)
 
+    def get_arrears(self, as_of=None):
+        """Every loan past its due date, as rows with days/instalments missed.
+
+        The population the dashboard's arrears tile counts, turned into
+        something readable. See :mod:`src.services.arrears`.
+        """
+        from src.services.arrears import get_arrears
+        return get_arrears(self.db, as_of)
+
     def add_loan_event(self, individual_id, principal, duration, date_str, interest_rate=None):
         """Issue a new loan (Segregated Principal & Interest model).
         

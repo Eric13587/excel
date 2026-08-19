@@ -162,14 +162,19 @@ class MainApp(QMainWindow):
         self.statusBar().addPermanentWidget(self.status_journal)
 
     def apply_app_theme(self):
-        """Push the theme's dialog stylesheet onto the QApplication.
+        """Push the theme's dialog and menu stylesheets onto the QApplication.
 
         Called at startup and whenever the theme changes, so open-anew dialogs
-        match the rest of the window.
+        match the rest of the window. Menus go on at the application level
+        rather than per-widget because they are created on demand all over the
+        app — the member right-click, the ledger's context menus, the menu bar —
+        and one of them left unstyled is one that renders in the platform's
+        colours instead of the theme's.
         """
         app = QApplication.instance()
         if app is not None:
-            app.setStyleSheet(self.dashboard.theme_manager.dialog_stylesheet())
+            theme = self.dashboard.theme_manager
+            app.setStyleSheet(theme.dialog_stylesheet() + theme.menu_css())
 
     def refresh_window_title(self):
         """Title carries the configured organization name when one is set.
@@ -230,12 +235,20 @@ class MainApp(QMainWindow):
         self._menu_action(reports_menu, "Benevolent Report…",
                           lambda: d._open_fund_report_dialog("benevolent", "Benevolent"))
         reports_menu.addSeparator()
+        self._menu_action(reports_menu, "Loans in Arrears…", d.show_arrears_dialog,
+                          "Who is behind on a loan, and by how much — with a "
+                          "printable list")
         self._menu_action(reports_menu, "Members List (Excel / PDF)…",
                           d.export_members_list)
         self._menu_action(reports_menu, "Statements…", d.batch_print_selected,
                           "Generate member statements as PDF or Excel")
 
         ops_menu = menubar.addMenu("&Operations")
+        grid_action = self._menu_action(
+            ops_menu, "Fund Grid (bulk edit)…", d.open_fund_grid,
+            "Edit savings, Christmas and benevolent for every member in one table")
+        grid_action.setShortcut(QKeySequence("Ctrl+G"))
+        ops_menu.addSeparator()
         self._menu_action(ops_menu, "Mass Deduct (Loans)…", d.open_mass_deduction_dialog)
         self._menu_action(ops_menu, "Mass Savings (Increments)…", d.open_mass_savings_dialog)
         self._menu_action(ops_menu, "Mass Christmas (Contributions)…", d.open_mass_christmas_dialog)

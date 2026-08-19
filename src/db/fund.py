@@ -90,6 +90,45 @@ class FundRepository(Repository):
             f"SELECT id, individual_id, date, transaction_type, amount, notes FROM {t} WHERE id=?",
             (row_id,))
 
+    def movements_in_range(self, table, start_date, end_date):
+        """Every member's rows in a date window, in one query.
+
+        The per-member reader (:meth:`transactions`) is right for one member's
+        statement and wrong for a screen showing hundreds at once — that is a
+        query per member per fund. This is the whole-journal read: one pass,
+        ordered so a caller can group by member and month as it goes.
+        """
+        t = self._table(table)
+        return self._dicts(
+            f"SELECT id, individual_id, date, transaction_type, amount, notes, batch_id "
+            f"FROM {t} WHERE date >= ? AND date <= ? "
+            f"ORDER BY individual_id, date, id", (start_date, end_date))
+
+    def first_movement_dates(self, table):
+        """``{member_id: earliest date}`` for a fund, in one query.
+
+        When a member's account in a fund effectively opened. Anything before it
+        is a month the account did not exist for, which is not the same as a
+        month with no contribution.
+        """
+        return {row[0]: row[1] for row in self._rows(
+            f"SELECT individual_id, MIN(date) FROM {self._table(table)} "
+            f"GROUP BY individual_id")}
+
+    def last_dated_row(self, table, member_id, kinds=None):
+        """The member's most recent row in a fund, optionally by type.
+
+        Ordered by ``(date, id)`` — the order a statement shows — so "the last
+        contribution" means the latest dated one, not the last inserted.
+        """
+        t = self._table(table)
+        sql = f"SELECT id, date, transaction_type, amount FROM {t} WHERE individual_id=?"
+        params = [member_id]
+        if kinds:
+            sql += f" AND transaction_type IN ({','.join('?' * len(kinds))})"
+            params.extend(kinds)
+        return self._dict(sql + " ORDER BY date DESC, id DESC LIMIT 1", tuple(params))
+
     def members_in_batch(self, table, batch_id):
         """Members touched by a mass run, for post-revert recalculation."""
         t = self._table(table)
@@ -151,6 +190,28 @@ class FundRepository(Repository):
         self._execute(f"UPDATE {t} SET date=?, amount=?, notes=? WHERE id=?",
                       (date, amount, notes, row_id))
 
+    def set_type(self, table, row_id, transaction_type):
+        """Change what a row *is* — a deposit into a withdrawal, say.
+
+        Separate from :meth:`update` because the type carries the sign of the
+        movement, so changing it is a different act from correcting a figure.
+        """
+        t = self._table(table)
+        self._execute(f"UPDATE {t} SET transaction_type=? WHERE id=?",
+                      (transaction_type, row_id))
+
+    def month_rows(self, table, member_id, start_date, end_date):
+        """One member's rows within a window, identity and amount only.
+
+        Narrow on purpose: this answers "is this cell still what it was when I
+        read it?", so it reads the fields an edit could have moved and no more.
+        """
+        t = self._table(table)
+        return self._rows(
+            f"SELECT id, amount, date, transaction_type FROM {t} "
+            f"WHERE individual_id=? AND date >= ? AND date <= ?",
+            (member_id, start_date, end_date))
+
     def set_balance(self, table, row_id, balance):
         t = self._table(table)
         self._execute(f"UPDATE {t} SET balance=? WHERE id=?", (balance, row_id))
@@ -208,6 +269,12 @@ class FundRepository(Repository):
         return self._dict(
             "SELECT id, individual_id, monthly_amount, start_date, next_due_date, active "
             "FROM benevolent_accounts WHERE individual_id=?", (member_id,))
+
+    def all_enrolments(self):
+        """Every enrolment at once, for a screen showing all members."""
+        return self._dicts(
+            "SELECT individual_id, monthly_amount, start_date, next_due_date, active "
+            "FROM benevolent_accounts")
 
     def upsert_enrolment(self, member_id, monthly_amount, start_date, next_due_date):
         if self.get_enrolment(member_id):

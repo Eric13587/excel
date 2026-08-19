@@ -52,6 +52,42 @@ class MemberRepository(Repository):
         """One member as a dict keyed by column name, or None."""
         return self._dict("SELECT * FROM individuals WHERE id=?", (member_id,))
 
+    # -- grid participation ----------------------------------------------- #
+    # Which members take part in which ledger. Stored as exceptions only:
+    # a member with no row is included, so an untouched journal behaves
+    # exactly as it did and the table stays as small as the decisions made.
+
+    def excluded_from(self, scope):
+        """``{member_id: note}`` for everybody left out of one ledger."""
+        return {row[0]: row[1] or "" for row in self._rows(
+            "SELECT individual_id, note FROM grid_participation "
+            "WHERE scope=? AND excluded=1", (scope,))}
+
+    def set_excluded(self, member_id, scope, excluded, note=""):
+        """Take a member out of one ledger's grid, or put them back."""
+        if excluded:
+            self._execute(
+                "INSERT INTO grid_participation (individual_id, scope, excluded, "
+                "note, created_at) VALUES (?, ?, 1, ?, ?) "
+                "ON CONFLICT(individual_id, scope) DO UPDATE SET excluded=1, note=?",
+                (member_id, scope, note,
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), note))
+        else:
+            self._execute(
+                "DELETE FROM grid_participation WHERE individual_id=? AND scope=?",
+                (member_id, scope))
+
+    def summaries(self):
+        """Every member as the few fields a listing needs, name-ordered.
+
+        Narrower than :meth:`rows` on purpose: a screen showing hundreds of
+        members at once wants identity and standing, not every column, and
+        wants them without a query per member.
+        """
+        return self._dicts(
+            "SELECT id, name, pf_no, employment_status, is_retired, retired_date "
+            "FROM individuals ORDER BY name COLLATE NOCASE, id")
+
     def name_of(self, member_id):
         """The member's name, or None when there is no such member.
 

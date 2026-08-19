@@ -73,6 +73,15 @@ CREATE TABLE "christmas_savings" (
     batch_id         TEXT,
     created_at       TEXT
 );
+CREATE TABLE grid_participation (
+                individual_id INTEGER NOT NULL,
+                scope TEXT NOT NULL,        -- savings | christmas_savings |
+                                            -- benevolent_ledger | loans
+                excluded INTEGER NOT NULL DEFAULT 1,
+                note TEXT,
+                created_at TEXT,
+                PRIMARY KEY (individual_id, scope)
+            );
 CREATE TABLE "import_history" (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),

@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                              QMessageBox, QMenu, QDialog,
                              QFormLayout, QDateEdit, QSpinBox, QDialogButtonBox,
                              QHeaderView, QSplitter, QProgressDialog, QApplication,
-                             QTabWidget, QDoubleSpinBox)
+                             QTabWidget, QDoubleSpinBox, QRadioButton, QButtonGroup)
 from PyQt6.QtGui import QAction, QColor, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QDate, QTimer
 
@@ -331,7 +331,9 @@ class LedgerView(QWidget):
             title_text = f"<b>Loan Reference: {loan_ref}</b>"
             if loan_info and loan_info.get('is_suspended', 0):
                 suspend_until = loan_info.get('suspend_until', '')
-                suffix = f" until {suspend_until}" if suspend_until else ""
+                # No end date is a state, not a missing value: say so, or the
+                # header reads the same as a suspension that ends by itself.
+                suffix = f" until {suspend_until}" if suspend_until else " \u2014 until resumed"
                 title_text = f"<b style='color: #F59E0B;'>Loan Reference: {loan_ref} (\u23f8 SUSPENDED{suffix})</b>"
             elif is_overdue:
                 title_text = f"<b style='color: {self.theme_manager.get_color('danger')};'>Loan Reference: {loan_ref} (OVERDUE)</b>"
@@ -1138,7 +1140,16 @@ class LedgerView(QWidget):
                 QMessageBox.warning(self, "Error", "Could not process buyoff.")
 
     def suspend_loan_dialog(self, loan_id, loan_ref):
-        """Suspend a loan for N months — ongoing, or backdated as a past event."""
+        """Suspend a loan — for N months, or open-ended until somebody resumes it.
+
+        The two are genuinely different decisions. A fixed period is a plan with
+        an end date the software can act on by itself: catch-up auto-resumes at
+        the boundary and the statement says when deductions restart. An
+        open-ended suspension is a hold of unknown length — payroll stopped, a
+        member is on unpaid leave — and it stays in force until a person ends
+        it, which is why it is offered rather than forcing a guessed end date
+        that would silently start deducting again.
+        """
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Suspend Loan {loan_ref}")
         dialog.setMinimumWidth(360)
@@ -1150,6 +1161,9 @@ class LedgerView(QWidget):
 
         start_input = QDateEdit()
         start_input.setCalendarPopup(True)
+        # Same format the rest of the app's date pickers use — "9/1/26" left it
+        # to the reader to guess whether that was September or January.
+        start_input.setDisplayFormat("yyyy-MM-dd")
         # Default to where the loan actually is (its next due date), so
         # "suspend for N months" means the loan's next N due months — even when
         # back-filling a loan whose next due is in the past.
@@ -1159,10 +1173,33 @@ class LedgerView(QWidget):
         start_input.setDate(start_qdate if start_qdate.isValid() else QDate.currentDate())
         form.addRow("Suspended from:", start_input)
 
+        # Fixed-period vs open-ended. The radios are kept together so exactly
+        # one can be chosen, and the months box follows the choice rather than
+        # sitting there enabled but meaningless.
+        fixed_radio = QRadioButton("For a set number of months")
+        fixed_radio.setChecked(True)
+        indefinite_radio = QRadioButton("Until I resume it")
+        mode_group = QButtonGroup(dialog)
+        mode_group.addButton(fixed_radio)
+        mode_group.addButton(indefinite_radio)
+
         months_spin = QSpinBox()
         months_spin.setRange(1, 60)
         months_spin.setValue(3)
-        form.addRow("Suspend for (months):", months_spin)
+        months_spin.setSuffix(" month(s)")
+
+        fixed_row = QHBoxLayout()
+        fixed_row.setContentsMargins(0, 0, 0, 0)
+        fixed_row.addWidget(fixed_radio)
+        fixed_row.addWidget(months_spin)
+        fixed_row.addStretch()
+        form.addRow("Suspend:", fixed_row)
+        form.addRow("", indefinite_radio)
+
+        indefinite_radio.setToolTip(
+            "No end date. Deductions stay paused — and the term keeps extending "
+            "— until you press Resume on this loan.")
+        fixed_radio.toggled.connect(months_spin.setEnabled)
 
         layout.addLayout(form)
 
@@ -1172,15 +1209,46 @@ class LedgerView(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        # What each choice means, updated live, because "until I resume it" has
+        # a consequence (nothing restarts deductions on its own) that the label
+        # alone does not carry.
+        effect = QLabel()
+        effect.setWordWrap(True)
+        effect.setStyleSheet(self.theme_manager.hint_css())
+
+        def describe_effect():
+            if indefinite_radio.isChecked():
+                effect.setText(
+                    "⏸  Open-ended: deductions stay paused until you press Resume. "
+                    "Catch-up and Deduct stay disabled on this loan, and the term "
+                    "extends for every month skipped.")
+            else:
+                end = start_input.date().addMonths(months_spin.value())
+                effect.setText(
+                    f"⏸  Deductions resume automatically from "
+                    f"{end.toString('d MMM yyyy')} — {months_spin.value()} month(s) skipped.")
+
+        indefinite_radio.toggled.connect(describe_effect)
+        months_spin.valueChanged.connect(describe_effect)
+        start_input.dateChanged.connect(describe_effect)
+        describe_effect()
+        layout.addWidget(effect)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            months = months_spin.value()
+            indefinite = indefinite_radio.isChecked()
+            months = None if indefinite else months_spin.value()
             start_str = start_input.date().toString("yyyy-MM-dd")
-            end_str = start_input.date().addMonths(months).toString("yyyy-MM-dd")
+            # None is the stored form of "no end date" (loans.suspend_until is
+            # nullable), and every consumer — catch-up, statements, the event
+            # replay — already reads it that way.
+            end_str = None if indefinite else start_input.date().addMonths(months).toString("yyyy-MM-dd")
+            window_str = (f"on or after {start_str}" if indefinite
+                          else f"between {start_str} and {end_str}")
             today_str = QDate.currentDate().toString("yyyy-MM-dd")
 
             # If the window already has deductions, recording a suspension on its
@@ -1193,8 +1261,8 @@ class LedgerView(QWidget):
                 ind_id = self.current_individual_id
                 if self.engine.loan_service.has_loan_restructure_events(ind_id, loan_ref):
                     proceed = QMessageBox.question(self, "Deductions Found in Period",
-                        f"{existing} deduction(s) exist for {loan_ref} between {start_str} and "
-                        f"{end_str}, and this loan has top-ups / buy-offs so it can't be "
+                        f"{existing} deduction(s) exist for {loan_ref} {window_str}, "
+                        f"and this loan has top-ups / buy-offs so it can't be "
                         f"auto-rebuilt.\n\nRecord the suspension as a note only (it may "
                         f"contradict those deductions)?",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -1211,7 +1279,7 @@ class LedgerView(QWidget):
                         ("Repayment", "Interest Earned"))
                     choice = QMessageBox.question(self, "Rebuild Schedule — Deletes Entries",
                         f"There {'is' if existing == 1 else 'are'} {existing} deduction(s) recorded "
-                        f"for {loan_ref} between {start_str} and {end_str}.\n\n"
+                        f"for {loan_ref} {window_str}.\n\n"
                         f"To apply the suspension, this loan's schedule must be rebuilt. "
                         f"That deletes ALL {total_rows} repayment and interest entries on "
                         f"{loan_ref} — not only the {existing} in this window — and re-creates "
@@ -1252,6 +1320,12 @@ class LedgerView(QWidget):
                 QMessageBox.information(self, "Past Suspension Recorded",
                     f"Recorded a past suspension for {loan_ref} from {start_str} to {end_str}.\n"
                     f"It will appear as a no-deductions period on statements covering it.")
+            elif indefinite:
+                QMessageBox.information(self, "Suspended Indefinitely",
+                    f"Loan {loan_ref} is suspended from {start_str} with no end date.\n\n"
+                    f"Deductions will keep being skipped — and the term keep extending — "
+                    f"until you press Resume on this loan. Nothing will restart them "
+                    f"automatically.")
             else:
                 QMessageBox.information(self, "Suspended",
                     f"Loan {loan_ref} suspended from {start_str} until {end_str}.\n"
@@ -1515,11 +1589,20 @@ class LedgerView(QWidget):
         dialog.exec()
 
     def resume_loan_btn(self, loan_id):
-        """Resume a suspended loan."""
+        """Resume a suspended loan.
+
+        The months already skipped stay skipped either way — resuming ends the
+        suspension, it does not backfill it — so the confirmation says so
+        rather than leaving the user to find out from the balance.
+        """
+        span = self.engine.db.loans.open_suspension(loan_id)
+        since = f" It has been suspended since {span['start_date']}." if span else ""
         confirm = QMessageBox.question(self, "Resume Loan",
-            "Are you sure you want to resume deductions for this loan?",
+            f"Resume deductions for this loan?{since}\n\n"
+            "The months it skipped stay skipped and the term stays extended; "
+            "only future months are deducted again.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        
+
         if confirm == QMessageBox.StandardButton.Yes:
             self.engine.db.resume_loan(loan_id)
             QMessageBox.information(self, "Resumed", "Loan deductions have been resumed.")
