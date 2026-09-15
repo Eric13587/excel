@@ -216,6 +216,39 @@ def apply_pending(conn):
                 restore_fk = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
                 conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute("BEGIN IMMEDIATE")
+            if version == 1:
+                # Pre-flight for migration 001: remove orphaned children across all child tables
+                # and deduplicate (individual_id, ref) in loans so idx_loans_member_ref unique index
+                # creation and strict schema migration 004 do not fail on legacy journals.
+                try:
+                    conn.execute(
+                        "DELETE FROM loan_suspensions WHERE loan_id IS NULL "
+                        "OR loan_id NOT IN (SELECT id FROM loans)"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                for tbl in ("loan_suspensions", "ledger", "savings", "christmas_savings",
+                            "benevolent_ledger", "benevolent_accounts", "loans"):
+                    try:
+                        conn.execute(
+                            f"DELETE FROM {tbl} WHERE individual_id IS NULL "
+                            f"OR individual_id NOT IN (SELECT id FROM individuals)"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                dups = conn.execute(
+                    "SELECT individual_id, ref FROM loans GROUP BY individual_id, ref HAVING COUNT(*) > 1"
+                ).fetchall()
+                for ind_id, ref in dups:
+                    rows = conn.execute(
+                        "SELECT id FROM loans WHERE individual_id = ? AND ref = ? ORDER BY id ASC",
+                        (ind_id, ref)
+                    ).fetchall()
+                    for idx, (lid,) in enumerate(rows[1:], start=1):
+                        new_ref = f"{ref}-DUP{idx}"
+                        conn.execute("UPDATE loans SET ref = ? WHERE id = ?", (new_ref, lid))
+                        conn.execute("UPDATE ledger SET loan_id = ? WHERE individual_id = ? AND loan_id = ?",
+                                     (new_ref, ind_id, ref))
             if is_python:
                 statements = [None] * _run_python_migration(path, conn)
             else:

@@ -63,24 +63,27 @@ class RepairRepository(Repository):
         """
         t = _quote(table)
         dates = "MIN(o.date), MAX(o.date)" if self._has_date_column(table) else "NULL, NULL"
+        extra = " OR o.loan_id IS NULL OR o.loan_id NOT IN (SELECT id FROM loans)" if table == "loan_suspensions" else ""
         return self._rows(
             f"SELECT o.individual_id, COUNT(*), {dates} FROM {t} o "
             f"LEFT JOIN individuals i ON i.id = o.individual_id "
-            f"WHERE i.id IS NULL GROUP BY o.individual_id ORDER BY o.individual_id")
+            f"WHERE (i.id IS NULL{extra}) GROUP BY o.individual_id ORDER BY o.individual_id")
 
     def orphan_frame(self, table):
         """Every orphaned row of one table, for the audit workbook."""
         t = _quote(table)
+        extra = " OR o.loan_id IS NULL OR o.loan_id NOT IN (SELECT id FROM loans)" if table == "loan_suspensions" else ""
         return pd.read_sql_query(
             f"SELECT o.* FROM {t} o LEFT JOIN individuals i ON i.id = o.individual_id "
-            f"WHERE i.id IS NULL", self.conn)
+            f"WHERE i.id IS NULL{extra}", self.conn)
 
     def delete_orphans(self, table):
         """Delete one table's orphans; returns the row count removed."""
         t = _quote(table)
+        extra = " OR loan_id IS NULL OR loan_id NOT IN (SELECT id FROM loans)" if table == "loan_suspensions" else ""
         cur = self._execute(
             f"DELETE FROM {t} WHERE individual_id IS NULL "
-            f"OR individual_id NOT IN (SELECT id FROM individuals)")
+            f"OR individual_id NOT IN (SELECT id FROM individuals){extra}")
         return cur.rowcount
 
 

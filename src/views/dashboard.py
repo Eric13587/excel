@@ -2560,9 +2560,24 @@ class Dashboard(QWidget):
     def open_repair_loans_dialog(self):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
-                                     QHeaderView, QDialogButtonBox, QProgressDialog)
+                                     QHeaderView, QDialogButtonBox, QProgressDialog, QMessageBox)
+        from src import migrations
 
-        healable = self.engine.scan_healable_loans()
+        if migrations.schema_version(self.db.conn) < 3:
+            QMessageBox.warning(
+                self, "Migration Required",
+                "Database migrations have not completed. Please run the Orphan Repair tool "
+                "first to resolve legacy data issues before repairing loan terms."
+            )
+            return
+
+        try:
+            healable = self.engine.scan_healable_loans()
+        except Exception as e:
+            from src.views.error_handling import report
+            report(e, parent=self, context="scanning healable loans")
+            return
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Repair Loans")
         dlg.setMinimumSize(640, 460)

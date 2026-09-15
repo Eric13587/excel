@@ -6,7 +6,8 @@ import os
 # Disable GPU and software rasterizer to prevent crashes on older hardware (DirectX 11 issues)
 # This is critical for systems where QtWebEngine fails to initialize GPU process.
 # Must be set before QWebEngineWidgets is imported/initialized.
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-rasterizer"
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-rasterizer --disable-gpu-compositing"
+os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
 # Import QtWebEngineWidgets BEFORE QApplication is created (needed for PDF generation)
 try:

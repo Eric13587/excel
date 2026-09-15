@@ -407,6 +407,9 @@ class LedgerView(QWidget):
                 buyoff_btn = QPushButton("Buyoff")
                 buyoff_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('purple')}; color: white;")
                 buyoff_btn.clicked.connect(lambda checked, ref=loan_ref: self.buyoff_loan_btn(ref))
+                if loan_info and loan_info.get('status') != 'Active':
+                    buyoff_btn.setEnabled(False)
+                    buyoff_btn.setToolTip(f"Loan is {loan_info.get('status')} — buyoff not permitted")
                 header_layout.addWidget(buyoff_btn)
                 
                 delete_loan_btn = QPushButton("Delete Loan")
@@ -1112,7 +1115,11 @@ class LedgerView(QWidget):
     def buyoff_loan_btn(self, loan_ref):
         """Show dialog to buyoff/settle the loan fully."""
         loan = self.engine.db.get_loan_by_ref(self.current_individual_id, loan_ref)
-        if not loan: return
+        if not loan:
+            return
+        if loan.get('status') != 'Active':
+            QMessageBox.warning(self, "Loan Inactive", f"Loan '{loan_ref}' is already {loan.get('status')}.")
+            return
         
         principal = loan['balance']
         accrued = loan.get('interest_balance', 0.0)
@@ -1132,12 +1139,16 @@ class LedgerView(QWidget):
                                        
         if confirm == QMessageBox.StandardButton.Yes:
             # Use default date logic (Next Due Date) from LoanService
-            if self.engine.buyoff_loan(self.current_individual_id, loan_ref, None):
-                QMessageBox.information(self, "Success", "Loan Paid Off Successfully!")
-                self.refresh_table()
-                self.refresh_loans_list()
-            else:
-                QMessageBox.warning(self, "Error", "Could not process buyoff.")
+            try:
+                if self.engine.buyoff_loan(self.current_individual_id, loan_ref, None):
+                    QMessageBox.information(self, "Success", "Loan Paid Off Successfully!")
+                    self.refresh_table()
+                    self.refresh_loans_list()
+                else:
+                    QMessageBox.warning(self, "Error", "Could not process buyoff.")
+            except Exception as e:
+                from src.views.error_handling import report
+                report(e, parent=self, context=f"loan buyoff for '{loan_ref}'")
 
     def suspend_loan_dialog(self, loan_id, loan_ref):
         """Suspend a loan — for N months, or open-ended until somebody resumes it.
