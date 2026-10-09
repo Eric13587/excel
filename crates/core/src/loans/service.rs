@@ -82,6 +82,20 @@ pub fn terms_for(principal: f64, duration_months: i64, rate: f64) -> LoanTerms {
     }
 }
 
+/// The largest whole principal whose instalment over `months` at `rate` is no
+/// more than `deduction` — "what can this member borrow if they can afford
+/// 2,300 a month?". `None` when the inputs cannot have an answer.
+pub fn principal_for_deduction(deduction: f64, months: i64, rate: f64) -> Option<f64> {
+    if !deduction.is_finite() || deduction <= 0.0 || months < 1 || !rate.is_finite() || rate < 0.0 {
+        return None;
+    }
+    let mut principal = (deduction * months as f64 / (1.0 + rate) + 0.5).floor();
+    while principal > 0.0 && terms_for(principal, months, rate).installment > deduction {
+        principal -= 1.0;
+    }
+    (principal > 0.0).then_some(principal)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Issued {
     pub reference: String,
@@ -691,6 +705,17 @@ mod tests {
     fn notes_read_like_the_first_version() {
         assert_eq!(py_float(100000.0), "100000.0");
         assert_eq!(py_float(15000.5), "15000.5");
+    }
+
+    #[test]
+    fn the_principal_calculator_never_overshoots_the_deduction() {
+        // 2,300 over 11 months at 15%: 1.x's answer.
+        assert_eq!(principal_for_deduction(2300.0, 11, 0.15), Some(22000.0));
+        assert!(terms_for(22000.0, 11, 0.15).installment <= 2300.0);
+        assert!(terms_for(22001.0, 11, 0.15).installment > 2300.0 || terms_for(22002.0, 11, 0.15).installment > 2300.0);
+        assert_eq!(principal_for_deduction(5750.0, 20, 0.15), Some(100000.0));
+        assert_eq!(principal_for_deduction(0.0, 12, 0.15), None);
+        assert_eq!(principal_for_deduction(1000.0, 0, 0.15), None);
     }
 
     #[test]

@@ -8,7 +8,11 @@ use loanmaster_core::db::model::Fund;
 use loanmaster_core::imports::{Options, Source, run};
 use loanmaster_core::{Journal, OpenOptions};
 
-fn figures(journal: &Journal) -> (usize, Vec<(String, String, String, String)>, usize, Vec<(String, String)>) {
+/// Members, each loan's (member, ref, balance, due), ledger rows, each
+/// member's fund balances.
+type Figures = (usize, Vec<(String, String, String, String)>, usize, Vec<(String, String)>);
+
+fn figures(journal: &Journal) -> Figures {
     let members = journal.members().all().unwrap();
     let mut loans = Vec::new();
     let mut funds = Vec::new();
