@@ -9,8 +9,9 @@ from 1.x on purpose.
 
 | Crate | Holds |
 |---|---|
-| `crates/core` | The journal, loans, funds, the Ledger Grid, policy and undo. No user interface. |
-| `crates/app` | The egui desktop application (in progress). |
+| `crates/core` | The journal, loans, funds, the Ledger Grid, policy, undo, report and statement data, imports. No user interface. |
+| `crates/reports` | Writing documents: workbooks, CSV, and PDFs typeset with Typst. |
+| `crates/app` | The egui desktop application: the dashboard, a member's ledger, the Ledger Grid, and the Reports, Tools and import windows. |
 
 ## The journal
 
@@ -48,6 +49,9 @@ purpose.
   Grid's Fill Forward does the same work and shows every figure before saving.
 * **Journal Health Check and the repair and scan tools.** New journals cannot
   get into the states they repaired. Existing journals are corrected by hand.
+* **Auto Deduct and Auto Increment on the member's ledger.** Deduct (with its
+  number of months) and Catch Up take a loan's or a fund's months in order,
+  and the Ledger Grid fills any other months.
 * **Loan restructuring.** 1.x had the code but no screen that called it, and the
   production journal holds no restructure rows. 2.0 still reads restructure
   rows, so an older journal that has them still derives correctly.
@@ -119,6 +123,11 @@ purpose.
   paid off in full could show a gross balance of 1.
 * **Savings balances are summed from the rows.** 1.x printed each row's
   stored running balance. On the production journal the two agree.
+* **A member with no activity in the period is skipped, in either format**,
+  and the summary says so. 1.x counted an empty workbook statement as a
+  failure.
+* **Two members of the same name get a file each.** 1.x wrote both
+  statements to one file name, so the second replaced the first.
 
 ### Importing from another journal
 
@@ -147,6 +156,8 @@ purpose.
 * **A member who has left with no leaving date is recorded as leaving on the
   import date**, so their status, retirement flag and date agree. 1.x dropped
   the flag but kept the status, which made any later status edit fail.
+* **Import History is on the File menu and the dashboard's Import Data
+  button.** 1.x had the window, with its undo, but nothing opened it.
 
 ### Importing from a spreadsheet
 
@@ -160,6 +171,13 @@ purpose.
 * **A benevolent sheet moves the member's schedule past what it recorded**,
   as the Ledger Grid does, so the next catch-up does not post those months
   again.
+
+### Settings and backups
+
+* **Workbook colours are part of Settings**, and Reset Colours restores the
+  colours a new journal starts with. 1.x reset them to a different pair.
+* **Restoring a backup clears the undo history.** 1.x kept it, so an undo
+  after a restore could apply to entries the restore had replaced.
 
 ### Reports and documents
 
