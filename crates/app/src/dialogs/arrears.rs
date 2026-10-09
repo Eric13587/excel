@@ -185,6 +185,7 @@ impl Arrears {
                     });
                 });
                 egui::CentralPanel::default().show(ui, |ui| {
+                    widgets::clickable_rows(ui);
                     TableBuilder::new(ui)
                         .striped(true)
                         .sense(egui::Sense::click())

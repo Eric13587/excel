@@ -66,6 +66,16 @@ pub fn badge(ui: &mut Ui, text: &str, colour: Color32) {
         });
 }
 
+/// A figure typed by a person: thousands separators allowed, finite only.
+pub fn number(text: &str) -> Option<f64> {
+    text.replace(',', "").trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// An amount of money typed by a person: a positive [`number`].
+pub fn amount(text: &str) -> Option<f64> {
+    number(text).filter(|v| *v > 0.0)
+}
+
 /// Money for a table cell: whole shillings, a dash for nothing.
 pub fn money_or_dash(value: f64) -> String {
     if value.abs() < 0.005 { "—".into() } else { shillings(value) }
@@ -104,6 +114,12 @@ pub fn date(ui: &mut Ui, id: &str, value: &mut chrono::NaiveDate) -> egui::Respo
         *value = date;
     }
     response
+}
+
+/// Make a table's rows take clicks anywhere on them: text that can be
+/// selected would otherwise take a click on a name for itself.
+pub fn clickable_rows(ui: &mut Ui) {
+    ui.style_mut().interaction.selectable_labels = false;
 }
 
 /// Fill a table cell edge to edge, across the gap to its neighbours, so a

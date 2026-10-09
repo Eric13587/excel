@@ -10,11 +10,7 @@ use loanmaster_core::{dates, funds};
 use super::footer;
 use crate::app::{Action, outcome};
 use crate::theme;
-use crate::widgets;
-
-fn amount(text: &str) -> Option<f64> {
-    text.replace(',', "").trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
-}
+use crate::widgets::{self, amount};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {

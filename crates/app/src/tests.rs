@@ -425,3 +425,83 @@ fn statements_are_written_one_file_per_member() {
     assert_eq!(written.len(), 2, "{written:?}");
     assert!(written[0].starts_with("ANN WANJIRU_statement_") && written[0].ends_with(".pdf"), "{written:?}");
 }
+
+// ------------------------------------------------------------------ tools
+
+#[test]
+fn settings_are_saved_to_the_journal() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Tools", "Settings…");
+    shot(&mut harness, "settings");
+    let name = || (egui::accesskit::Role::TextInput, "Organization name");
+    harness.get_by_role_and_label(name().0, name().1).focus();
+    harness.run();
+    harness.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
+    harness.get_by_role_and_label(name().0, name().1).type_text("Umoja Staff Sacco");
+    harness.run();
+    harness.get_by_label("Save").click();
+    harness.run();
+    let journal = &harness.state().workspace.as_ref().unwrap().journal;
+    assert_eq!(journal.settings().org_name(), "Umoja Staff Sacco");
+    assert_eq!(journal.settings().default_interest_rate(), 0.15, "untouched values are kept");
+    harness.get_by_label("Umoja Staff Sacco");
+}
+
+#[test]
+fn an_impossible_interest_rate_is_not_saved() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Tools", "Settings…");
+    let rate = || (egui::accesskit::Role::TextInput, "Loan interest rate");
+    harness.get_by_role_and_label(rate().0, rate().1).focus();
+    harness.run();
+    harness.key_combination_modifiers(egui::Modifiers::COMMAND, &[egui::Key::A]);
+    harness.get_by_role_and_label(rate().0, rate().1).type_text("150");
+    harness.run();
+    harness.get_by_label("Save").click();
+    harness.run();
+    harness.get_by_label("The interest rate must be a percentage from 0 to 100.");
+    assert_eq!(harness.state().workspace.as_ref().unwrap().journal.settings().default_interest_rate(), 0.15);
+}
+
+#[test]
+fn the_activity_log_lists_what_changed() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Tools", "Activity Log…");
+    harness.get_by_label_contains("create, update and delete events");
+    shot(&mut harness, "activity_log");
+}
+
+#[test]
+fn a_backup_is_restored_after_asking() {
+    use loanmaster_core::OpenOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.db");
+    sample().backup_to(&path).unwrap();
+    // Opening takes the backup; a member added afterwards is not in it.
+    let journal = Journal::open(&path, OpenOptions { backup_on_open: true }).unwrap();
+    membership::add(&journal, &MemberDetails { name: "NEW MEMBER".into(), ..Default::default() }).unwrap();
+    let mut harness = harness(journal);
+    menu(&mut harness, "Tools", "Restore From Backup…");
+    shot(&mut harness, "restore");
+    harness.get_by_label_contains("journal.20").click();
+    harness.run();
+    harness.get_by_label_contains("Contains 10 members");
+    harness.get_by_label("Restore Selected").click();
+    harness.run();
+    harness.get_by_label("Restore Journal");
+    harness.get_by_label("Restore").click();
+    harness.run();
+    harness.get_by_label("Restored");
+    let journal = &harness.state().workspace.as_ref().unwrap().journal;
+    assert_eq!(journal.members().all().unwrap().len(), 10);
+    assert_eq!(journal.available_backups().len(), 2, "the state before restoring was kept");
+}
+
+#[test]
+fn clicking_a_members_row_selects_them() {
+    let mut harness = harness(sample());
+    harness.get_by_label("PETER MWANGI").click();
+    harness.run();
+    let peter = member_id(&harness, "PETER MWANGI");
+    assert_eq!(harness.state().workspace.as_ref().unwrap().dashboard.selected, Some(peter));
+}

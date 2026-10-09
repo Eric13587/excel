@@ -13,8 +13,11 @@ use loanmaster_core::Error;
 use loanmaster_core::db::model::Fund;
 
 use crate::dialogs::Dialog;
+use crate::dialogs::activity::ActivityLog;
 use crate::dialogs::arrears::Arrears;
 use crate::dialogs::reports::{FundReport, LoanReport, MembersList};
+use crate::dialogs::restore::Restore;
+use crate::dialogs::settings::SettingsForm;
 use crate::dialogs::statements::Statements;
 use crate::screens::{self, startup};
 use crate::task::Task;
@@ -218,6 +221,24 @@ impl LoanMasterApp {
                     actions.push(Action::OpenGrid);
                 }
             });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Settings…").on_hover_text("Organization, financial, funds, report and appearance settings").clicked() {
+                    actions.push(Action::dialog(SettingsForm::new(&ws.journal)));
+                }
+                ui.separator();
+                if ui.button("Activity Log…").clicked() {
+                    actions.push(Action::dialog(ActivityLog::default()));
+                }
+                if ui.button("Restore From Backup…").clicked() {
+                    match ws.unsaved() {
+                        Some(detail) => actions.push(Action::Notice(Notice::info(
+                            "Restore From Backup",
+                            format!("The Ledger Grid has unsaved changes ({detail}). Save or discard them before restoring."),
+                        ))),
+                        None => actions.push(Action::dialog(Restore::default())),
+                    }
+                }
+            });
             ui.menu_button("Help", |ui| {
                 if ui.button("About LoanMaster").clicked() {
                     actions.push(Action::Notice(Notice::info(
@@ -322,12 +343,7 @@ impl LoanMasterApp {
             Ok((workspace, warnings)) => {
                 self.remembered.remember(&path);
                 self.remembered.dark = workspace.dark;
-                let title = if workspace.org_name.is_empty() {
-                    format!("LoanMaster {} — {}", env!("CARGO_PKG_VERSION"), file_name(&path))
-                } else {
-                    format!("{} — LoanMaster {} — {}", workspace.org_name, env!("CARGO_PKG_VERSION"), file_name(&path))
-                };
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(&workspace)));
                 self.workspace = Some(workspace);
                 self.notices.extend(warnings);
             }
@@ -368,7 +384,13 @@ impl LoanMasterApp {
                     Action::OpenGrid => ws.open_grid(),
                     Action::Dialog(dialog) => ws.dialogs.push(*dialog),
                     Action::Status(text) => ws.status = Some(text),
-                    Action::Changed => ws.changed(),
+                    Action::Changed => {
+                        let named = ws.org_name.clone();
+                        ws.changed();
+                        if ws.org_name != named {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Title(window_title(ws)));
+                        }
+                    }
                     Action::Run(job) => job(ws, &mut follow),
                     Action::Task(task) if ws.task.is_some() => {
                         drop(task);
@@ -390,6 +412,16 @@ impl LoanMasterApp {
 
 fn file_name(path: &Path) -> String {
     path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// "Umoja Sacco — LoanMaster 2.0.0 — loan_master.db".
+fn window_title(ws: &Workspace) -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    if ws.org_name.is_empty() {
+        format!("LoanMaster {version} — {}", file_name(&ws.path))
+    } else {
+        format!("{} — LoanMaster {version} — {}", ws.org_name, file_name(&ws.path))
+    }
 }
 
 impl eframe::App for LoanMasterApp {

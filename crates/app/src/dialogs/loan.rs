@@ -12,12 +12,8 @@ use loanmaster_core::{Journal, dates, funds};
 use super::footer;
 use crate::app::{Action, Notice, outcome};
 use crate::theme;
-use crate::widgets;
+use crate::widgets::{self, amount};
 use crate::workspace::Screen;
-
-fn amount(text: &str) -> Option<f64> {
-    text.replace(',', "").trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
-}
 
 fn month_end(date: NaiveDate) -> NaiveDate {
     dates::add_days(dates::add_months(date.with_day(1).unwrap_or(date), 1), -1)

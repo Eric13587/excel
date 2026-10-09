@@ -197,6 +197,7 @@ fn table(ui: &mut egui::Ui, journal: &Journal, lines: &[&Line], selected: Option
     let p = theme::palette(ui.ctx());
     let mut clicked = None;
     egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(10).inner_margin(6).show(ui, |ui| {
+        widgets::clickable_rows(ui);
         TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())

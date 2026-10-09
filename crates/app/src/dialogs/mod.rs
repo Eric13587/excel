@@ -6,6 +6,7 @@ use loanmaster_core::Journal;
 
 use crate::app::Action;
 
+pub mod activity;
 pub mod arrears;
 pub mod columns;
 pub mod confirm;
@@ -14,6 +15,8 @@ pub mod fund;
 pub mod loan;
 pub mod member;
 pub mod reports;
+pub mod restore;
+pub mod settings;
 pub mod statements;
 
 macro_rules! dialogs {
@@ -50,6 +53,9 @@ dialogs! {
     LoanReport(reports::LoanReport),
     MembersList(reports::MembersList),
     Statements(statements::Statements),
+    Settings(settings::SettingsForm),
+    Activity(activity::ActivityLog),
+    Restore(restore::Restore),
 }
 
 impl Dialog {
@@ -75,6 +81,9 @@ impl Dialog {
             Dialog::LoanReport(d) => d.show(ctx, journal, actions),
             Dialog::MembersList(d) => d.show(ctx, journal, actions),
             Dialog::Statements(d) => d.show(ctx, journal, actions),
+            Dialog::Settings(d) => d.show(ctx, actions),
+            Dialog::Activity(d) => d.show(ctx, journal, actions),
+            Dialog::Restore(d) => d.show(ctx, journal, actions),
         }
     }
 }

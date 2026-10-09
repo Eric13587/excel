@@ -20,6 +20,11 @@ pub fn folder(title: &str) -> Option<PathBuf> {
     ask::folder(title)
 }
 
+/// Ask for an existing file to read.
+pub fn pick(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
+    ask::pick(title, filters)
+}
+
 /// The filters for a report: PDF, workbook or CSV.
 pub const REPORT_FORMATS: [(&str, &str); 3] = [("PDF document", "pdf"), ("Excel workbook", "xlsx"), ("CSV file", "csv")];
 
@@ -53,6 +58,14 @@ mod ask {
         rfd::FileDialog::new().set_title(title).pick_folder()
     }
 
+    pub fn pick(title: &str, filters: &[(&str, &[&str])]) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().set_title(title);
+        for (label, extensions) in filters {
+            dialog = dialog.add_filter(*label, extensions);
+        }
+        dialog.pick_file()
+    }
+
     pub fn open(path: &Path) -> std::io::Result<()> {
         open::that_detached(path)
     }
@@ -79,6 +92,10 @@ pub mod ask {
     }
 
     pub fn folder(_: &str) -> Option<PathBuf> {
+        CHOSEN.with(|chosen| chosen.borrow_mut().take())
+    }
+
+    pub fn pick(_: &str, _: &[(&str, &[&str])]) -> Option<PathBuf> {
         CHOSEN.with(|chosen| chosen.borrow_mut().take())
     }
 
