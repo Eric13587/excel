@@ -22,14 +22,27 @@ represent the first two honestly. So:
 * **empty** — typing a number inserts one credit row (:data:`FundSpec.credit`),
   dated by :func:`default_day`;
 * **one row** — typing changes that row's amount; clearing it deletes the row;
-* **several rows** — the cell shows the net and is **read only**, flagged
-  :data:`CellState.MIXED`. Collapsing three transactions into one number would
-  either destroy two of them or invent an allocation between them. The view
-  offers to open that month instead.
+* **several rows** — the cell holds a *list* of entries, one per row, written
+  with operation prefixes: ``@D=2,000, @W=500``. Editing the list adds, changes
+  or removes the rows to match (:data:`ChangeKind.SET`). One number could not
+  stand for two facts, which is why these cells used to be read only; a list
+  can. A month holding a row no operation describes stays read only.
 
-A negative number means money out: it is written as a ``Withdrawal``, which is
-the sign convention the whole application already uses (the sign lives in the
-transaction type, never in the stored amount — see :mod:`src.services.posting`).
+A DEPOSIT EVERY MONTH
+---------------------
+Every member credits every fund every month; a withdrawal or a payout happens
+*as well*, not instead. So what is typed replaces only the entries of the kinds
+it names: ``2,500`` sets the month's deposit and keeps its withdrawal, ``@W=300``
+sets the withdrawal and keeps the deposit, ``@W=0`` removes the withdrawal.
+Clearing the cell clears the month; ``+@W=…`` adds a second entry of a kind.
+Fill Forward follows the same rule: a month is missed when it has no credit,
+whatever else it holds.
+
+The operations are :mod:`src.services.grid_ops`: a bare figure is the fund's
+credit, ``@W`` a withdrawal (``@P`` a payout on the benevolent fund). A negative
+number still means money out — written as a ``Withdrawal``, the sign convention
+the whole application uses (the sign lives in the transaction type, never in
+the stored amount — see :mod:`src.services.posting`).
 
 WHAT IS REFUSED, AND WHY IT IS REPORTED PER CELL
 ------------------------------------------------
@@ -46,7 +59,11 @@ Refusals come from the existing rules, not from new ones invented here:
   (:mod:`src.services.policy`) — but may still have a withdrawal recorded;
 * a Christmas withdrawal outside the unlock month
   (:class:`~src.exceptions.ChristmasLockedError`);
-* anything :func:`src.services.posting.validate` rejects.
+* anything :func:`src.services.posting.validate` rejects;
+* on Savings and Christmas, a save that would leave a withdrawal bigger than the
+  balance it was taken from — the Withdraw dialog's rule. Judged per member,
+  over all of that member's changes in the save (docs/grid/deleting-months.md
+  §3.3).
 
 THE BENEVOLENT SCHEDULE
 -----------------------
@@ -66,6 +83,7 @@ from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 from src.db.fund import BENEVOLENT, CHRISTMAS, SAVINGS
+from src.services.grid_ops import Entry, Op, OpError, OpSet
 from src.services.policy import Operation, default_policy
 from src.services.posting import Posting, check as check_posting
 
@@ -89,13 +107,16 @@ class FundSpec:
     policy_kind: str            # the policy Operation for a new credit
     scheduled: bool = False     # driven by benevolent_accounts.next_due_date
     locks_withdrawals: bool = False   # Christmas: only in the unlock month
+    #: The member's own money, so a withdrawal may not exceed the balance it
+    #: came from. Not benevolent: a payout draws on a pooled fund.
+    own_money: bool = False
 
 
 FUNDS = {
     SAVINGS: FundSpec(SAVINGS, "Savings / Shares", "Deposit", "deposit",
-                      "savings.deposit"),
+                      "savings.deposit", own_money=True),
     CHRISTMAS: FundSpec(CHRISTMAS, "Christmas", "Deposit", "deposit",
-                        "christmas.deposit", locks_withdrawals=True),
+                        "christmas.deposit", locks_withdrawals=True, own_money=True),
     BENEVOLENT: FundSpec(BENEVOLENT, "Benevolent", "Contribution", "contribution",
                          "benevolent.contribute", scheduled=True),
 }
@@ -113,6 +134,80 @@ def spec(fund):
     except KeyError:
         raise ValueError(f"{fund!r} is not a fund grid table; "
                          f"expected one of {sorted(FUNDS)}") from None
+
+
+# --------------------------------------------------------------------------- #
+# Operations — what a cell can say besides a bare figure
+# --------------------------------------------------------------------------- #
+
+_DEPOSIT = Op("D", "Deposit", ("d", "deposit", "i", "increment"),
+              "Money in — the default, so a bare figure means this.")
+_WITHDRAW = Op("W", "Withdrawal", ("w", "withdrawal", "withdraw"),
+               "Money out. A bare negative figure (-500) means the same.")
+_XMAS_WITHDRAW = Op("W", "Withdrawal", ("w", "withdrawal", "withdraw"),
+                    "Money out — only in the unlock month set in Settings. "
+                    "A bare negative figure (-500) means the same.")
+_CONTRIBUTE = Op("C", "Contribution", ("c", "contribution", "contribute", "i",
+                                       "increment", "d", "deposit"),
+                 "The monthly contribution — the default, so a bare figure means this.")
+_PAYOUT = Op("P", "Payout", ("p", "payout", "w", "withdrawal", "withdraw"),
+             "A benefit paid out of the fund (recorded as a withdrawal). A bare "
+             "negative figure means the same.")
+
+#: Each fund's operations: (default credit, money out).
+_FUND_OPS = {
+    SAVINGS: OpSet((_DEPOSIT, _WITHDRAW), _DEPOSIT, negative=_WITHDRAW),
+    CHRISTMAS: OpSet((_DEPOSIT, _XMAS_WITHDRAW), _DEPOSIT, negative=_XMAS_WITHDRAW),
+    BENEVOLENT: OpSet((_CONTRIBUTE, _PAYOUT), _CONTRIBUTE, negative=_PAYOUT),
+}
+
+
+def operations(fund):
+    """The :class:`~src.services.grid_ops.OpSet` a fund's cells understand."""
+    spec(fund)
+    return _FUND_OPS[fund]
+
+
+def _type_for(fund, op):
+    """The ``transaction_type`` an operation is stored as."""
+    return spec(fund).credit if op is operations(fund).default else WITHDRAWAL
+
+
+def _op_for(fund, transaction_type):
+    """The operation a stored row reads back as, or None if none describes it."""
+    ops = operations(fund)
+    if transaction_type == spec(fund).credit:
+        return ops.default
+    if transaction_type == WITHDRAWAL:
+        return ops.negative
+    return None
+
+
+def cell_entries(fund, cell):
+    """A cell's rows as entries, in date order — or None if one has no operation.
+
+    ``Interest`` is a valid fund posting that no grid operation writes. A month
+    holding one cannot be expressed as a list of entries, so it stays read only
+    rather than having the row silently dropped by the next edit.
+    """
+    entries = []
+    for row in sorted(cell.rows, key=lambda r: (str(r["date"])[:10], r["id"])):
+        op = _op_for(fund, row["transaction_type"])
+        if op is None:
+            return None
+        entries.append(Entry(op, round(float(row["amount"] or 0), 2)))
+    return entries
+
+
+def _as_types(fund, entries):
+    """Entries as sorted ``(transaction_type, amount)`` pairs, for comparison.
+
+    Zero rows are left out. The journal has a few, and a zero entry parses as
+    no entry, so without this, opening such a cell and pressing Enter would
+    stage the deletion of a row nobody asked to touch.
+    """
+    return sorted((_type_for(fund, e.op), round(e.amount, 2)) for e in entries
+                  if round(e.amount, 2))
 
 
 # --------------------------------------------------------------------------- #
@@ -335,6 +430,7 @@ class ChangeKind:
     INSERT = "insert"
     UPDATE = "update"
     DELETE = "delete"
+    SET = "set"             # make the month hold exactly these entries
 
 
 @dataclass
@@ -349,11 +445,17 @@ class Change:
     row_id: int = None              # UPDATE/DELETE: the row it acts on
     before: tuple = ()              # the cell's fingerprint when it was read
     notes: str = ""
+    entries: tuple = ()             # SET: what the month should hold
 
     @property
     def key(self):
         """The row this change belongs to — see :attr:`MemberRow.key`."""
         return self.member_id
+
+    @property
+    def effect(self):
+        """What the cell nets to once this is saved — for staged totals."""
+        return 0.0 if self.kind == ChangeKind.DELETE else self.amount
 
     @property
     def transaction_type(self):
@@ -368,45 +470,64 @@ class Change:
 def stage(grid, member_row, month, text):
     """Turn what somebody typed into a :class:`Change`, or return a refusal.
 
-    Returns ``(change, problem)`` — exactly one of which is None. Blank (or a
-    dash, which is how the grid shows an empty cell) means "no movement": that
-    deletes the row if there is one and is a no-op if there is not.
+    Returns ``(change, problem)`` — exactly one of which is None, or both when
+    there is nothing to do. Blank (or a dash, which is how the grid shows an
+    empty cell) means "no movement": that deletes what the month holds.
+
+    A month that holds — or is being given — at most one entry produces the
+    same single-row change it always has. Anything more is a
+    :data:`ChangeKind.SET`, resolved into row edits when it is saved.
     """
     cell = member_row.cell(month)
-    if not cell.editable:
-        return None, ("This month has several transactions, so one number "
-                      "cannot stand for it. Open the month to edit them.")
-
-    text = (text or "").strip().replace(",", "").replace("—", "").replace("–", "")
-    if text in ("", "-", "0", "0.0", "0.00"):
-        if cell.state == CellState.SINGLE and text in ("", "-"):
-            return Change(grid.fund, member_row.member_id, month, ChangeKind.DELETE,
-                          row_id=cell.row_id, before=cell.fingerprint()), None
-        if cell.state == CellState.EMPTY:
-            return None, None                   # nothing there, nothing asked for
-        # An explicit zero on an existing row is a deletion too: a fund row of
-        # zero is not a fact anybody wants recorded, and posting refuses it.
-        return Change(grid.fund, member_row.member_id, month, ChangeKind.DELETE,
-                      row_id=cell.row_id, before=cell.fingerprint()), None
-
+    ops = operations(grid.fund)
+    current = cell_entries(grid.fund, cell)
+    if current is None:
+        return None, ("This month holds a transaction no grid operation "
+                      "describes. Open the member's ledger to edit it.")
     try:
-        amount = round(float(text), 2)
-    except ValueError:
-        return None, f"{text!r} is not a number."
-    if amount == 0:
-        return None, "Zero is not a movement — clear the cell to remove it."
+        entries, append = ops.parse(text)
+    except OpError as e:
+        return None, str(e)
+    if append:
+        entries = current + [e for e in entries if e.amount]
+    elif entries:
+        # Only the kinds named are replaced — see A DEPOSIT EVERY MONTH. The
+        # credit is listed first, the way the month is read back.
+        named = {e.op for e in entries}
+        entries = sorted([e for e in current if e.op not in named]
+                         + [e for e in entries if e.amount],
+                         key=lambda e: e.op is not ops.default)
 
-    if cell.state == CellState.EMPTY:
-        return Change(grid.fund, member_row.member_id, month, ChangeKind.INSERT,
-                      amount=amount, before=cell.fingerprint()), None
-
-    existing = cell.rows[0]
-    was = round(float(existing["amount"] or 0), 2)
-    signed = -was if existing["transaction_type"] == WITHDRAWAL else was
-    if signed == amount:
+    if _as_types(grid.fund, entries) == _as_types(grid.fund, current):
         return None, None                       # typed what was already there
-    return Change(grid.fund, member_row.member_id, month, ChangeKind.UPDATE,
-                  amount=amount, row_id=cell.row_id, before=cell.fingerprint()), None
+
+    before = cell.fingerprint()
+    member_id = member_row.member_id
+    if len(cell.rows) <= 1 and len(entries) <= 1:
+        if not entries:
+            return Change(grid.fund, member_id, month, ChangeKind.DELETE,
+                          row_id=cell.row_id, before=before), None
+        entry = entries[0]
+        signed = entry.amount if entry.op is ops.default else -entry.amount
+        kind = ChangeKind.INSERT if cell.state == CellState.EMPTY else ChangeKind.UPDATE
+        return Change(grid.fund, member_id, month, kind, amount=signed,
+                      row_id=cell.row_id, before=before), None
+
+    net = round(sum(e.amount if e.op is ops.default else -e.amount
+                    for e in entries), 2)
+    return Change(grid.fund, member_id, month, ChangeKind.SET, amount=net,
+                  before=before, entries=tuple(entries)), None
+
+
+def change_entries(change):
+    """What a staged change will leave in its month, as entries."""
+    if change.kind == ChangeKind.SET:
+        return list(change.entries)
+    if change.kind == ChangeKind.DELETE:
+        return []
+    ops = operations(change.fund)
+    op = ops.default if change.amount >= 0 else ops.negative
+    return [Entry(op, change.magnitude)]
 
 
 # --------------------------------------------------------------------------- #
@@ -423,7 +544,10 @@ def default_day(db, fund, member_id, month):
     catch-up in the application uses.
     """
     day = 1
-    last = db.funds.last_dated_row(fund, member_id)
+    # The last *credit* sets the day: deposits land on their own day, and a
+    # withdrawal on the 20th must not drag next month's deposit to the 20th.
+    last = (db.funds.last_dated_row(fund, member_id, kinds=(spec(fund).credit,))
+            or db.funds.last_dated_row(fund, member_id))
     if last and last.get("date"):
         try:
             day = datetime.strptime(str(last["date"])[:10], _DATE).day
@@ -509,6 +633,20 @@ def _refusal_for(db, fund, change, date_str, policy):
     fund_spec = spec(fund)
     if change.kind == ChangeKind.DELETE:
         return None                     # removing a row creates no obligation
+    if change.kind == ChangeKind.SET:
+        # Every row the month will gain or change answers to the same rules a
+        # single-figure edit does. One refusal holds back the whole cell:
+        # half a month is not what anybody typed.
+        for step in _plan_set(db, fund, change):
+            if step.action == "delete":
+                continue
+            signed = step.amount if step.transaction_type != WITHDRAWAL else -step.amount
+            reason = _refusal_for(db, fund, Change(fund, change.member_id, change.month,
+                                                   ChangeKind.INSERT, amount=signed),
+                                  date_str, policy)
+            if reason:
+                return reason
+        return None
 
     if change.amount < 0:
         if fund_spec.locks_withdrawals:
@@ -554,55 +692,213 @@ def apply_changes(db, fund, changes, policy=default_policy):
     if not changes:
         return result
 
+    fund_spec = spec(fund)
+    by_member = defaultdict(list)
+    for change in changes:
+        by_member[change.member_id].append(change)
+
     with db.transaction():
-        for change in changes:
-            date_str = default_day(db, fund, change.member_id, change.month)
-
-            # Someone editing the same member on another screen while this grid
-            # sat open. Refusing is the only honest answer: the staged number
-            # was typed against figures that have since moved.
-            if change.before != _current_fingerprint(db, fund, change.member_id,
-                                                     change.month):
-                result.refused.append(Refused(
-                    change, "This month changed elsewhere since the grid was "
-                            "loaded. Reload to see the current figures."))
-                continue
-
-            reason = _refusal_for(db, fund, change, date_str, policy)
-            if reason:
-                result.refused.append(Refused(change, reason))
-                continue
-
-            try:
-                applied = _write(db, fund, change, date_str)
-            except Exception as e:              # noqa: BLE001 - report per cell
-                logger.exception("Fund grid change failed for member %s %s",
-                                 change.member_id, change.month)
-                result.refused.append(Refused(change, str(e)))
-                continue
-
-            result.applied.append(applied)
-            result.members_touched.add(change.member_id)
+        for member_id, member_changes in by_member.items():
+            # One savepoint per member: the overdraw guard judges a member's
+            # changes together and takes them back together (docs §3.3), and
+            # nobody else's are affected.
+            guarded = fund_spec.own_money
+            if guarded:
+                before = db.funds.history(fund, member_id)
+                db.conn.execute("SAVEPOINT grid_member")
+            written = []
+            for change in member_changes:
+                applied = _apply_one(db, fund, change, policy, result)
+                if applied is not None:
+                    written.append(applied)
+            if guarded:
+                reason = (overdraw_reason(before, db.funds.history(fund, member_id))
+                          if written else None)
+                if reason:
+                    db.conn.execute("ROLLBACK TO grid_member")
+                    result.refused.extend(Refused(a.change, reason) for a in written)
+                    written = []
+                db.conn.execute("RELEASE grid_member")
+            result.applied.extend(written)
+            if written:
+                result.members_touched.add(member_id)
 
         for member_id in result.members_touched:
             db.funds.recalculate(fund, member_id)
-        if spec(fund).scheduled and result.members_touched:
+        if fund_spec.scheduled and result.members_touched:
             for member_id in result.members_touched:
                 resync_benevolent_schedule(db, member_id)
 
     return result
 
 
+def _apply_one(db, fund, change, policy, result):
+    """Check and write one change. Returns its :class:`Applied`, or None when
+    it was refused (and recorded as such on ``result``)."""
+    date_str = default_day(db, fund, change.member_id, change.month)
+
+    # Someone editing the same member on another screen while this grid
+    # sat open. Refusing is the only honest answer: the staged number
+    # was typed against figures that have since moved.
+    if change.before != _current_fingerprint(db, fund, change.member_id,
+                                             change.month):
+        result.refused.append(Refused(
+            change, "This month changed elsewhere since the grid was "
+                    "loaded. Reload to see the current figures."))
+        return None
+
+    reason = _refusal_for(db, fund, change, date_str, policy)
+    if reason:
+        result.refused.append(Refused(change, reason))
+        return None
+
+    # A month can be several row writes; one failing must not leave the others.
+    db.conn.execute("SAVEPOINT grid_change")
+    try:
+        applied = _write(db, fund, change, date_str)
+    except Exception as e:              # noqa: BLE001 - report per cell
+        logger.exception("Fund grid change failed for member %s %s",
+                         change.member_id, change.month)
+        db.conn.execute("ROLLBACK TO grid_change")
+        db.conn.execute("RELEASE grid_change")
+        result.refused.append(Refused(change, str(e)))
+        return None
+    db.conn.execute("RELEASE grid_change")
+    return applied
+
+
+# --------------------------------------------------------------------------- #
+# The overdraw guard — docs/grid/deleting-months.md §3.3
+# --------------------------------------------------------------------------- #
+
+def _low_point(history):
+    """The lowest running balance in a ``(id, date, type, amount)`` history,
+    and the ``(date, amount)`` of the withdrawal it falls at."""
+    running, low, at = 0.0, 0.0, None
+    for _row_id, date, ttype, amount in history:
+        amount = float(amount or 0)
+        running = round(running - amount if ttype == WITHDRAWAL else running + amount, 2)
+        if running < low - 0.005:
+            low, at = running, (str(date)[:10], amount)
+    return low, at
+
+
+def overdraw_reason(before, after):
+    """Why ``after`` may not replace ``before``, or None.
+
+    A withdrawal may not be left bigger than the balance it was taken from —
+    the Withdraw dialog's rule, applied to the record after the fact. A member
+    already overdrawn before the change is not refused for it; only a change
+    that makes it worse is.
+    """
+    was, _ = _low_point(before)
+    now, at = _low_point(after)
+    if now >= min(was, 0.0) - 0.005:
+        return None
+    date, amount = at
+    return (f"This would leave the withdrawal of {amount:,.0f} on {date} taken from "
+            f"{amount + now:,.0f} — overdrawn by {-now:,.0f}. Include that withdrawal's "
+            f"month, or correct it in the member's ledger.")
+
+
+def _grid_note(fund, transaction_type):
+    """The note a row the grid writes carries, so the ledger shows its origin."""
+    if fund == BENEVOLENT and transaction_type == WITHDRAWAL:
+        return "Benevolent Payout (grid entry)"     # what the Payout button writes
+    return f"{spec(fund).label} (grid entry)"
+
+
+@dataclass
+class _Step:
+    """One row edit a :data:`ChangeKind.SET` resolves into."""
+
+    action: str                     # insert | update | delete
+    transaction_type: str = None
+    amount: float = 0.0
+    row: dict = None                # the existing row, for update/delete
+
+
+def _plan_set(db, fund, change):
+    """The row edits that make a month hold exactly ``change.entries``.
+
+    Rows are matched to entries of the same type. An entry whose amount an
+    existing row already has keeps that row untouched; the rest are paired in
+    date order and their amounts corrected; anything left over is inserted or
+    deleted. Matching like-for-like first is what keeps ``2,000, @W=500``
+    typed over a 2,000 deposit from rewriting the deposit it left alone.
+    """
+    start = change.month + "-01"
+    end = (datetime.strptime(start, _DATE) + relativedelta(months=1)
+           - relativedelta(days=1)).strftime(_DATE)
+    rows = sorted(({"id": r[0], "amount": r[1], "date": r[2], "transaction_type": r[3]}
+                   for r in db.funds.month_rows(fund, change.member_id, start, end)),
+                  key=lambda r: (str(r["date"])[:10], r["id"]))
+
+    steps = []
+    wanted_by_type = defaultdict(list)
+    for entry in change.entries:
+        wanted_by_type[_type_for(fund, entry.op)].append(round(entry.amount, 2))
+    types = list(dict.fromkeys([*wanted_by_type, *(r["transaction_type"] for r in rows)]))
+    for ttype in types:
+        wanted = list(wanted_by_type.get(ttype, []))
+        free = [r for r in rows if r["transaction_type"] == ttype]
+        for amount in list(wanted):
+            same = next((r for r in free if round(float(r["amount"] or 0), 2) == amount), None)
+            if same is not None:
+                free.remove(same)
+                wanted.remove(amount)
+        for row, amount in zip(list(free), list(wanted)):
+            steps.append(_Step("update", ttype, amount, row))
+        for amount in wanted[len(free):]:
+            steps.append(_Step("insert", ttype, amount))
+        for row in free[len(wanted):]:
+            steps.append(_Step("delete", ttype, round(float(row["amount"] or 0), 2), row))
+    return steps
+
+
+def _write_set(db, fund, change, date_str):
+    """Apply a SET: the month's rows become its entries. Records how to undo it."""
+    undo = []
+    for step in _plan_set(db, fund, change):
+        if step.action == "insert":
+            row_id = db.funds.add(fund, change.member_id, date_str, step.transaction_type,
+                                  step.amount, 0.0, _grid_note(fund, step.transaction_type))
+            undo.append(("insert", row_id, None))
+            continue
+        before = db.funds.snapshot(fund, step.row["id"])
+        if before is None:
+            raise ValueError("An entry in this month no longer exists.")
+        undo.append((step.action, step.row["id"], dict(before)))
+        if step.action == "delete":
+            db.funds.delete(fund, step.row["id"])
+        else:
+            db.funds.update(fund, step.row["id"], str(before["date"])[:10],
+                            step.amount, before.get("notes") or "")
+    return Applied(change, row_id=None, restore={"steps": undo})
+
+
+def _revert_set(db, fund, change, applied):
+    for action, row_id, before in reversed((applied.restore or {}).get("steps", [])):
+        if action == "insert":
+            db.funds.delete(fund, row_id)
+        elif action == "delete":
+            db.funds.reinstate(fund, before)
+        else:
+            db.funds.update(fund, row_id, str(before.get("date"))[:10],
+                            before.get("amount"), before.get("notes") or "")
+
+
 def _write(db, fund, change, date_str):
     """Perform one change inside the batch's transaction."""
-    fund_spec = spec(fund)
+    if change.kind == ChangeKind.SET:
+        return _write_set(db, fund, change, date_str)
     if change.kind == ChangeKind.INSERT:
         row_id = db.funds.add(fund, change.member_id, date_str,
                               change.transaction_type, change.magnitude, 0.0,
-                              change.notes or f"{fund_spec.label} (grid entry)")
+                              change.notes or _grid_note(fund, change.transaction_type))
         return Applied(change, row_id=row_id)
 
-    before = db.funds.get(fund, change.row_id)
+    before = db.funds.snapshot(fund, change.row_id)
     if before is None:
         raise ValueError("That entry no longer exists.")
     restore = dict(before)
@@ -633,14 +929,14 @@ def revert(db, fund, result):
         for applied in reversed(result.applied):
             change = applied.change
             touched.add(change.member_id)
-            if change.kind == ChangeKind.INSERT:
+            if change.kind == ChangeKind.SET:
+                _revert_set(db, fund, change, applied)
+            elif change.kind == ChangeKind.INSERT:
                 if applied.row_id is not None:
                     db.funds.delete(fund, applied.row_id)
             elif change.kind == ChangeKind.DELETE:
-                row = applied.restore or {}
-                db.funds.add(fund, change.member_id, str(row.get("date"))[:10],
-                             row.get("transaction_type"), row.get("amount"), 0.0,
-                             row.get("notes") or "")
+                # Original id: within a date, rows are ordered by it.
+                db.funds.reinstate(fund, applied.restore or {})
             else:
                 row = applied.restore or {}
                 db.funds.update(fund, change.row_id, str(row.get("date"))[:10],
@@ -754,8 +1050,9 @@ def plan_fill(db, grid, member_rows, months, policy=default_policy, today=None):
     * **a genuine gap** — the account existed, the month has passed, and nothing
       was recorded. This is the only case a fill is for.
 
-    Occupied cells are never touched: filling is for gaps, and replacing a
-    recorded figure with an assumed one is not on offer.
+    A recorded credit is never touched: filling is for gaps, and replacing a
+    recorded figure with an assumed one is not on offer. A month holding only a
+    withdrawal *is* a gap — the deposit is added beside it.
 
     A member with no account start at all is skipped rather than guessed at —
     the same answer ``catch_up_savings`` gives when there is no history to
@@ -763,6 +1060,7 @@ def plan_fill(db, grid, member_rows, months, policy=default_policy, today=None):
     """
     today = today or datetime.now().strftime(_DATE)
     this_month = month_key(today)
+    ops = operations(grid.fund)
 
     plan = FillPlan()
     for member_row in member_rows:
@@ -791,7 +1089,11 @@ def plan_fill(db, grid, member_rows, months, policy=default_policy, today=None):
 
         fillable = []
         for month in months:
-            if member_row.cell(month).state != CellState.EMPTY:
+            # Missed means no credit — a month holding only a withdrawal still
+            # owed its deposit. A month with a row no operation describes is
+            # left alone, as it is for typing.
+            current = cell_entries(grid.fund, member_row.cell(month))
+            if current is None or any(e.op is ops.default for e in current):
                 continue
             if month < member_row.account_start:
                 plan.before_start += 1
@@ -805,9 +1107,131 @@ def plan_fill(db, grid, member_rows, months, policy=default_policy, today=None):
                 member_row, f"No missed months in range for {member_row.name}."))
             continue
         for month in fillable:
-            plan.changes.append(Change(grid.fund, member_row.member_id, month,
-                                       ChangeKind.INSERT, amount=amount,
-                                       before=member_row.cell(month).fingerprint()))
+            cell = member_row.cell(month)
+            if not cell.rows:
+                plan.changes.append(Change(grid.fund, member_row.member_id, month,
+                                           ChangeKind.INSERT, amount=amount,
+                                           before=cell.fingerprint()))
+                continue
+            # The deposit joins what the month already holds, so the change is
+            # the whole month — which is also what the cell will show.
+            entries = [Entry(ops.default, amount), *cell_entries(grid.fund, cell)]
+            plan.changes.append(Change(
+                grid.fund, member_row.member_id, month, ChangeKind.SET,
+                amount=round(amount + cell.net, 2), before=cell.fingerprint(),
+                entries=tuple(entries)))
+    return plan
+
+
+# --------------------------------------------------------------------------- #
+# Deleting months — docs/grid/deleting-months.md
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class DeletePlan:
+    """What deleting some months would do, before anything is staged.
+
+    The preview a column delete shows, and the changes it stages if the
+    operator goes ahead. Shared by both grids; each fills it in its own terms.
+    """
+
+    months: list
+    changes: list = field(default_factory=list)
+    refused: list = field(default_factory=list)        # [(row, reason)]
+    tallies: dict = field(default_factory=dict)        # label -> (count, amount)
+    untouched: list = field(default_factory=list)      # sentences
+    consequences: list = field(default_factory=list)   # sentences
+
+    def tally(self, label, amount):
+        count, total = self.tallies.get(label, (0, 0.0))
+        self.tallies[label] = (count + 1, round(total + float(amount or 0), 2))
+
+    @property
+    def rows_affected(self):
+        return len({c.key for c in self.changes})
+
+    @property
+    def empty(self):
+        return not self.changes and not self.refused
+
+
+def _rows_in_months(db, fund, months):
+    """Every row the journal holds in these months, by member."""
+    out = defaultdict(list)
+    for month in months:
+        start, end = month_bounds([month])
+        for row in db.funds.movements_in_range(fund, start, end):
+            out[row["individual_id"]].append(row)
+    return out
+
+
+def plan_delete_months(db, grid, rows, months):
+    """Plan deleting ``months`` for the given (on-screen) rows.
+
+    docs §3: every row an operation describes is deleted; a month holding one
+    that no operation describes is left whole; a member whose deletions would
+    leave a withdrawal overdrawn (Savings, Christmas) is refused as a whole.
+    """
+    fund_spec = spec(grid.fund)
+    months = sorted(months)
+    plan = DeletePlan(months=months)
+    shown = {row.member_id for row in rows if not row.excluded}
+
+    for row in rows:
+        if row.excluded:
+            continue
+        member_changes, removed = [], set()
+        for month in months:
+            cell = row.cell(month)
+            if not cell.rows:
+                continue
+            change, problem = stage(grid, row, month, "")
+            if problem:
+                plan.refused.append((row, f"{month_label(month)}: {problem}"))
+                continue
+            if change is not None:
+                member_changes.append((change, cell))
+                removed.update(r["id"] for r in cell.rows)
+        if not member_changes:
+            continue
+        if fund_spec.own_money:
+            history = db.funds.history(grid.fund, row.member_id)
+            reason = overdraw_reason(history, [h for h in history if h[0] not in removed])
+            if reason:
+                plan.refused.append((row, reason))
+                continue
+        for change, cell in member_changes:
+            plan.changes.append(change)
+            for r in cell.rows:
+                label = ("withdrawals" if r["transaction_type"] == WITHDRAWAL
+                         else f"{fund_spec.noun}s")
+                if grid.fund == BENEVOLENT and r["transaction_type"] == WITHDRAWAL:
+                    label = "payouts"
+                plan.tally(label, r["amount"])
+
+    # What is left in these months, said out loud (docs §2).
+    in_months = _rows_in_months(db, grid.fund, months)
+    not_shown = sum(len(v) for member, v in in_months.items() if member not in shown)
+    if not_shown:
+        plan.untouched.append(
+            f"{not_shown} transaction(s) belonging to members not on screen "
+            f"(filtered out, past members, or excluded) are not touched.")
+    if plan.refused:
+        plan.untouched.append(f"{len(plan.refused)} member-month(s) are refused — "
+                              f"listed below — and keep their transactions.")
+
+    if plan.changes:
+        plan.consequences.append(
+            "Running balances after these months are recalculated for every member "
+            "affected.")
+        if any(label.startswith(fund_spec.noun) for label in plan.tallies):
+            plan.consequences.append(
+                f"These become missed months: Fill Forward will offer each member's "
+                f"{fund_spec.noun} for them again.")
+        if fund_spec.scheduled:
+            plan.consequences.append(
+                "Each member's contribution schedule is re-derived from their last "
+                "remaining contribution — deleting the latest months moves it back.")
     return plan
 
 
@@ -842,14 +1266,50 @@ class FundBackend:
     def cell_refusal(self, grid, row, month):
         """Why this cell cannot be typed into, or None."""
         cell = row.cell(month)
-        if cell.editable:
+        if cell_entries(self.fund, cell) is not None:
             return None
         return (f"{len(cell.rows)} transactions this month, netting "
-                f"{cell.net:,.0f}. One number cannot stand for them — "
+                f"{cell.net:,.0f}, including one no grid operation describes — "
                 f"double-click to open {row.name}'s ledger.")
+
+    @property
+    def ops(self):
+        return operations(self.fund)
 
     def stage(self, grid, row, month, text):
         return stage(grid, row, month, text)
+
+    def edit_text(self, row, month):
+        """What the editor opens with: the month's entries, exactly."""
+        return self.ops.format(cell_entries(self.fund, row.cell(month)) or [])
+
+    def display_text(self, row, month):
+        """The cell's text when it says more than one figure can, else None."""
+        entries = cell_entries(self.fund, row.cell(month)) or []
+        return self.ops.format(entries) if len(entries) > 1 else None
+
+    def staged_text(self, change):
+        entries = change_entries(change)
+        if len(entries) > 1:
+            return self.ops.format(entries)
+        return None
+
+    def staged_edit_text(self, change):
+        return self.ops.format(change_entries(change))
+
+    def plan_delete_months(self, db, grid, rows, months):
+        return plan_delete_months(db, grid, rows, months)
+
+    def cell_note(self, row, month):
+        """A remark on an ordinary cell, or None. Funds have none."""
+        return None
+
+    def describe(self, change, staged=None):
+        """A staged change in words, for its tooltip."""
+        entries = change_entries(change)
+        if not entries:
+            return "Clears this month."
+        return "Leaves: " + "; ".join(f"{e.op.name} {e.amount:,.0f}" for e in entries)
 
     def apply(self, db, engine, changes):
         return apply_changes(db, self.fund, changes)

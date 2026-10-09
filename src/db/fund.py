@@ -200,6 +200,38 @@ class FundRepository(Repository):
         self._execute(f"UPDATE {t} SET transaction_type=? WHERE id=?",
                       (transaction_type, row_id))
 
+    def snapshot(self, table, row_id):
+        """Every column of one row, for putting it back exactly. None if gone."""
+        t = self._table(table)
+        return self._dict(f"SELECT * FROM {t} WHERE id=?", (row_id,))
+
+    def reinstate(self, table, snapshot):
+        """Re-insert a row from :meth:`snapshot`, original id included.
+
+        Rows sharing a date are ordered by id — on a statement and in the
+        running balance — so putting a deleted row back under a new id can
+        move it past its neighbours: a deposit and a withdrawal on the same day
+        trade places, and the balance between them changes.
+        """
+        t = self._table(table)
+        known = {row[1] for row in self.conn.execute(f"PRAGMA table_info({t})")}
+        columns = [c for c in snapshot if c in known]
+        self._execute(
+            f"INSERT INTO {t} ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+            tuple(snapshot[c] for c in columns))
+        if "created_at" in snapshot and snapshot["created_at"] is None:
+            # The insert trigger stamps a missing creation time with "now"; a
+            # restored row was not created now, and its time was never known.
+            self._execute(f"UPDATE {t} SET created_at=NULL WHERE id=?", (snapshot["id"],))
+
+    def history(self, table, member_id):
+        """A member's rows as ``(id, date, transaction_type, amount)``, in
+        statement order — what a running balance is computed over."""
+        t = self._table(table)
+        return self._rows(
+            f"SELECT id, date, transaction_type, amount FROM {t} "
+            f"WHERE individual_id=? ORDER BY date ASC, id ASC", (member_id,))
+
     def month_rows(self, table, member_id, start_date, end_date):
         """One member's rows within a window, identity and amount only.
 

@@ -58,8 +58,13 @@ class LedgerPosition:
     interest_balance: float = 0.0
 
 
-def position_from_frame(df):
+def position_from_frame(df, loan_ref=None):
     """The position carried on the last row of a ledger DataFrame.
+
+    Pass ``loan_ref`` whenever the position is for one loan. Running balances
+    are stored *per loan*, so the member's last row belongs to whichever loan
+    moved last — reading it for a different loan adds that loan's balance in.
+    That is how a new loan once opened at 493,597 instead of 200,000.
 
     Six call sites across the loan lifecycle repeated this, each with its own
     empty-frame and missing-column handling::
@@ -74,6 +79,8 @@ def position_from_frame(df):
     Note this reads a *stored* running total. It is only as current as the last
     recalculation — see docs/db/phase-3-balance-consolidation.md §3b.
     """
+    if df is not None and loan_ref is not None and "loan_id" in df:
+        df = df[df["loan_id"] == loan_ref]
     if df is None or df.empty:
         return LedgerPosition()
     def last(column):
@@ -228,6 +235,27 @@ class LedgerRepository(Repository):
         self._execute(
             "INSERT INTO ledger (" + ", ".join(self.IMPORT_COLUMNS) + ") "
             "VALUES (" + ", ".join("?" * len(self.IMPORT_COLUMNS)) + ")", values)
+
+    def snapshot(self, row_id):
+        """Every column of one row, for putting it back exactly. None if gone."""
+        return self._dict("SELECT * FROM ledger WHERE id=?", (row_id,))
+
+    def reinstate(self, snapshot):
+        """Re-insert a row from :meth:`snapshot` — every column, original id.
+
+        Unlike :meth:`restore`, nothing is lost: ``previous_state`` (what the
+        ledger's own Delete Last restores a loan from), ``batch_id`` and
+        ``import_id`` come back too, and the id puts the row back in its place
+        among rows sharing its date.
+        """
+        columns = [c for c in snapshot if c in self._columns()]
+        self._execute(
+            f"INSERT INTO ledger ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' * len(columns))})",
+            tuple(snapshot[c] for c in columns))
+
+    def _columns(self):
+        return {row[1] for row in self.conn.execute("PRAGMA table_info(ledger)")}
 
     def restore(self, values):
         """Re-insert a deleted row with its original id (undo)."""

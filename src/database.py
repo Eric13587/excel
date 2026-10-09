@@ -2,6 +2,7 @@
 import glob
 import logging
 import os
+import re
 import sqlite3
 import pandas as pd
 import json
@@ -20,6 +21,8 @@ from src.data_structures import StatementData
 
 # How many timestamped on-open backups to keep per journal.
 BACKUP_KEEP_COUNT = 10
+# What an on-open backup's name looks like after "<stem>.": a timestamp only.
+_ON_OPEN_BACKUP = re.compile(r"\d{8}-\d{6}\.db")
 
 # How long a writer waits for a competing writer before giving up. Mass
 # operations (catch-up over thousands of loans) and the report thread's second
@@ -321,7 +324,14 @@ class DatabaseManager:
             dest_path = os.path.join(backup_dir, f"{stem}.{stamp}.db")
             if not os.path.exists(dest_path):
                 self.backup_to(dest_path)
-            old_backups = sorted(glob.glob(os.path.join(backup_dir, f"{stem}.*.db")))
+            # Only the dated on-open copies rotate. A bare "{stem}.*.db" also
+            # matched the named safety backups (pre-delete-loan-…, pre-repair-…),
+            # and since digits sort before letters, the copy just written was
+            # always the first to go — every on-open backup was deleted the
+            # moment it was made once ten named ones had built up.
+            old_backups = sorted(
+                path for path in glob.glob(os.path.join(backup_dir, f"{stem}.*.db"))
+                if _ON_OPEN_BACKUP.fullmatch(os.path.basename(path)[len(stem) + 1:]))
             for stale in old_backups[:-keep]:
                 os.remove(stale)
         except Exception:

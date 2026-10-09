@@ -69,10 +69,6 @@ class LoanService:
         interest_total = principal * interest_rate
         unearned_interest = interest_total
         
-        df = self.get_ledger_df(individual_id)
-        pos = position_from_frame(df)
-        current_balance, prev_principal = pos.balance, pos.principal_balance
-        
         # Determine next loan ID
         all_loans = self.db.get_loans(individual_id)
         max_id_num = 0
@@ -103,8 +99,11 @@ class LoanService:
             duration_months=duration, interest_rate=interest_rate
         )
         
-        new_balance = current_balance + principal
-        new_p_bal = prev_principal + principal
+        # Running balances are per loan, and a new loan has no history: it opens
+        # at its own principal. Starting from the member's last row instead
+        # added whichever other loan moved last into this one.
+        new_balance = principal
+        new_p_bal = principal
         
         self.db.add_transaction(
             individual_id, date_str, "Loan Issued", loan_id,
@@ -287,7 +286,12 @@ class LoanService:
             limit_date_str_for_check = target_date.strftime("%Y-%m-%d") if target_date and not isinstance(target_date, str) else (target_date or datetime.now().strftime("%Y-%m-%d"))
             guard_windows = self._suspension_windows(individual_id, loan['id'])
 
-            if suspend_until and loan['next_due_date'] > suspend_until:
+            # The resume date is the first due date *not* suspended — the same
+            # half-open [start, until) window _date_in_suspension, statements and
+            # the Suspend dialog ("resume automatically from …") all use. With
+            # ">" here and "<=" below, a 2-month suspension skipped 3 months
+            # whenever it was still running at catch-up time.
+            if suspend_until and loan['next_due_date'] >= suspend_until:
                 # Suspension period has passed — auto-resume.
                 # Record the resume at the intended boundary, not "now".
                 self.db.resume_loan(loan['id'], resumed_date=suspend_until)
@@ -309,7 +313,7 @@ class LoanService:
                 resume_date = datetime.strptime(suspend_until, "%Y-%m-%d") if suspend_until else datetime.strptime(limit_date_str_for_check, "%Y-%m-%d")
                 
                 months_skipped = 0
-                while due_date <= resume_date and due_date.strftime("%Y-%m-%d") <= limit_date_str_for_check:
+                while due_date < resume_date and due_date.strftime("%Y-%m-%d") <= limit_date_str_for_check:
                     due_date = due_date + relativedelta(months=1)
                     months_skipped += 1
                 
@@ -319,7 +323,7 @@ class LoanService:
                     self.db.conn.commit()
                 
                 # If suspension period has now passed, auto-resume and re-fetch
-                if suspend_until and due_date.strftime("%Y-%m-%d") > suspend_until:
+                if suspend_until and due_date.strftime("%Y-%m-%d") >= suspend_until:
                     self.db.resume_loan(loan['id'], resumed_date=suspend_until)
                     # Re-fetch loan with updated next_due_date and proceed
                     loan = self.db.get_loan_by_ref(individual_id, loan_ref)
@@ -342,7 +346,7 @@ class LoanService:
         
         # We need current balances to start simulation
         df = self.get_ledger_df(individual_id)
-        pos = position_from_frame(df)
+        pos = position_from_frame(df, loan_ref)
         current_balance, current_p_bal, current_i_bal = (
             pos.balance, pos.principal_balance, pos.interest_balance)
         
@@ -641,7 +645,7 @@ class LoanService:
         new_interest_bal = current_interest_bal + accrual_amount
         
         df = self.get_ledger_df(individual_id)
-        pos = position_from_frame(df)
+        pos = position_from_frame(df, loan['ref'])
         last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         if accrual_amount > 0:
@@ -753,7 +757,7 @@ class LoanService:
         new_monthly_interest = math.ceil(new_unearned / new_duration)
         
         df = self.get_ledger_df(individual_id)
-        pos = position_from_frame(df)
+        pos = position_from_frame(df, loan_ref)
         last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         new_tx_bal = last_bal + top_up_amount
@@ -885,8 +889,9 @@ class LoanService:
         # But get_loan_by_ref pulls from DB 'loans' table which should be synced.
         # Let's trust loan dict for 'principal_balance' concept if it maps to 'balance'.
         
-        # Ledger way:
-        pos = position_from_frame(df)
+        # Ledger way — this loan's rows only; the member's last row may be
+        # another loan's, and the buy-off would then settle the wrong amount.
+        pos = position_from_frame(df, loan_ref)
         current_tx_bal, current_p_bal, current_i_bal = (
             pos.balance, pos.principal_balance, pos.interest_balance)
         

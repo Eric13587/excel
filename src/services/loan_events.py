@@ -48,7 +48,8 @@ def reconstruct(ledger_rows, suspensions=()):
 
     ``ledger_rows`` are dicts or tuples of
     ``(id, date, event_type, added, deducted, principal_portion, interest_portion)``
-    in date order. ``suspensions`` are ``(start_date, suspend_until)`` pairs.
+    in date order. ``suspensions`` are ``(start_date, end_date)`` pairs, the end
+    being the resume date for a span that was resumed.
     """
     rows = [_as_tuple(r) for r in ledger_rows]
     events = []
@@ -121,8 +122,12 @@ def reconstruct_for_loan(db, individual_id, loan_ref):
         "       interest_portion FROM ledger "
         "WHERE individual_id=? AND loan_id=? ORDER BY date, id",
         (individual_id, loan_ref)).fetchall()
+    # A span ends when it was resumed, if it was; otherwise when it was planned
+    # to. Reading only suspend_until made a suspension resumed the day it began
+    # look like three skipped months, and the loan stopped projecting. Same rule
+    # as LoanService._suspension_windows, which decides where deductions land.
     suspensions = db.conn.execute(
-        "SELECT start_date, suspend_until FROM loan_suspensions "
+        "SELECT start_date, COALESCE(resumed_date, suspend_until) FROM loan_suspensions "
         "WHERE individual_id=? AND loan_ref=? ORDER BY start_date",
         (individual_id, loan_ref)).fetchall()
     return reconstruct(rows, suspensions)

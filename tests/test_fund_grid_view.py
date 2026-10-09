@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 pytest.importorskip("PyQt6")
 
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox
 
 from src.database import DatabaseManager
@@ -115,18 +116,35 @@ def test_figures_land_in_their_month(qt_app, db):
     assert _text(page, "Ann", "2026-02") == "2,000"
 
 
-def test_a_month_with_several_transactions_is_marked_and_locked(qt_app, db):
+def test_a_month_with_several_transactions_shows_its_entries(qt_app, db):
+    from PyQt6.QtCore import Qt
+
+    from src.views.fund_grid import EDIT_ROLE
+
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2026-01-05", "Deposit", 2000)
+    db.add_savings_transaction(ind, "2026-01-25", "Withdrawal", 500)
+    page = _page(qt_app, db)
+
+    item = page.table.item(_row_of(page, "Ann"), _column_of(page, "2026-01"))
+    assert item.text() == "@D=2,000, @W=500"
+    assert item.data(EDIT_ROLE) == "@D=2,000, @W=500"
+    assert item.flags() & Qt.ItemFlag.ItemIsEditable
+    assert "Withdrawal of 500 on 2026-01-25" in item.toolTip()
+
+
+def test_a_month_with_a_row_no_operation_describes_is_marked_and_locked(qt_app, db):
     from PyQt6.QtCore import Qt
 
     ind = _member(db, "Ann")
     db.add_savings_transaction(ind, "2026-01-05", "Deposit", 2000)
-    db.add_savings_transaction(ind, "2026-01-25", "Deposit", 500)
+    db.add_savings_transaction(ind, "2026-01-25", "Interest", 500)
     page = _page(qt_app, db)
 
     item = page.table.item(_row_of(page, "Ann"), _column_of(page, "2026-01"))
     assert item.text() == "2,500 ·"
     assert not (item.flags() & Qt.ItemFlag.ItemIsEditable)
-    assert "cannot stand for them" in item.toolTip()
+    assert "no grid operation describes" in item.toolTip()
 
 
 def test_past_members_are_left_out_by_default(qt_app, db):
@@ -793,3 +811,171 @@ def test_undo_last_save_works_on_the_loans_tab(qt_app, db, monkeypatch):
 
     page._undo_last_save()
     assert db.get_loan_by_ref(ind, "L-001")["balance"] == before
+
+
+# --------------------------------------------------------------------------- #
+# Operations and help
+# --------------------------------------------------------------------------- #
+
+def test_typing_an_operation_stages_the_whole_month(qt_app, db):
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2026-01-05", "Deposit", 2000)
+    page = _page(qt_app, db)
+
+    _type(page, "Ann", "2026-01", "+@w=500")
+    item = page.table.item(_row_of(page, "Ann"), _column_of(page, "2026-01"))
+    assert item.text() == "@D=2,000, @W=500"
+    assert "Withdrawal 500" in item.toolTip()
+    # The Period column nets the month the way it will be once saved.
+    period = page.table.item(_row_of(page, "Ann"), page._period_column())
+    assert period.text() == "1,500"
+
+    page._save()
+    assert [(r[0], r[1]) for r in db.conn.execute(
+        "SELECT transaction_type, amount FROM savings ORDER BY id")] == [
+        ("Deposit", 2000), ("Withdrawal", 500)]
+
+
+def test_a_mistyped_operation_is_explained_not_staged(qt_app, db):
+    _member(db, "Ann")
+    page = _page(qt_app, db)
+    _type(page, "Ann", "2026-01", "@x=5")
+    assert not page.staged
+    assert "not an operation" in page.status.text()
+
+
+def test_the_help_lists_each_tabs_own_operations(qt_app, db):
+    from src.views.fund_grid import GridHelpDialog
+
+    _member(db, "Ann")
+    window = FundGridWindow(None, db, ThemeManager(db))
+    assert window.help_btn.text() == "?"
+    wanted = {SAVINGS: ["@W=amount", "+@W=500"],
+              "christmas_savings": ["unlock month"],
+              BENEVOLENT: ["@P=amount", "payout"],
+              "loans": ["@T=amount/months", "@B", "@S=months", "due next"]}
+    for fund, words in wanted.items():
+        html = GridHelpDialog.html(window.theme, window.pages[fund].backend)
+        for word in words:
+            assert word in html, (fund, word)
+
+
+def test_the_loans_tab_reaches_next_month(qt_app, db):
+    """An up-to-date loan is due next month — its only typeable cell."""
+    from PyQt6.QtCore import QDate
+
+    window = FundGridWindow(None, db, ThemeManager(db))
+    next_month = QDate.currentDate().addMonths(1).toString("yyyy-MM")
+    assert window.pages["loans"].to_month.currentData() == next_month
+    assert window.pages[SAVINGS].to_month.currentData() == QDate.currentDate().toString("yyyy-MM")
+
+
+# --------------------------------------------------------------------------- #
+# Deleting months — docs/grid/deleting-months.md
+# --------------------------------------------------------------------------- #
+
+def _select_column(page, month):
+    page.table.clearSelection()
+    page.table.selectColumn(_column_of(page, month))
+
+
+def test_a_header_selected_month_and_delete_opens_the_preview(qt_app, db, monkeypatch):
+    for name in ("Ann", "Ben"):
+        ind = _member(db, name)
+        db.add_savings_transaction(ind, "2026-02-01", "Deposit", 1000)
+    page = _page(qt_app, db)
+    shown = {}
+    monkeypatch.setattr(page, "_confirm_delete",
+                        lambda plan, label: shown.setdefault("plan", plan) is plan)
+
+    _select_column(page, "2026-02")
+    page._clear_selection()
+
+    assert shown["plan"].tallies == {"deposits": (2, 2000)}
+    assert {k[1] for k in page.staged} == {"2026-02"} and len(page.staged) == 2
+    assert _total(page, "2026-02") == "—"
+
+
+def test_cancelling_the_preview_stages_nothing(qt_app, db, monkeypatch):
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2026-02-01", "Deposit", 1000)
+    page = _page(qt_app, db)
+    monkeypatch.setattr(page, "_confirm_delete", lambda plan, label: False)
+    _select_column(page, "2026-02")
+    page._clear_selection()
+    assert page.staged == {}
+
+
+def test_a_month_delete_touches_only_the_rows_shown(qt_app, db):
+    for name in ("Ann", "Ben"):
+        ind = _member(db, name)
+        db.add_savings_transaction(ind, "2026-02-01", "Deposit", 1000)
+    page = _page(qt_app, db)
+    page.search.setText("Ann")
+    assert page._delete_months(["2026-02"], confirm=False)
+    assert [k for k in page.staged] == [(page.rows[_row_of(page, "Ann")].key, "2026-02")]
+
+    page._save()
+    names = [r[0] for r in db.conn.execute(
+        "SELECT i.name FROM savings s JOIN individuals i ON i.id = s.individual_id")]
+    assert names == ["Ben"]
+
+
+def test_deleting_a_month_replaces_what_was_staged_in_it(qt_app, db):
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2026-02-01", "Deposit", 1000)
+    _member(db, "Ben")
+    page = _page(qt_app, db)
+    _type(page, "Ben", "2026-02", "700")                 # staged into an empty cell
+    page._delete_months(["2026-02"], confirm=False)
+    assert all(c.kind == model.ChangeKind.DELETE for c in page.staged.values())
+    assert len(page.staged) == 1
+
+
+def test_a_loan_months_deletion_is_described_as_it_will_run(qt_app, db):
+    _with_loan(db, catch_up_to="2026-03-01")
+    page = _loan_page(qt_app, db)
+    page._delete_months(["2026-02"], confirm=False)
+    tip = page.table.item(0, LEAD + page.months.index("2026-02")).toolTip()
+    assert "missed" in tip
+
+    # With March deleted too, February is the last entry by the time it runs.
+    page._delete_months(["2026-02", "2026-03"], confirm=False)
+    tip = page.table.item(0, LEAD + page.months.index("2026-02")).toolTip()
+    assert "Un-runs" in tip
+
+
+def test_a_missed_loan_month_shows_red_and_says_so(qt_app, db):
+    from src.engine import LoanEngine
+    from src.services import loan_grid as lg
+
+    ind = _with_loan(db, catch_up_to="2026-03-01")
+    grid = lg.load(db, MONTHS)
+    change, _ = lg.stage(grid, grid.rows[0], "2026-02", "")
+    lg.apply_changes(db, LoanEngine(db), [change])
+
+    page = _loan_page(qt_app, db)
+    item = page.table.item(0, LEAD + page.months.index("2026-02"))
+    assert item.text() == "—"
+    assert "Missed" in item.toolTip()
+    assert item.foreground().color().name() == QColor(
+        page.theme.get_color("danger")).name()
+    assert db.get_loan_by_ref(ind, "L-001")["next_due_date"] == "2026-04-01"
+
+
+def test_only_the_loans_tab_offers_paid_loans(qt_app, db):
+    window = FundGridWindow(None, db, ThemeManager(db))
+    assert window.pages["loans"].include_paid is not None
+    assert window.pages[SAVINGS].include_paid is None
+    window.pages["loans"].include_paid.setChecked(True)
+    assert window.pages["loans"].backend.include_paid is True
+
+
+def test_the_help_explains_deleting_months(qt_app, db):
+    from src.views.fund_grid import GridHelpDialog
+
+    window = FundGridWindow(None, db, ThemeManager(db))
+    funds = GridHelpDialog.html(window.theme, window.pages[SAVINGS].backend)
+    loans = GridHelpDialog.html(window.theme, window.pages["loans"].backend)
+    assert "Deleting months" in funds and "missed month" in funds
+    assert "un-run" in loans and "red dash" in loans

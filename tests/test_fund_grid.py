@@ -196,15 +196,31 @@ def test_nonsense_is_reported_not_swallowed(db):
     assert "not a number" in problem
 
 
-def test_a_mixed_cell_cannot_be_typed_into(db):
+def test_a_mixed_cell_takes_a_list_of_entries(db):
+    """Several rows used to lock the month. A list of entries can stand for
+    them, so typing one figure makes the month hold exactly that."""
     ind = _member(db, "Ann")
     db.add_savings_transaction(ind, "2026-01-01", "Deposit", 2000)
     db.add_savings_transaction(ind, "2026-01-20", "Deposit", 500)
     grid = fg.load(db, SAVINGS, MONTHS)
 
     change, problem = fg.stage(grid, _row(grid, "Ann"), "2026-01", "3000")
+    assert problem is None and change.kind == fg.ChangeKind.SET
+    fg.apply_changes(db, SAVINGS, [change])
+    assert db.conn.execute(
+        "SELECT transaction_type, amount FROM savings WHERE individual_id=?",
+        (ind,)).fetchall() == [("Deposit", 3000)]
+
+
+def test_a_month_with_a_row_no_operation_describes_stays_locked(db):
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2026-01-01", "Deposit", 2000)
+    db.add_savings_transaction(ind, "2026-01-20", "Interest", 50)
+    grid = fg.load(db, SAVINGS, MONTHS)
+
+    change, problem = fg.stage(grid, _row(grid, "Ann"), "2026-01", "3000")
     assert change is None
-    assert "several transactions" in problem
+    assert "no grid operation" in problem
 
 
 def test_benevolent_credits_are_contributions_not_deposits(db):
@@ -286,17 +302,43 @@ def test_an_update_keeps_the_original_date(db):
     assert row == ("2026-01-09", 3000)
 
 
-def test_flipping_a_deposit_to_a_withdrawal_changes_its_type(db):
+def test_a_negative_figure_adds_a_withdrawal_beside_the_deposit(db):
+    """A deposit happens every month; a withdrawal is as well, not instead."""
     ind = _member(db, "Ann")
     db.add_savings_transaction(ind, "2026-01-01", "Deposit", 2000)
-    _grid, changes = _stage_all(db, SAVINGS, {"Ann": {"2026-01": "-2000"}})
+    _grid, changes = _stage_all(db, SAVINGS, {"Ann": {"2026-01": "-500"}})
     fg.apply_changes(db, SAVINGS, changes)
 
-    row = db.conn.execute(
-        "SELECT transaction_type, amount FROM savings WHERE individual_id=?",
-        (ind,)).fetchone()
-    assert row == ("Withdrawal", 2000)
-    assert db.get_savings_balance(ind) == -2000
+    rows = db.conn.execute(
+        "SELECT transaction_type, amount FROM savings WHERE individual_id=? "
+        "ORDER BY id", (ind,)).fetchall()
+    assert rows == [("Deposit", 2000), ("Withdrawal", 500)]
+    assert db.get_savings_balance(ind) == 1500
+
+
+def test_flipping_a_deposit_to_a_withdrawal_is_said_outright(db):
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2025-12-01", "Deposit", 5000)
+    db.add_savings_transaction(ind, "2026-01-01", "Deposit", 2000)
+    _grid, changes = _stage_all(db, SAVINGS, {"Ann": {"2026-01": "@D=0, @W=2000"}})
+    fg.apply_changes(db, SAVINGS, changes)
+
+    rows = db.conn.execute(
+        "SELECT transaction_type, amount FROM savings WHERE individual_id=? "
+        "AND date LIKE '2026-01%'", (ind,)).fetchall()
+    assert rows == [("Withdrawal", 2000)]
+    assert db.get_savings_balance(ind) == 3000
+
+
+def test_a_withdrawal_bigger_than_the_savings_is_refused(db):
+    """The Withdraw dialog's rule, held by the grid too (docs §3.3)."""
+    ind = _member(db, "Ann")
+    db.add_savings_transaction(ind, "2026-01-01", "Deposit", 2000)
+    _grid, changes = _stage_all(db, SAVINGS, {"Ann": {"2026-02": "-2500"}})
+    result = fg.apply_changes(db, SAVINGS, changes)
+
+    assert result.refused and "overdrawn by 500" in result.refused[0].reason
+    assert db.get_savings_balance(ind) == 2000
 
 
 def test_a_deletion_removes_the_row(db):

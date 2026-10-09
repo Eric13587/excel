@@ -140,6 +140,17 @@ class LoanRepository(Repository):
              start_date, next_due_date, unearned_interest, duration_months, interest_rate))
         return cur.lastrowid
 
+    def adjust_unearned(self, loan_id, delta):
+        """Move interest between charged and still-to-charge.
+
+        Removing a month's interest charge must hand it back here, and putting
+        the charge back must take it out again: for every loan, interest charged
+        plus unearned interest is what the loan was written for.
+        """
+        self._execute(
+            "UPDATE loans SET unearned_interest = ROUND(COALESCE(unearned_interest, 0) + ?, 2) "
+            "WHERE id=?", (delta, loan_id))
+
     def set_terms(self, loan_id, duration_months, interest_rate=None):
         """Record a new duration (and optionally rate) after a top-up or
         restructure, so the stored terms keep describing the live loan."""

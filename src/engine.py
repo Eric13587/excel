@@ -316,7 +316,7 @@ class LoanEngine:
         
         # Need ledger context for running balances
         df = self.get_ledger_df(individual_id)
-        pos = position_from_frame(df)
+        pos = position_from_frame(df, loan_ref)
         last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         # Load current loan state into variables to track simulation

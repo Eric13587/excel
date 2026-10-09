@@ -235,8 +235,9 @@ def _check_accounting(conn, report):
                 if not rows:
                     continue
                 susp = conn.execute(
-                    "SELECT start_date, suspend_until FROM loan_suspensions "
-                    "WHERE individual_id=? AND loan_ref=?", (ind, ref)).fetchall()
+                    "SELECT start_date, COALESCE(resumed_date, suspend_until) "
+                    "FROM loan_suspensions WHERE individual_id=? AND loan_ref=?",
+                    (ind, ref)).fetchall()
                 derived = derive(reconstruct(rows, susp))
                 stored = [r for r in rows if r[2] == "Interest Earned"]
                 got = [p for p in derived.postings if p.kind == "Interest Earned"]
@@ -251,20 +252,30 @@ def _check_accounting(conn, report):
                    f"history (first: {failures[0][1]} for {failures[0][2]})",
                    len(failures))
 
-        # A month with no deduction is also a month with no interest, because
-        # accrual happens inside the deduction loop rather than on a calendar.
-        # So a gap is not merely a missed payment: it is interest the member was
-        # never charged. A recorded suspension is the legitimate reason for one;
-        # without it, either payroll stopped and nobody said so, or catch-up was
-        # not run. Found by replaying loans against their own terms.
+        # A gap is a month with neither a deduction nor an interest charge:
+        # accrual happens inside the deduction loop rather than on a calendar,
+        # so such a month is interest the member was never charged. A recorded
+        # suspension is the legitimate reason for one; without it, either payroll
+        # stopped and nobody said so, or catch-up was not run.
+        #
+        # A month *charged* but not paid is not a gap. It is a missed deduction —
+        # what deleting a month in the Ledger Grid records when later deductions
+        # exist (docs/grid/deleting-months.md §4.2) — and its interest was
+        # charged. Those are counted, not flagged.
         gaps = []
+        missed_months = 0
         for lid, ref, name, ind, mi in conn.execute(
                 "SELECT l.id, l.ref, i.name, l.individual_id, l.monthly_interest "
                 "FROM loans l JOIN individuals i ON i.id = l.individual_id"):
-            months = [r[0][:7] for r in conn.execute(
+            paid = {r[0][:7] for r in conn.execute(
                 "SELECT date FROM ledger WHERE individual_id=? AND loan_id=? "
-                "AND event_type IN ('Repayment','Loan Buyoff') ORDER BY date",
-                (ind, ref))]
+                "AND event_type IN ('Repayment','Loan Buyoff')", (ind, ref))}
+            charged = {r[0][:7] for r in conn.execute(
+                "SELECT date FROM ledger WHERE individual_id=? AND loan_id=? "
+                "AND event_type='Interest Earned'", (ind, ref))}
+            if paid:
+                missed_months += sum(1 for m in charged - paid if m < max(paid))
+            months = sorted(paid | {m for m in charged if paid and m < max(paid)})
             missed = 0
             for a, b in zip(months, months[1:]):
                 try:
@@ -280,12 +291,14 @@ def _check_accounting(conn, report):
             if not covered:
                 gaps.append((lid, ref, name, missed, missed * (mi or 0)))
         uncharged = sum(g[4] for g in gaps)
+        noted = (f"; {missed_months} missed deduction(s) recorded — interest "
+                 f"charged, nothing paid" if missed_months else "")
         report.add("deductions run without unexplained gaps", "accounting",
                    PASS if not gaps else WARN,
-                   "no gaps" if not gaps else
+                   ("no gaps" + noted) if not gaps else
                    f"{len(gaps)} loan(s) skipped {sum(g[3] for g in gaps)} month(s) with "
                    f"no suspension recorded — about {uncharged:,.0f} of interest was "
-                   f"not charged (first: {gaps[0][1]} for {gaps[0][2]})", len(gaps))
+                   f"not charged (first: {gaps[0][1]} for {gaps[0][2]}){noted}", len(gaps))
 
         # Why a loan ends up "Paid" with a negative balance. The check above
         # reports the symptom; these two name the cause, because the balance is

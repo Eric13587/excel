@@ -59,21 +59,21 @@ def clear_derived(db, row_id):
         (row_id,))
 
 
-def project_loan(db, individual_id, loan_ref, commit=True):
-    """Re-derive one loan and write the result into its rows.
+def _alignment(db, individual_id, loan_ref):
+    """Pair a loan's stored rows with the postings its events derive.
 
-    Returns the number of ledger rows whose derived values changed, so a caller
-    can tell a correction from a no-op. On a healthy loan this is 0.
+    Returns ``(result, pairs, None)``, or ``(None, None, why)`` when the two do
+    not line up — the loan does not reconcile with its own history, and writing
+    half an answer into it would be worse than leaving it alone.
     """
     events = reconstruct_for_loan(db, individual_id, loan_ref)
     if not events:
-        return 0
+        return None, None, None
     result = derive(events)
 
     # Match derived postings to stored rows by (date, kind). The derivation
     # emits them in the same order the ledger stores them, so position within a
-    # date is enough; a mismatch means the reconstruction lost a row, and it is
-    # safer to leave the loan alone than to write half an answer.
+    # date is enough; a mismatch means the reconstruction lost a row.
     stored = db.conn.execute(
         "SELECT id, date, event_type, balance, principal_balance, interest_balance, "
         "       principal_portion, interest_portion FROM ledger "
@@ -83,18 +83,39 @@ def project_loan(db, individual_id, loan_ref, commit=True):
     postings = [p for p in result.postings if p.kind in ("Interest Earned", "Repayment")]
 
     if len(stored) != len(postings):
-        logger.warning(
-            "Loan %s/%s: %d stored rows vs %d derived — not projecting",
-            individual_id, loan_ref, len(stored), len(postings))
+        return None, None, f"{len(stored)} stored rows vs {len(postings)} derived"
+    for row, posting in zip(stored, postings):
+        if str(row[1])[:10] != posting.date:
+            return None, None, (f"row {row[0]} dated {str(row[1])[:10]} where its "
+                                f"schedule has {posting.date}")
+    return result, list(zip(stored, postings)), None
+
+
+def reconciles(db, individual_id, loan_ref):
+    """``(True, None)`` when :func:`project_loan` can derive this loan, else
+    ``(False, why)``. Asks without writing anything."""
+    _result, _pairs, why = _alignment(db, individual_id, loan_ref)
+    return why is None, why
+
+
+def project_loan(db, individual_id, loan_ref, commit=True):
+    """Re-derive one loan and write the result into its rows.
+
+    Returns the number of ledger rows whose derived values changed, so a caller
+    can tell a correction from a no-op. On a healthy loan this is 0.
+    """
+    result, pairs, why = _alignment(db, individual_id, loan_ref)
+    if why:
+        logger.warning("Loan %s/%s: %s — not projecting", individual_id, loan_ref, why)
         return 0
+    if result is None:
+        return 0
+    stored = [row for row, _posting in pairs]
+    postings = [posting for _row, posting in pairs]
 
     changed = 0
     for row, posting in zip(stored, postings):
-        row_id, date = row[0], row[1]
-        if str(date)[:10] != posting.date:
-            logger.warning("Loan %s/%s: row %s dated %s vs derived %s — not projecting",
-                           individual_id, loan_ref, row_id, date, posting.date)
-            return 0
+        row_id = row[0]
         gross = round(posting.principal_balance + posting.interest_balance, 2)
         wanted = (gross, posting.principal_balance, posting.interest_balance,
                   posting.principal_portion, posting.interest_portion)
@@ -105,6 +126,8 @@ def project_loan(db, individual_id, loan_ref, commit=True):
             "principal_portion=?, interest_portion=? WHERE id=?",
             (*wanted, row_id))
         changed += 1
+
+    changed += _carry_position(db, individual_id, loan_ref)
 
     loan = db.get_loan_by_ref(individual_id, loan_ref)
     if loan:
@@ -122,6 +145,41 @@ def project_loan(db, individual_id, loan_ref, commit=True):
              _next_due(db, individual_id, loan_ref, loan), loan["id"]))
     if commit:
         db.conn.commit()
+    return changed
+
+
+#: Rows the derivation emits a posting for. Every other row on a loan — an
+#: issue, a top-up, a restructure marker — has its running columns carried.
+_POSTED = ("Interest Earned", "Repayment", "Loan Buyoff")
+
+
+def _carry_position(db, individual_id, loan_ref):
+    """Write the running position onto the rows the derivation does not post.
+
+    A disbursement's balance is the one brought forward plus what it disbursed;
+    a restructure changes no money and just repeats it. Nothing else wrote these
+    after the recalculators were replaced, so a figure that was wrong at issue —
+    another loan's balance added in — stayed wrong. Runs after the postings are
+    written, so the position it carries forward is the derived one.
+    """
+    rows = db.conn.execute(
+        "SELECT id, event_type, added, balance, principal_balance, interest_balance "
+        "FROM ledger WHERE individual_id=? AND loan_id=? ORDER BY date, id",
+        (individual_id, loan_ref)).fetchall()
+    principal = interest = 0.0
+    changed = 0
+    for row_id, kind, added, *stored in rows:
+        if kind in _POSTED:
+            principal, interest = float(stored[1] or 0), float(stored[2] or 0)
+            continue
+        principal = round(principal + float(added or 0), 2)
+        wanted = (round(principal + interest, 2), principal, round(interest, 2))
+        if tuple(round(float(v or 0), 2) for v in stored) == wanted:
+            continue
+        db.conn.execute(
+            "UPDATE ledger SET balance=?, principal_balance=?, interest_balance=? WHERE id=?",
+            (*wanted, row_id))
+        changed += 1
     return changed
 
 

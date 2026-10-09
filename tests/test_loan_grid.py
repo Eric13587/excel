@@ -309,18 +309,19 @@ def test_correcting_is_allowed_for_a_member_who_left(env):
 # Removing a deduction
 # --------------------------------------------------------------------------- #
 
-def test_only_the_most_recent_deduction_can_be_removed(env):
+def test_an_earlier_deduction_is_missed_and_the_last_is_un_run(env):
+    """docs/grid/deleting-months.md §4.2 — what follows a deduction decides it."""
     db, engine = env
     _loan(db, engine, catch_up_to="2026-04-01")
     grid = lg.load(db, MONTHS)
     row = _row(grid)
 
     change, problem = lg.stage(grid, row, "2026-02", "")
-    assert change is None
-    assert "most recent" in problem
+    assert problem is None and change.mode == lg.MISSED
 
     change, problem = lg.stage(grid, row, "2026-04", "")
     assert problem is None and change.kind == ChangeKind.DELETE
+    assert change.mode == lg.UNRUN
 
 
 def test_removing_takes_the_months_accrual_with_it(env):

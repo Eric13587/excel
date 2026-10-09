@@ -23,15 +23,24 @@ Everything else follows the spreadsheet the user already knows: arrow keys and
 Tab to move, type to replace, Delete to clear, Ctrl+C / Ctrl+V to move a block
 of figures in or out of Excel, Ctrl+Z to take back the last edit.
 
+OPERATIONS
+----------
+A bare figure is the tab's everyday entry. Anything else is written as an
+operation — ``@W=500`` for a withdrawal, ``@T=20,000/12`` for a loan top-up —
+and a fund month can hold several: ``2,000, @W=500``. The syntax lives in
+:mod:`src.services.grid_ops`; the **?** button in the corner lists what the
+current tab accepts. Editing (F2 or double-click) opens a cell with its full
+list, so what a month holds can be read and corrected in place.
+
 WHAT THIS SCREEN DELIBERATELY WILL NOT DO
 -----------------------------------------
 * **Loans are not here.** A loan schedule is derived from its terms — principal,
   interest, suspensions — and is not a set of independent monthly numbers. A
   grid that let you type over it would produce a ledger that no longer follows
   from anything. Loans keep their own screen.
-* **A month with several transactions is read only.** Shown with a · marker and
-  the net figure, because one editable number cannot represent two facts without
-  destroying one of them. Open that member to work on those rows.
+* **A month holding a row no operation describes is read only** (an
+  ``Interest`` posting on a fund, a second payment on a loan). Shown with a ·
+  marker and the net figure; open that member to work on those rows.
 * **Nothing here bypasses a rule.** Every write goes through the same posting
   pipeline and membership policy as the per-member screens, so what is refused
   there is refused here — with the reason, against the cell that caused it.
@@ -41,13 +50,14 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime
 
-from PyQt6.QtCore import QDate, Qt
+from PyQt6.QtCore import QDate, QModelIndex, Qt
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
                              QLineEdit, QMenu, QMessageBox, QProgressDialog,
-                             QPushButton, QTableWidget, QTableWidgetItem,
-                             QTabWidget, QVBoxLayout, QWidget)
+                             QPushButton, QStyledItemDelegate, QTableWidget,
+                             QTableWidgetItem, QTabWidget, QTextBrowser,
+                             QToolButton, QVBoxLayout, QWidget)
 
 from src.services import fund_grid as model
 
@@ -55,6 +65,22 @@ logger = logging.getLogger(__name__)
 
 #: Marker on a cell holding more than one transaction.
 MIXED_MARK = " ·"
+
+#: Where a cell keeps the text its editor opens with. A QTableWidgetItem stores
+#: display and edit text in one slot, and a month shown as "2,500" may need to
+#: open as "@D=2,000, @W=500" — so the full form lives here instead.
+EDIT_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+class _CellDelegate(QStyledItemDelegate):
+    """Opens a cell's editor on its full entry list rather than its display text."""
+
+    def setEditorData(self, editor, index):
+        text = index.data(EDIT_ROLE)
+        if text is not None and isinstance(editor, QLineEdit):
+            editor.setText(text)
+            return
+        super().setEditorData(editor, index)
 
 
 def _money(value):
@@ -114,14 +140,38 @@ class FundGridWindow(QDialog):
         self.pages = {}
         layout = QVBoxLayout(self)
 
+        header = QHBoxLayout()
         intro = QLabel(
-            "Type to edit, Delete to clear, Ctrl+C / Ctrl+V to move figures to and "
-            "from Excel. On the fund tabs a negative number records a withdrawal; on "
-            "Loans a figure takes that month's deduction. Nothing is written until "
-            "you press Save.")
+            "Type a figure for the usual entry, or an operation such as @W=500 "
+            "(withdrawal) or @T=20,000/12 (loan top-up). Several in one month: "
+            "2,000, @W=500. Nothing is written until you press Save.")
         intro.setWordWrap(True)
         intro.setStyleSheet(self.theme.hint_css())
-        layout.addWidget(intro)
+        header.addWidget(intro, 1)
+
+        self.help_btn = QToolButton()
+        self.help_btn.setText("?")
+        self.help_btn.setToolTip("How this grid works, and the operations this tab "
+                                 "accepts (F1)")
+        self.help_btn.setStyleSheet(f"""
+            QToolButton {{
+                color: {t.get_color('accent')};
+                background-color: transparent;
+                border: 1.5px solid {t.get_color('accent')};
+                border-radius: 13px;
+                min-width: 22px; min-height: 22px;
+                max-width: 22px; max-height: 22px;
+                font-weight: bold; font-size: 13px;
+            }}
+            QToolButton:hover {{
+                background-color: {t.get_color('accent')};
+                color: {t.get_color('bg_secondary')};
+            }}
+        """)
+        self.help_btn.clicked.connect(self.show_help)
+        header.addWidget(self.help_btn, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(header)
+        QShortcut(QKeySequence(Qt.Key.Key_F1), self, self.show_help)
 
         self.tabs = QTabWidget()
         for backend in self._backends():
@@ -150,6 +200,13 @@ class FundGridWindow(QDialog):
         from src.services.loan_grid import LoanBackend
 
         return [model.FundBackend(fund) for fund in model.FUND_ORDER] + [LoanBackend()]
+
+    def show_help(self):
+        """The help panel for whichever tab is showing."""
+        page = self.tabs.currentWidget()
+        if page is None:
+            return
+        GridHelpDialog(self, self.theme, page.backend).exec()
 
     def _tab_changed(self, index):
         """Load a fund the first time its tab is looked at, not before."""
@@ -239,7 +296,11 @@ class FundGridPage(QWidget):
         self.from_month = self._month_picker(QDate.currentDate().addMonths(-11))
         controls.addWidget(self.from_month)
         controls.addWidget(QLabel("To:"))
-        self.to_month = self._month_picker(QDate.currentDate())
+        # A loan that is up to date is due *next* month, and that is the only
+        # cell that takes a deduction or an operation. Ending the Loans range at
+        # this month would hide it for every loan that is not in arrears.
+        ahead = 1 if self.backend.fund == "loans" else 0
+        self.to_month = self._month_picker(QDate.currentDate().addMonths(ahead))
         controls.addWidget(self.to_month)
 
         self.search = QLineEdit()
@@ -263,6 +324,15 @@ class FundGridPage(QWidget):
         self.show_excluded.stateChanged.connect(lambda: self.reload())
         controls.addWidget(self.show_excluded)
 
+        self.include_paid = None
+        if self.backend.fund == "loans":
+            self.include_paid = QCheckBox("Include paid loans")
+            self.include_paid.setToolTip(
+                "Loans already repaid or bought off. Shown so their deductions can "
+                "be corrected or deleted — deleting one reopens the loan.")
+            self.include_paid.stateChanged.connect(self._toggle_paid)
+            controls.addWidget(self.include_paid)
+
         reload_btn = QPushButton("Reload")
         reload_btn.setToolTip("Re-read the journal, discarding unsaved changes")
         reload_btn.clicked.connect(self._reload_clicked)
@@ -275,6 +345,10 @@ class FundGridPage(QWidget):
         self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
+        self.table.setItemDelegate(_CellDelegate(self.table))
+        header = self.table.horizontalHeader()
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._header_menu)
         self.table.itemChanged.connect(self._item_changed)
         self.table.itemDoubleClicked.connect(self._double_clicked)
         layout.addWidget(self.table)
@@ -414,6 +488,10 @@ class FundGridPage(QWidget):
     # ------------------------------------------------------------------ #
     # Loading
     # ------------------------------------------------------------------ #
+
+    def _toggle_paid(self):
+        self.backend.include_paid = self.include_paid.isChecked()
+        self.reload()
 
     def _reload_clicked(self):
         if self.staged and not self.window_ref.confirm_discard("reload"):
@@ -584,18 +662,24 @@ class FundGridPage(QWidget):
         key = (member.key, month)
         cell = member.cell(month)
 
-        if key in self.staged:
-            change = self.staged[key]
-            text = ("—" if change.kind == model.ChangeKind.DELETE
-                    else f"{change.amount:,.0f}")
+        staged = self.staged.get(key)
+        if staged is not None:
+            text = self.backend.staged_text(staged) or (
+                "—" if staged.kind == model.ChangeKind.DELETE
+                else f"{staged.amount:,.0f}")
         else:
-            text = _money(cell.net)
+            text = self.backend.display_text(member, month) or _money(cell.net)
         locked = self._refusal(member, month)
         if locked and cell.rows:
             text += MIXED_MARK
 
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if not locked:
+            # What F2 / double-click opens with: the month's entries in full,
+            # or the staged ones, so an edit starts from what is really there.
+            item.setData(EDIT_ROLE, self.backend.staged_edit_text(staged)
+                         if staged is not None else self.backend.edit_text(member, month))
 
         if locked:
             item.setToolTip(locked)
@@ -607,12 +691,22 @@ class FundGridPage(QWidget):
         elif key in self.staged:
             item.setBackground(QColor(self.theme.get_color("warning_bg")))
             item.setForeground(QColor(self.theme.get_color("warning")))
-            item.setToolTip("Unsaved — press Save Changes to write it.")
-        elif cell.state == model.CellState.SINGLE:
-            row = cell.rows[0]
-            item.setToolTip(f"{row['transaction_type']} of "
-                            f"{float(row['amount'] or 0):,.0f} on {str(row['date'])[:10]}"
-                            + (f"\n{row['notes']}" if row.get("notes") else ""))
+            item.setToolTip(f"{self.backend.describe(staged, self.staged)}\n"
+                            f"Unsaved — press Save Changes to write it.")
+        elif self.backend.cell_note(member, month):
+            # A missed loan month: charged, unpaid, and still recordable. Bold as
+            # well as red — a lone dash is easy to lose in a wide table.
+            item.setToolTip(self.backend.cell_note(member, month))
+            item.setForeground(QColor(self.theme.get_color("danger")))
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+        elif cell.rows:
+            item.setToolTip("\n".join(
+                f"{row['transaction_type']} of {float(row['amount'] or 0):,.0f} "
+                f"on {str(row['date'])[:10]}"
+                + (f" — {row['notes']}" if row.get("notes") else "")
+                for row in sorted(cell.rows, key=lambda r: (str(r["date"]), r["id"]))))
         return item
 
     def _figure(self, value):
@@ -698,7 +792,7 @@ class FundGridPage(QWidget):
             member = self.rows[row]
             column = len(self.backend.lead_columns) + self.months.index(month)
             self._place(row, column, self._cell_item(member, month),
-                        editable=member.cell(month).editable)
+                        editable=self._editable(member, month))
             self._redraw_derived(row)
         finally:
             self._filling = False
@@ -713,7 +807,7 @@ class FundGridPage(QWidget):
         change = self.staged.get((member.key, month))
         if change is None:
             return member.cell(month).net
-        return 0.0 if change.kind == model.ChangeKind.DELETE else change.amount
+        return change.effect
 
     def _redraw_derived(self, row):
         """Keep the member's Period column, and the totals, honest."""
@@ -754,6 +848,12 @@ class FundGridPage(QWidget):
         return out
 
     def _clear_selection(self):
+        # Whole columns selected is a request to delete those months, and that
+        # deserves the preview of what it does (docs/grid/deleting-months.md).
+        months = self._whole_months()
+        if months:
+            self._delete_months(months)
+            return
         cells = self._selected_month_cells()
         if not cells:
             return
@@ -890,7 +990,8 @@ class FundGridPage(QWidget):
             f"{self.spec.noun}?\n\n"
             f"Only months that were missed are filled — never a month before "
             f"the member's account began, never a month still to come, and "
-            f"never one that already has an entry.\n\n"
+            f"never one that already has its {self.spec.noun}. A month holding "
+            f"only a withdrawal still gets its {self.spec.noun}, beside it.\n\n"
             f"Nothing is written until you press Save Changes."
             + (f"\n{detail}" if detail else ""),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
@@ -977,8 +1078,12 @@ class FundGridPage(QWidget):
             if member is None:
                 continue
             cell = member.cell(month)
-            if not cell.editable:
-                continue                # became a multi-transaction month; let it go
+            if self._refusal(member, month) is not None:
+                continue                # the month can no longer be edited; let it go
+            if change.kind == model.ChangeKind.SET:
+                self.staged[key] = replace(change, before=cell.fingerprint())
+                self.refused[key] = refused.get(key) or "Not saved."
+                continue
             rebased = replace(change, before=cell.fingerprint(),
                               row_id=cell.row_id if cell.rows else None)
             if rebased.kind == model.ChangeKind.DELETE and not cell.rows:
@@ -1069,13 +1174,13 @@ class FundGridPage(QWidget):
         if month is None or item.row() >= len(self.rows):
             return
         member = self.rows[item.row()]
-        if member.cell(month).editable:
-            return                              # normal edit; let Qt handle it
+        reason = self._refusal(member, month)
+        if reason is None or not member.cell(month).rows:
+            return                              # normal edit, or nothing to open
         answer = QMessageBox.question(
-            self, "Several Transactions",
-            f"{model.month_label(month)} holds {len(member.cell(month).rows)} "
-            f"transactions for {member.name}, so it cannot be edited as one "
-            f"number.\n\nOpen {member.name}'s ledger to work on them?",
+            self, "Edit in the Ledger",
+            f"{model.month_label(month)} for {member.name}: {reason}\n\n"
+            f"Open {member.name}'s ledger to work on it?",
             QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel)
         if answer == QMessageBox.StandardButton.Open and self.on_open_member:
             self.on_open_member(member.member_id, member.name)
@@ -1088,6 +1193,9 @@ class FundGridPage(QWidget):
         menu = QMenu(self)
         open_action = menu.addAction(f"Open {member.name}'s ledger")
         clear_action = menu.addAction("Clear selected cells")
+        month = self._month_column(self.table.columnAt(position.x()))
+        delete_month = (menu.addAction(f"Delete {model.month_label(month)} for everyone "
+                                       f"shown…") if month else None)
         menu.addSeparator()
         excluded = getattr(member, "excluded", False)
         rows = self._selected_rows() or [member]
@@ -1103,8 +1211,106 @@ class FundGridPage(QWidget):
             self.on_open_member(member.member_id, member.name)
         elif chosen is clear_action:
             self._clear_selection()
+        elif delete_month is not None and chosen is delete_month:
+            self._delete_months([month])
         elif chosen is toggle:
             self._set_excluded(rows, not excluded)
+
+    # ------------------------------------------------------------------ #
+    # Deleting months — docs/grid/deleting-months.md
+    # ------------------------------------------------------------------ #
+
+    def _visible_rows(self):
+        return [row for index, row in enumerate(self.rows)
+                if not self.table.isRowHidden(index)]
+
+    def _whole_months(self):
+        """Month columns selected as columns — by clicking their headers — else [].
+
+        Asked of the selection model rather than inferred from which cells are
+        selected: with two members on screen, selecting both of their cells is
+        still editing cells, not deleting a month.
+        """
+        selection = self.table.selectionModel()
+        months = []
+        for column in range(self.table.columnCount()):
+            month = self._month_column(column)
+            if month is not None and selection.isColumnSelected(column, QModelIndex()):
+                months.append(month)
+        return months
+
+    def _header_menu(self, position):
+        month = self._month_column(self.table.horizontalHeader().logicalIndexAt(position))
+        if month is None or not self.rows:
+            return
+        selected = self._whole_months()
+        months = selected if month in selected else [month]
+        what = (model.month_label(month) if len(months) == 1
+                else f"these {len(months)} months")
+        menu = QMenu(self)
+        action = menu.addAction(
+            f"Delete {what} for the {len(self._visible_rows())} "
+            f"{self.backend.per_row_noun}(s) shown…")
+        if menu.exec(self.table.horizontalHeader().mapToGlobal(position)) is action:
+            self._delete_months(months)
+
+    def _delete_months(self, months, confirm=True):
+        """Preview, then stage, the deletion of whole months for the rows shown."""
+        rows = self._visible_rows()
+        plan = self.backend.plan_delete_months(self.db, self.grid, rows, months)
+        label = ", ".join(model.month_label(m) for m in sorted(months))
+        if plan.empty:
+            self._set_status(f"Nothing recorded in {label} for the rows shown.", "muted")
+            return False
+        if confirm and not self._confirm_delete(plan, label):
+            return False
+
+        # The months are being cleared: anything staged into them for these rows
+        # goes, and the deletions take their place.
+        for row in rows:
+            for month in months:
+                self.staged.pop((row.key, month), None)
+                self.refused.pop((row.key, month), None)
+        for change in plan.changes:
+            self.staged[(change.key, change.month)] = change
+        self.edit_history.clear()       # undone with Discard, like a fill
+        self._render()
+        self._refresh_status()
+        note = (f"{len(plan.changes)} deletion(s) staged in {label} — press Save "
+                f"Changes to write them.")
+        if plan.refused:
+            note += f" {len(plan.refused)} refused; see the preview for why."
+        self._set_status(note, "warning")
+        return True
+
+    def _confirm_delete(self, plan, label):
+        """The preview: what goes, what follows, what is left — then go or not."""
+        counts = "\n".join(
+            f"  • {count} {name} — {amount:,.0f}"
+            for name, (count, amount) in sorted(plan.tallies.items()))
+        sections = [f"Deletes, across {plan.rows_affected} "
+                    f"{self.backend.per_row_noun}(s):\n{counts}" if counts else
+                    "Nothing can be deleted."]
+        if plan.consequences:
+            sections.append("What follows:\n" + "\n".join(
+                f"  • {line}" for line in plan.consequences))
+        if plan.untouched:
+            sections.append("Left alone:\n" + "\n".join(
+                f"  • {line}" for line in plan.untouched))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Delete Months")
+        box.setText(f"Delete {label} in {self.backend.label} for the rows shown?")
+        box.setInformativeText("\n\n".join(sections) + "\n\nNothing is written until "
+                               "you press Save Changes, and Undo Last Save reverses it.")
+        if plan.refused:
+            box.setDetailedText("Refused — these keep their transactions:\n\n" + "\n".join(
+                f"{row.label}: {reason}" for row, reason in plan.refused))
+        go = box.addButton("Stage Deletions", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        go.setEnabled(bool(plan.changes))
+        box.exec()
+        return box.clickedButton() is go
 
     def _selected_rows(self):
         """The distinct member rows touched by the selection."""
@@ -1201,3 +1407,182 @@ class FundGridPage(QWidget):
             report_saved(self, "Fund Grid", path, what="grid")
         else:
             QMessageBox.critical(self, "Export Failed", message)
+
+
+class GridHelpDialog(QDialog):
+    """What the grid does, and what the current tab's cells will accept.
+
+    Built from the backend's own operation table rather than written out by
+    hand, so the help cannot list an operation the tab does not understand.
+    """
+
+    _GENERAL = [
+        ("Type", "Replace a cell. A bare figure is the tab's usual entry."),
+        ("F2 / double-click", "Edit a cell starting from what it holds — every "
+                              "entry in the month, written out."),
+        ("Delete", "Clear the selected cells."),
+        ("Ctrl+C / Ctrl+V", "Copy to or paste from Excel; pastes run across "
+                            "and down from the selected cell."),
+        ("Ctrl+Z", "Take back the last unsaved edit."),
+        ("Save Changes", "Write everything staged, as one batch. "
+                         "Undo Last Save reverses it exactly."),
+    ]
+
+    _COLOURS = [
+        ("warning", "Orange", "Staged — typed but not saved yet."),
+        ("danger", "Red", "Refused when saving; hover it for the reason."),
+        ("text_secondary", "Grey", "Locked; hover it for why, or double-click to "
+                                   "open the member's ledger."),
+    ]
+
+    def __init__(self, parent, theme, backend):
+        super().__init__(parent)
+        self.setWindowTitle(f"Ledger Grid Help — {backend.label}")
+        self.setMinimumSize(600, 560)
+        t = theme
+        self.setStyleSheet(f"QDialog {{ background-color: {t.get_color('bg_secondary')}; }}")
+
+        layout = QVBoxLayout(self)
+        body = QTextBrowser()
+        body.setOpenExternalLinks(False)
+        body.setStyleSheet(f"""
+            QTextBrowser {{
+                background-color: {t.get_color('bg_secondary')};
+                color: {t.get_color('text_primary')};
+                border: 1px solid {t.get_color('border')};
+                border-radius: 4px;
+                padding: 8px;
+            }}
+        """)
+        body.setHtml(self.html(theme, backend))
+        layout.addWidget(body)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _spellings(ops):
+        """Three ways to write this tab's first non-default operation."""
+        op = next(o for o in ops.ops if o is not ops.default)
+        longest = max(op.words, key=len)
+        return (f"<code>@{op.code.lower()}</code>, <code>@{op.code}</code> and "
+                f"<code>@{longest}</code>")
+
+    @classmethod
+    def html(cls, theme, backend):
+        accent = theme.get_color("accent")
+        muted = theme.get_color("text_secondary")
+        border = theme.get_color("border")
+
+        def table(rows, code=True):
+            cells = "".join(
+                "<tr><td style='padding:4px 12px 4px 0; vertical-align:top; "
+                "white-space:nowrap'>"
+                + (f"<code style='color:{accent}'>{left}</code>" if code else f"<b>{left}</b>")
+                + f"</td><td style='padding:4px 0'>{right}</td></tr>"
+                for left, right in rows)
+            return (f"<table cellspacing='0' style='border-top:1px solid {border}; "
+                    f"margin-bottom:6px'>{cells}</table>")
+
+        ops = backend.ops
+        examples = _EXAMPLES.get(backend.fund, [])
+        colours = "".join(
+            f"<tr><td style='padding:2px 12px 2px 0'><b style='color:"
+            f"{theme.get_color(tone)}'>{name}</b></td><td>{meaning}</td></tr>"
+            for tone, name, meaning in cls._COLOURS)
+        return f"""
+            <h3 style='margin-bottom:2px'>{backend.label}: what a cell accepts</h3>
+            {table(ops.help_rows())}
+            <p style='color:{muted}'>Write an operation as <code>@</code> and the
+            start of its name — {cls._spellings(ops)} are the same. The
+            <code>=</code> is optional.</p>
+
+            <h3 style='margin-bottom:2px'>Examples</h3>
+            {table(examples)}
+
+            <h3 style='margin-bottom:2px'>{"Several entries in one month" if backend.fund != "loans" else "One thing per month"}</h3>
+            <p>{_MULTI.get(backend.fund, _MULTI["funds"])}</p>
+
+            <h3 style='margin-bottom:2px'>Deleting months</h3>
+            <p>{_DELETING["loans" if backend.fund == "loans" else "funds"]}</p>
+
+            <h3 style='margin-bottom:2px'>Editing</h3>
+            {table(cls._GENERAL, code=False)}
+
+            <h3 style='margin-bottom:2px'>Colours</h3>
+            <table>{colours}</table>
+        """
+
+
+_FUND_EXAMPLES = [
+    ("2,000", "Sets the month's deposit to 2,000. A withdrawal already in the "
+              "month is kept."),
+    ("-500  or  @W=500", "Sets the month's withdrawal to 500. The deposit is kept."),
+    ("2,000, @W=500", "Sets both."),
+    ("@W=0", "Removes the month's withdrawal (@D=0 removes the deposit)."),
+    ("+@W=500", "Adds a second withdrawal beside the one already there."),
+    ("(empty)  or  -", "Clears the whole month."),
+]
+
+_EXAMPLES = {
+    "savings": _FUND_EXAMPLES,
+    "christmas_savings": _FUND_EXAMPLES + [
+        ("", "Withdrawals are refused outside the unlock month set in Settings; "
+             "use the member's Christmas tab to override.")],
+    "benevolent_ledger": [
+        ("300", "Sets the month's contribution to 300. A payout is kept."),
+        ("@P=10,000", "Sets the month's payout to 10,000 (recorded as a "
+                      "withdrawal). The contribution is kept."),
+        ("300, @P=10,000", "Sets both."),
+        ("@P=0", "Removes the month's payout."),
+        ("(empty)  or  -", "Clears the whole month."),
+    ],
+    "loans": [
+        ("5,750", "Takes the month's deduction at 5,750 — or corrects one already taken."),
+        ("@T=20,000/12", "Tops the loan up by 20,000, re-termed over 12 months."),
+        ("@B", "Buys the loan off: settles principal and all interest."),
+        ("@S=3", "Suspends deductions for 3 months from this one."),
+        ("(empty)", "Removes the loan's most recent deduction."),
+    ],
+}
+
+_DELETE_HOW = ("Right-click a month's heading — or select whole columns and press "
+               "<b>Delete</b> — to delete that month for the rows shown. A preview "
+               "says what will happen before anything is staged. ")
+
+_DELETING = {
+    "funds": _DELETE_HOW + (
+        "Every deposit and withdrawal in the month goes, balances after it are "
+        "recalculated, and the month becomes a missed month that Fill Forward "
+        "will offer again. On Savings and Christmas, a deletion that would leave "
+        "a later withdrawal bigger than the savings it came from is refused for "
+        "that member."),
+    "loans": _DELETE_HOW + (
+        "A loan's <b>last</b> deduction is <b>un-run</b>: its interest returns to "
+        "unearned and the month falls due again. An <b>earlier</b> one becomes "
+        "<b>missed</b>: its interest stays charged, later deductions are re-split "
+        "interest first, and the loan runs one instalment longer. A missed month "
+        "shows as a red dash — type a figure there to record it. Buy-offs, and a "
+        "loan's last deduction before a top-up, are refused: use the member's "
+        "ledger. Tick <b>Include paid loans</b> to work on loans already repaid."),
+}
+
+_MULTI = {
+    "funds": ("Every month is assumed to have its deposit; a withdrawal happens "
+              "<i>as well</i>. So what you type replaces only the kinds it names "
+              "— a bare figure is the deposit, <code>@W</code> the withdrawal — and "
+              "leaves the rest of the month alone. Fill Forward treats a month with "
+              "a withdrawal but no deposit as missed. "
+              "Separate entries with commas: <code>2,000, @W=500</code>. A comma "
+              "splits entries when a space or an <code>@</code> follows it, so "
+              "<code>2,000</code> stays two thousand. A month holding more than one "
+              "entry is shown with every entry prefixed (<code>@D=2,000, "
+              "@W=500</code>). Start with <code>+</code> to add another entry of the "
+              "same kind."),
+    "loans": ("A loan month takes a deduction <i>or</i> one operation, and "
+              "operations go only in the month the loan is due next (its "
+              "<b>Due</b> column). Each moves the loan's schedule, so save one "
+              "before typing the next. Months before the due date, and months "
+              "after it while it is unpaid, are locked — hover for why."),
+}
