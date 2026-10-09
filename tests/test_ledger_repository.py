@@ -81,17 +81,6 @@ def test_event_probes(journal):
     assert led.first_note(ind, "L-001", "Loan Buyoff") is None
 
 
-def test_batch_lookups(journal):
-    a, b = _member(journal, "A"), _member(journal, "B")
-    for ind in (a, b):
-        _row(journal, ind, "2026-01-01", batch_id="RUN-1")
-    _row(journal, a, "2026-02-01", loan_ref="L-002", batch_id="RUN-1")
-
-    assert sorted(journal.ledger.members_in_batch("RUN-1")) == sorted([a, b])
-    assert sorted(journal.ledger.loans_in_batch("RUN-1")) == sorted(
-        [("L-001", a), ("L-001", b), ("L-002", a)])
-
-
 # --------------------------------------------------------------------------- #
 # Earliest-date coverage (finding D7)
 # --------------------------------------------------------------------------- #
@@ -260,19 +249,15 @@ def test_delete_and_restore_round_trip(journal):
     assert (after["principal_portion"], after["interest_portion"]) == (60, 40)
 
 
-def test_delete_events_and_batch(journal):
+def test_delete_events_removes_only_the_kinds_named(journal):
     ind = _member(journal)
     _row(journal, ind, "2026-01-01", "Loan Issued", added=1000)
-    _row(journal, ind, "2026-02-01", "Repayment", deducted=100, batch_id="RUN-1")
-    _row(journal, ind, "2026-02-01", "Interest Earned", added=12, batch_id="RUN-1")
+    _row(journal, ind, "2026-02-01", "Repayment", deducted=100)
+    _row(journal, ind, "2026-02-01", "Interest Earned", added=12)
 
     with journal.transaction():
         journal.ledger.delete_events(ind, "L-001", ("Repayment", "Interest Earned"))
     assert [r for r in journal.get_ledger(ind)["event_type"]] == ["Loan Issued"]
-
-    _row(journal, ind, "2026-03-01", batch_id="RUN-2")
-    journal.delete_batch("RUN-2")
-    assert len(journal.get_ledger(ind)) == 1
 
 
 # --------------------------------------------------------------------------- #

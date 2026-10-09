@@ -176,28 +176,6 @@ def test_recalculate_accepts_a_caller_cursor(journal):
 # Batch helpers
 # --------------------------------------------------------------------------- #
 
-def test_members_in_batch_and_delete_batch(journal):
-    a, b = _member(journal, "A"), _member(journal, "B")
-    for ind in (a, b):
-        journal.add_savings_transaction(ind, "2026-01-01", "Deposit", 100, batch_id="BATCH-1")
-    journal.add_savings_transaction(a, "2026-02-01", "Deposit", 50, batch_id="BATCH-2")
-
-    assert sorted(journal.funds.members_in_batch(SAVINGS, "BATCH-1")) == sorted([a, b])
-    journal.delete_savings_batch("BATCH-1")
-    assert journal.funds.members_in_batch(SAVINGS, "BATCH-1") == []
-    assert journal.funds.members_in_batch(SAVINGS, "BATCH-2") == [a]
-
-
-def test_earliest_date_per_member_in_batch(journal):
-    """Benevolent revert restores each member's next-due to the batch's first date."""
-    a, b = _member(journal, "A"), _member(journal, "B")
-    journal.fund_add_transaction(BENEVOLENT, a, "2026-03-01", "Contribution", 50, batch_id="B1")
-    journal.fund_add_transaction(BENEVOLENT, a, "2026-04-01", "Contribution", 50, batch_id="B1")
-    journal.fund_add_transaction(BENEVOLENT, b, "2026-02-01", "Contribution", 50, batch_id="B1")
-
-    got = dict(journal.funds.earliest_date_per_member_in_batch(BENEVOLENT, "B1"))
-    assert got == {a: "2026-03-01", b: "2026-02-01"}
-
 
 def test_delete_all_for_member_leaves_others_alone(journal):
     a, b = _member(journal, "A"), _member(journal, "B")

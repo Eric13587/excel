@@ -172,66 +172,6 @@ def test_validate(source, tmp_path):
 # RepairRepository
 # --------------------------------------------------------------------------- #
 
-def _make_orphans(db):
-    """Simulate a pre-migration-001 journal, where a parent delete orphaned rows."""
-    _relax_to_legacy_shape(db)
-    keep = db.add_individual("Keep", "1", "k@x.com")
-    gone = db.add_individual("Gone", "2", "g@x.com")
-    for ind in (keep, gone):
-        db.add_savings_transaction(ind, "2026-01-01", "Deposit", 100)
-        db.add_transaction(ind, "2026-01-01", "Loan Issued", "L-001", 10, 0, 10, "x")
-    db.conn.execute("PRAGMA foreign_keys = OFF")
-    db.conn.execute("DELETE FROM individuals WHERE id=?", (gone,))
-    db.conn.commit()
-    return keep, gone
-
-
-def test_child_tables_are_discovered(journal):
-    tables = journal.repair.child_tables()
-    assert "individuals" not in tables
-    for expected in ("ledger", "loans", "savings", "christmas_savings",
-                     "benevolent_ledger", "benevolent_accounts", "loan_suspensions"):
-        assert expected in tables
-    # Tables without an individual_id are excluded.
-    assert "settings" not in tables and "journal_entries" not in tables
-
-
-def test_orphan_groups_and_deletion(journal):
-    _, gone = _make_orphans(journal)
-
-    groups = {t: journal.repair.orphan_groups(t) for t in journal.repair.child_tables()}
-    assert groups["savings"] == [(gone, 1, "2026-01-01", "2026-01-01")]
-    assert groups["ledger"] == [(gone, 1, "2026-01-01", "2026-01-01")]
-    assert groups["loans"] == []
-
-    assert len(journal.repair.orphan_frame("savings")) == 1
-    assert journal.repair.orphan_frame("loans").empty
-
-    with journal.transaction():
-        assert journal.repair.delete_orphans("savings") == 1
-        assert journal.repair.delete_orphans("loans") == 0
-    assert journal.repair.orphan_groups("savings") == []
-
-
-def test_null_member_rows_count_as_orphans(journal):
-    """Migration 004 makes individual_id NOT NULL, so this is only reachable on
-    a pre-004 journal — which is exactly what the repair tool is for."""
-    _relax_to_legacy_shape(journal)
-    journal.conn.execute("PRAGMA foreign_keys = OFF")
-    journal.conn.execute("INSERT INTO savings (individual_id, date, transaction_type, amount, "
-                         "balance) VALUES (NULL, '2026-01-01', 'Deposit', 5, 5)")
-    journal.conn.commit()
-    assert journal.repair.orphan_groups("savings") == [(None, 1, "2026-01-01", "2026-01-01")]
-
-
-def test_tables_without_a_date_column_report_none(journal):
-    _, gone = _make_orphans(journal)
-    journal.conn.execute("PRAGMA foreign_keys = OFF")
-    journal.conn.execute("INSERT INTO benevolent_accounts (individual_id, monthly_amount, "
-                         "active) VALUES (?, 50, 1)", (gone,))
-    journal.conn.commit()
-    assert journal.repair.orphan_groups("benevolent_accounts") == [(gone, 1, None, None)]
-
 
 # --------------------------------------------------------------------------- #
 # ImportHistoryRepository

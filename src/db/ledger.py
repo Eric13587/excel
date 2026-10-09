@@ -157,15 +157,6 @@ class LedgerRepository(Repository):
             "SELECT notes FROM ledger WHERE individual_id=? AND loan_id=? AND event_type=? "
             "ORDER BY date, id LIMIT 1", (member_id, loan_ref, event_type))
 
-    def members_in_batch(self, batch_id):
-        return [r[0] for r in
-                self._rows("SELECT DISTINCT individual_id FROM ledger WHERE batch_id=?", (batch_id,))]
-
-    def loans_in_batch(self, batch_id):
-        """(loan_ref, member_id) pairs touched by a mass run."""
-        return self._rows(
-            "SELECT DISTINCT loan_id, individual_id FROM ledger WHERE batch_id=?", (batch_id,))
-
     def earliest_date_for_members(self, member_ids):
         """Earliest activity across ledger and savings for one or more members.
 
@@ -323,9 +314,6 @@ class LedgerRepository(Repository):
 
     def delete(self, row_id):
         self._execute("DELETE FROM ledger WHERE id=?", (row_id,))
-
-    def delete_batch(self, batch_id):
-        self._execute("DELETE FROM ledger WHERE batch_id=?", (batch_id,))
 
     def delete_events(self, member_id, loan_ref, event_types):
         placeholders = ",".join("?" * len(event_types))

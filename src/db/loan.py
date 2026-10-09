@@ -250,14 +250,6 @@ class LoanRepository(Repository):
             "next_due_date=?, status='Active' WHERE id=?",
             (principal, unearned_interest, next_due_date, loan_id))
 
-    def set_healed_terms(self, loan_id, total_amount, installment, monthly_interest,
-                         unearned_interest):
-        """Terms re-derived from the issue note by the loan-heal tool."""
-        self._execute(
-            "UPDATE loans SET total_amount=?, installment=?, monthly_interest=?, "
-            "unearned_interest=? WHERE id=?",
-            (total_amount, installment, monthly_interest, unearned_interest, loan_id))
-
     def set_schedule_by_ref(self, member_id, ref, installment, monthly_interest):
         """Refresh the repayment schedule, keyed on (ref, member) — see D5.
 

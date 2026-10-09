@@ -5,7 +5,6 @@ mechanics — deposits, a monthly auto-contribution with Catch Up, and a running
 balance — but withdrawals are locked outside the configured unlock month
 (default December, setting ``christmas_unlock_month``).
 """
-import uuid
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
@@ -124,31 +123,3 @@ class ChristmasService:
             nxt += relativedelta(months=1)
             count += 1
         return count
-
-    def mass_catch_up(self, individual_ids, progress_callback=None, target_date=None):
-        """Catch up many members in one transaction. Returns (processed, total, batch_id, errors)."""
-        batch_id = str(uuid.uuid4())
-        processed = total = 0
-        errors = []
-        with self.db.transaction():
-            for i, ind in enumerate(individual_ids):
-                try:
-                    n = self.catch_up(ind, None, batch_id=batch_id, target_date=target_date)
-                    if n:
-                        processed += 1
-                        total += n
-                except Exception as e:
-                    errors.append((ind, str(e)))
-                if progress_callback:
-                    progress_callback(i, ind)
-        return processed, total, batch_id, errors
-
-    def revert_batch(self, batch_id):
-        """Undo a mass catch-up batch: delete its rows and recalc affected members."""
-        if not batch_id:
-            return False
-        affected = self.db.funds.members_in_batch(_TABLE, batch_id)
-        self.db.fund_delete_batch(_TABLE, batch_id)
-        for ind in affected:
-            self.db.fund_recalculate(_TABLE, ind)
-        return True

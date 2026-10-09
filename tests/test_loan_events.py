@@ -2,8 +2,7 @@
 
 The reconstruction is inference, not retrieval — terms have never been stored
 with history — so what matters is that the inference is principled and
-verifiable. These pin the principle; tools/replay_loans.py verifies the result
-against the whole production journal.
+verifiable. These pin the principle.
 """
 import os
 import sys

@@ -129,19 +129,6 @@ class FundRepository(Repository):
             params.extend(kinds)
         return self._dict(sql + " ORDER BY date DESC, id DESC LIMIT 1", tuple(params))
 
-    def members_in_batch(self, table, batch_id):
-        """Members touched by a mass run, for post-revert recalculation."""
-        t = self._table(table)
-        return [r[0] for r in
-                self._rows(f"SELECT DISTINCT individual_id FROM {t} WHERE batch_id=?", (batch_id,))]
-
-    def earliest_date_per_member_in_batch(self, table, batch_id):
-        """(member_id, earliest date) pairs — a member's next-due before the run."""
-        t = self._table(table)
-        return self._rows(
-            f"SELECT individual_id, MIN(date) FROM {t} WHERE batch_id=? GROUP BY individual_id",
-            (batch_id,))
-
     def add(self, table, member_id, date, transaction_type, amount, balance,
             notes="", batch_id=None):
         """Append a fund row with its running balance already computed."""
@@ -251,10 +238,6 @@ class FundRepository(Repository):
     def delete(self, table, row_id):
         t = self._table(table)
         self._execute(f"DELETE FROM {t} WHERE id=?", (row_id,))
-
-    def delete_batch(self, table, batch_id):
-        t = self._table(table)
-        self._execute(f"DELETE FROM {t} WHERE batch_id=?", (batch_id,))
 
     def delete_all_for_member(self, table, member_id):
         t = self._table(table)

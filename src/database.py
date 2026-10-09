@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import sqlite3
-import pandas as pd
 import json
 from datetime import datetime
 from contextlib import contextmanager
@@ -15,7 +14,7 @@ from src import migrations
 from src.db import import_rules
 from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
                     LedgerRepository, LoanRepository, MemberRepository,
-                    RepairRepository, SettingsRepository, SourceJournal)
+                    SettingsRepository, SourceJournal)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
@@ -70,7 +69,6 @@ class DatabaseManager:
         db.settings   settings
         db.imports    import_history
         db.audit      audit_log
-        db.repair     cross-table orphan queries
 
     ``SourceJournal`` wraps a *foreign* journal read-only during an import.
 
@@ -115,7 +113,6 @@ class DatabaseManager:
         self.funds = FundRepository(self.conn)
         self.loans = LoanRepository(self.conn)
         self.ledger = LedgerRepository(self.conn)
-        self.repair = RepairRepository(self.conn)
         self.imports = ImportHistoryRepository(self.conn)
         self.audit = AuditRepository(self.conn)
         if bootstrap == "auto" and self._is_empty_journal():
@@ -356,76 +353,6 @@ class DatabaseManager:
             dest.close()
         logger.info("Journal backed up to %s", dest_path)
         return dest_path
-
-    # ------------------------------------------------------------------
-    # Orphaned-record repair
-    #
-    # Legacy journals were written without foreign-key enforcement, so a
-    # deleted member could leave transactions behind in the child tables.
-    # Those orphans silently skew any aggregate that sums a child table
-    # directly, and they keep FK enforcement disabled (see
-    # _configure_connection). These methods power the guided repair tool.
-    # ------------------------------------------------------------------
-
-    def _tables_with_individual_id(self):
-        """All tables (except individuals) that carry an individual_id column."""
-        return self.repair.child_tables()
-
-    def find_orphaned_rows(self):
-        """Group child rows whose individual_id no longer exists.
-
-        A NULL individual_id also counts as orphaned — no row in a child
-        table is meaningful without a member.
-
-        Returns a list of dicts:
-            {table, individual_id, rows, first_date, last_date}
-        (dates are None for tables without a date column).
-        """
-        summary = []
-        for table in self.repair.child_tables():
-            for ind_id, n, first, last in self.repair.orphan_groups(table):
-                summary.append({"table": table, "individual_id": ind_id, "rows": n,
-                                "first_date": first, "last_date": last})
-        return summary
-
-    def export_orphaned_rows(self, path):
-        """Write an Excel audit workbook of every orphaned row.
-
-        Sheet 'Summary' lists the per-table/per-member groups; every table
-        with orphans gets its own sheet holding the complete rows. Returns
-        the number of data rows exported (excluding the summary).
-        """
-        summary = self.find_orphaned_rows()
-        total = 0
-        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
-            pd.DataFrame(summary, columns=["table", "individual_id", "rows",
-                                           "first_date", "last_date"]) \
-                .to_excel(writer, sheet_name="Summary", index=False)
-            for table in self.repair.child_tables():
-                df = self.repair.orphan_frame(table)
-                if not df.empty:
-                    df.to_excel(writer, sheet_name=table[:31], index=False)
-                    total += len(df)
-        logger.info("Exported %d orphaned row(s) to %s", total, path)
-        return total
-
-    def delete_orphaned_rows(self):
-        """Delete every orphaned row in a single transaction.
-
-        Matches find_orphaned_rows() exactly (NULL individual_id included).
-        Afterwards foreign-key enforcement is re-evaluated, so it switches on
-        immediately if the journal is now consistent.
-        Returns {table: rows_deleted} for tables that had orphans.
-        """
-        counts = {}
-        with self.transaction():
-            for table in self.repair.child_tables():
-                removed = self.repair.delete_orphans(table)
-                if removed:
-                    counts[table] = removed
-        logger.info("Deleted orphaned rows: %s", counts or "none")
-        self._evaluate_foreign_keys()
-        return counts
 
     def close(self):
         """Close the database connection.
@@ -1676,16 +1603,6 @@ class DatabaseManager:
         """Check if an individual has any active (outstanding) loans."""
         return self.loans.has_active(ind_id)
 
-    def delete_batch(self, batch_id):
-        """Delete all transactions associated with a batch_id from ledger."""
-        with self.transaction():
-            self.ledger.delete_batch(batch_id)
-
-    def delete_savings_batch(self, batch_id):
-        """Delete all transactions associated with a batch_id from savings."""
-        with self.transaction():
-            self.funds.delete_batch("savings", batch_id)
-
     # ========== SAVINGS OPERATIONS ==========
     
     def create_savings_table(self):
@@ -1852,14 +1769,6 @@ class DatabaseManager:
     def fund_delete_transaction(self, table, trans_id):
         """Delete a fund transaction and re-derive the running balances."""
         self._mutate_fund(table, trans_id, lambda: self.funds.delete(table, trans_id))
-
-    def fund_delete_batch(self, table, batch_id):
-        """Delete a whole batch and re-derive every affected member's balances."""
-        members = self.funds.members_in_batch(table, batch_id)
-        with self.transaction():
-            self.funds.delete_batch(table, batch_id)
-            for member_id in members:
-                self.funds.recalculate(table, member_id)
 
     def fund_delete_all(self, table, individual_id):
         with self.transaction():

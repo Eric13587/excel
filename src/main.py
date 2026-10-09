@@ -108,17 +108,13 @@ class MainApp(QMainWindow):
         # migration runs, keeping the last few copies.
         self.db = DatabaseManager(db_path, auto_backup=True)
         if not self.db.integrity_ok:
-            answer = QMessageBox.warning(
+            # SQLite's own check of the file failed: corruption, not bad data.
+            QMessageBox.warning(
                 self, "Database Warning",
-                "The integrity check on this journal reported problems.\n\n"
+                "SQLite's check of this journal file reported damage.\n\n"
                 "The journal was still opened so you can export your data, "
                 "but you should restore a recent backup from the 'backups' "
-                "folder next to the journal file as soon as possible.\n\n"
-                "Would you like to see what was found?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes)
-            if answer == QMessageBox.StandardButton.Yes:
-                self.show_health_check()
+                "folder next to the journal file as soon as possible.")
         # A migration that could not be applied leaves the journal on an older
         # schema — usable, but without cascading deletes or the new indexes.
         # Silent degradation is exactly what we must not do with a financial
@@ -129,9 +125,8 @@ class MainApp(QMainWindow):
                 f"This journal could not be brought fully up to date:\n\n"
                 f"{self.db.migration_report.summary()}\n\n"
                 "It has been opened on its existing schema and is safe to use, "
-                "but some integrity protections are not active.\n\n"
-                "Mass Operations \u2192 Journal Health Check shows the details, and "
-                "the Repair tools there can fix most causes.")
+                "but some integrity protections are not active. Sanitize the "
+                "journal's data, or restore a recent backup, and open it again.")
 
         # Persistent date defaults
         self.last_operation_date = QDate.currentDate()
@@ -246,27 +241,17 @@ class MainApp(QMainWindow):
 
         ops_menu = menubar.addMenu("&Operations")
         grid_action = self._menu_action(
-            ops_menu, "Fund Grid (bulk edit)…", d.open_fund_grid,
-            "Edit savings, Christmas and benevolent for every member in one table")
+            ops_menu, "Ledger Grid (bulk edit)…", d.open_fund_grid,
+            "Edit savings, Christmas, benevolent and loan deductions for every member "
+            "in one table — Fill Forward does what the mass operations did")
         grid_action.setShortcut(QKeySequence("Ctrl+G"))
-        ops_menu.addSeparator()
-        self._menu_action(ops_menu, "Mass Deduct (Loans)…", d.open_mass_deduction_dialog)
-        self._menu_action(ops_menu, "Mass Savings (Increments)…", d.open_mass_savings_dialog)
-        self._menu_action(ops_menu, "Mass Christmas (Contributions)…", d.open_mass_christmas_dialog)
-        self._menu_action(ops_menu, "Mass Benevolent (Deductions)…", d.open_mass_benevolent_dialog)
-        ops_menu.addSeparator()
-        self._menu_action(ops_menu, "Undo Last Mass Operation", d.undo_mass_operation)
 
         tools_menu = menubar.addMenu("&Tools")
         self._menu_action(tools_menu, "Settings…", self.open_settings,
                           "Organization, financial and appearance settings")
         tools_menu.addSeparator()
-        self._menu_action(tools_menu, "Repair Loans (legacy terms)…", d.open_repair_loans_dialog)
-        self._menu_action(tools_menu, "Repair Orphaned Records…", d.open_orphan_repair_dialog)
         self._menu_action(tools_menu, "Activity Log…", d.show_activity_log)
         self._menu_action(tools_menu, "Restore From Backup…", d.open_restore_dialog)
-        self._menu_action(tools_menu, "Journal Health Check…", self.show_health_check,
-                          "Run every integrity check on this journal")
 
         help_menu = menubar.addMenu("&Help")
         self._menu_action(help_menu, "About LoanMaster", self.show_about)
@@ -327,16 +312,6 @@ class MainApp(QMainWindow):
                         self.ledger_view.refresh_ledger()
             else:
                 QMessageBox.information(self, "Redo", "Nothing to redo.")
-
-    def show_health_check(self):
-        """Open the full journal integrity report.
-
-        Reachable from the startup warning and from Treasury, so the 35 checks
-        are usable without a terminal.
-        """
-        from src.theme import ThemeManager
-        from src.views.integrity_report import IntegrityReportDialog
-        IntegrityReportDialog(self.db, ThemeManager(self.db), self).exec()
 
     def show_dashboard(self):
         self.dashboard.refresh_list()

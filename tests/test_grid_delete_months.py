@@ -549,29 +549,3 @@ def test_undo_keeps_same_day_rows_in_their_order(env):
     fg.revert(db, SAVINGS, result)
     assert db.conn.execute("SELECT * FROM savings ORDER BY date, id").fetchall() == before
 
-
-def test_the_health_check_counts_missed_months_without_calling_them_gaps(env):
-    """A missed month was charged; a gap was not. The checker must agree with
-    §4.2 rather than report every deletion as uncharged interest."""
-    from src.integrity import PASS, verify
-
-    db, engine = env
-    _loan(db, engine)
-    ind = db.conn.execute("SELECT id FROM individuals").fetchone()[0]
-    _delete(db, engine, ind, ["2026-03"])
-    check = next(c for c in verify(db).checks
-                 if c.name == "deductions run without unexplained gaps")
-    assert check.status == PASS
-    assert "1 missed deduction(s) recorded" in check.detail
-
-
-def test_the_health_check_still_flags_a_month_never_charged(env):
-    from src.integrity import WARN, verify
-
-    db, engine = env
-    ind = _loan(db, engine)
-    db.conn.execute("DELETE FROM ledger WHERE individual_id=? AND date LIKE '2026-03%'",
-                    (ind,))
-    check = next(c for c in verify(db).checks
-                 if c.name == "deductions run without unexplained gaps")
-    assert check.status == WARN and "1 month(s)" in check.detail

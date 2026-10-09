@@ -89,19 +89,6 @@ def test_a_missing_member_is_refused_by_name(db):
 # Deciding vs doing
 # --------------------------------------------------------------------------- #
 
-def test_partition_splits_a_batch_without_running_it(db):
-    """A mass operation greys out who it cannot serve rather than failing
-    partway through."""
-    active = [_member(db, name=f"A{i}") for i in range(3)]
-    gone = [_member(db, RETIRED, name=f"R{i}") for i in range(2)]
-
-    allowed, blocked = default_policy.partition(
-        db, "savings.catch_up", active + gone)
-    assert sorted(allowed) == sorted(active)
-    assert sorted(m for m, _ in blocked) == sorted(gone)
-    assert all("has retired" in r.reason for _, r in blocked)
-
-
 def test_check_never_writes(db):
     ind = _member(db, RETIRED)
     before = db.conn.execute("SELECT COUNT(*) FROM savings").fetchone()[0]

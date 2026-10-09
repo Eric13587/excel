@@ -163,7 +163,7 @@ in the grid or Suspend in the ledger.
 |---|---|
 | A **buy-off** on or after the month | The settlement figure was worked out from a history that included this deduction. Reverse the buy-off in the member's ledger (Delete Last restores the loan) first. |
 | The deduction is the loan's last **deduction**, but a **top-up or restructure** follows it | The top-up re-termed the loan from the balance this deduction left. Un-running past it would put the due date before a re-terming; recording it as missed would charge the month's interest twice when it is next deducted. Remove the top-up in the ledger first, or keep this month. |
-| The loan **does not reconcile** with its own ledger (its rows already disagree with its schedule) | Every consequence above is worked out by re-deriving the loan, and this one cannot be re-derived: its cached balance would stop following its ledger. Repair it first (Mass Operations → Repair Loans). The same refusal applies to correcting a deduction or recording a missed month on such a loan. |
+| The loan **does not reconcile** with its own ledger (its rows already disagree with its schedule) | Every consequence above is worked out by re-deriving the loan, and this one cannot be re-derived: its cached balance would stop following its ledger. Correct its history in the member's ledger first. The same refusal applies to correcting a deduction or recording a missed month on such a loan. |
 
 A refusal holds back **all** of that loan's deletions in the save — half of a
 loan's months deleted is not what anybody asked for — and the other loans go

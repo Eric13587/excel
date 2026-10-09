@@ -740,15 +740,15 @@ def _unreconciled(db, member_id, ref):
     the loan (docs §4.2). A loan whose rows already disagree with its own
     schedule cannot be re-derived, so the consequences of the change could not
     be written — its cached balance would stop following its ledger. Refusing
-    is the honest answer; the repair tools are where such a loan is fixed.
+    is the honest answer; such a loan is corrected by hand.
     """
     from src.services.loan_projection import reconciles
     ok, why = reconciles(db, member_id, ref)
     if ok:
         return None
     return (f"{ref} does not reconcile with its own ledger ({why}), so what this "
-            f"change does to it cannot be worked out. Repair the loan first — Mass "
-            f"Operations → Repair Loans.")
+            f"change does to it cannot be worked out. Correct the loan's history in "
+            f"the member's ledger first.")
 
 
 def _batch_order(change):

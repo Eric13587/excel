@@ -10,7 +10,6 @@ Service Classes:
     - BalanceRecalculator: Balance computation operations
 """
 import logging
-import math
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -21,8 +20,7 @@ from src.db import position_from_frame
 
 from src.services import (LoanService, SavingsService, ChristmasService, BenevolentService,
                           BalanceRecalculator, TransactionManager)
-from src.services.undo_manager import (UndoManager, MassLoanCatchUpCommand, MassSavingsCatchUpCommand,
-                                        MassChristmasCatchUpCommand, MassBenevolentCatchUpCommand)
+from src.services.undo_manager import (UndoManager)
 
 
 
@@ -126,123 +124,6 @@ class LoanEngine:
     def recalculate_default_deduction(self, individual_id):
         return self.balance_recalculator.recalculate_default_deduction(individual_id)
 
-    # ------------------------------------------------------------------ #
-    # Loan healing — re-derive stored terms for loans created under older
-    # logic (the "delete + recreate to make it behave" problem), so their
-    # transactions compute with current logic. Only simple loans (no top-up /
-    # buy-off / edited repayments) are auto-healable.
-    # ------------------------------------------------------------------ #
-    def _loan_heal_plan(self, individual_id, loan_ref):
-        """Inspect one loan and return what healing it would change.
-
-        Returns a dict with keys: healable(bool), reason(str if not), changes
-        ({field:(old,new)}), contaminated_accruals(int). Pure inspection — no
-        writes. Healable = no top-up/buy-off and no manually-edited repayments,
-        with a parseable 'Loan Issued' note.
-        """
-        import re
-        lr = self.db.loans.terms(individual_id, loan_ref)
-        if not lr:
-            return {"healable": False, "reason": "loan not found"}
-        lid, cur_total, cur_inst, cur_mi = lr
-
-        if self.db.ledger.count_events(individual_id, loan_ref,
-                                       ("Loan Top-Up", "Loan Buyoff")) > 0:
-            return {"healable": False, "reason": "has top-up/buy-off", "loan_id": lid}
-        # Any nonzero is_edited means the repayment was edited/restructured. Some
-        # legacy rows store the amount there instead of 1, so test != 0, not = 1.
-        if self.db.ledger.count_edited(individual_id, loan_ref, "Repayment") > 0:
-            return {"healable": False, "reason": "has edited repayments", "loan_id": lid}
-
-        # Prefer the loan's own stored terms (migration 003). The issue note is
-        # only a fallback for loans whose note never parsed, because a term
-        # carried in prose changes whenever someone edits the note.
-        stored = self.db.loans.contract_terms(individual_id, loan_ref)
-        duration = rate = principal = None
-        if stored and stored[0] and stored[0] > 0:
-            duration, rate, principal = int(stored[0]), stored[1], float(stored[2] or 0)
-
-        if duration is None or not principal:
-            note = self.db.ledger.first_note(individual_id, loan_ref, "Loan Issued") or ""
-            mp = re.search(r"Principal:\s*([\d.]+)", note)
-            mi = re.search(r"Total Interest:\s*([\d.]+)", note)
-            md = re.search(r"Duration:\s*(\d+)", note)
-            if not (mp and mi and md and int(md.group(1)) > 0):
-                return {"healable": False, "reason": "no loan terms recorded", "loan_id": lid}
-            principal = float(mp.group(1))
-            interest = float(mi.group(1))
-            duration = int(md.group(1))
-        else:
-            interest = principal * (rate if rate is not None else DEFAULT_INTEREST_RATE)
-        total_amount = principal + interest                      # current creation logic
-        installment = math.ceil(total_amount / duration)
-        monthly_interest = math.ceil(interest / duration)
-
-        changes = {}
-        if round(float(cur_total or 0)) != round(total_amount):
-            changes["total_amount"] = (cur_total, total_amount)
-        if int(cur_inst or 0) != installment:
-            changes["installment"] = (cur_inst, installment)
-        if int(cur_mi or 0) != monthly_interest:
-            changes["monthly_interest"] = (cur_mi, monthly_interest)
-
-        contaminated = self.db.ledger.count_edited(individual_id, loan_ref,
-                                                  "Interest Earned", flag=1)
-
-        # monthly_interest is re-derived dynamically by recalc (and legitimately
-        # drifts from the static note formula), so it is NOT a heal trigger on its
-        # own — only the static terms and contaminated accruals are.
-        needs_heal = ("total_amount" in changes or "installment" in changes
-                      or contaminated > 0)
-
-        return {"healable": True, "loan_id": lid, "changes": changes,
-                "needs_heal": needs_heal, "contaminated_accruals": contaminated,
-                "derived": {"total_amount": total_amount, "installment": installment,
-                            "monthly_interest": monthly_interest, "unearned_interest": interest}}
-
-    def scan_healable_loans(self):
-        """All active loans needing a heal (stale terms or contaminated accruals).
-
-        Returns a list of dicts: {individual_id, name, ref, changes, contaminated_accruals}.
-        Read-only.
-        """
-        out = []
-        for ind, ref in self.db.loans.active_refs():
-            plan = self._loan_heal_plan(ind, ref)
-            if plan.get("healable") and plan.get("needs_heal"):
-                out.append({"individual_id": ind, "name": self.db.get_individual_name(ind),
-                            "ref": ref, "changes": plan["changes"],
-                            "contaminated_accruals": plan["contaminated_accruals"]})
-        return out
-
-    def heal_loan_terms(self, individual_id, loan_ref):
-        """Re-derive a simple loan's stored terms from its issue note (matching
-        current creation logic), clear contaminated accrual edit-locks, and
-        recompute its ledger. Returns the heal plan applied, or a dict with
-        healable=False. Caller should back up the DB first.
-        """
-        plan = self._loan_heal_plan(individual_id, loan_ref)
-        if not plan.get("healable"):
-            return plan
-        if not plan.get("needs_heal"):
-            return {**plan, "applied": False}  # already healthy (static terms OK)
-
-        d = plan["derived"]
-        self.db.loans.set_healed_terms(plan["loan_id"], d["total_amount"], d["installment"],
-                                       d["monthly_interest"], d["unearned_interest"])
-        # Clear edit-locks the old cross-member bug set on accruals so recalc
-        # re-derives them (safe: simple loans have no legitimate interest edits).
-        self.db.ledger.set_interest_lock(individual_id, loan_ref, locked=False)
-        self.db.conn.commit()
-
-        self.balance_recalculator.recalculate_loan_history(individual_id, loan_ref)
-        self.balance_recalculator.recalculate_balances(individual_id)
-        self.balance_recalculator.recalculate_default_deduction(individual_id)
-        return {**plan, "applied": True}
-
-
-
-
     def catch_up_loan(self, individual_id, loan_ref, target_date=None):
         """Deduct until the loan is caught up to ``target_date`` (default: today).
 
@@ -252,50 +133,6 @@ class LoanEngine:
         """
         return self.loan_service.catch_up_loan(individual_id, loan_ref,
                                                target_date=target_date)
-
-    def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None, target_date=None):
-        """Process multiple catch-up operations atomically with undo support.
-        
-        Delegates to LoanService via MassLoanCatchUpCommand.
-        """
-        # 1. Sanitize UI objects into simple data tuples
-        items = []
-        for item in loan_refs_and_ids:
-            if hasattr(item, "property"):
-                l_ref = item.property("loan_ref")
-                i_id = item.property("ind_id")
-                items.append((l_ref, i_id))
-            else:
-                items.append(item)
-        
-        # 2. Execute via UndoManager
-        command = MassLoanCatchUpCommand(self.loan_service, items, progress_callback, target_date=target_date)
-        success = self.undo_manager.execute(command)
-        
-        if success:
-            return command.result
-        else:
-            # If execution failed (callback exception etc), propagate error
-            # Or assume command handles it?
-            # Command execute returns True/False.
-            # But the service method might raise Exception (e.g. Canceled).
-            # If raised, manipulate success or re-raise?
-            # Command execute wraps heavily in try-except returning False?
-            # Actually catch_up raises on Cancel. Command.execute catches Exception and returns False.
-            # But user wants specific feedback "Canceled".
-            # If command catches it, caller gets (0,0).
-            # I should modify Command to propagate specific errors or handle them gracefully?
-            # The dashboard expects exceptions to detect Cancellation.
-            # So I should probably let the exception bubble up from command execution if specific types?
-            # My Command implementation catches generic Exception.
-            # I should probably update Command to re-raise Cancel?
-            # Or just check result (0,0) and assume failure?
-            # But "Canceled" needs distinct message.
-            # Let's simple raise if `success` is False and result is (0,0)?
-            # Or dashboard sees (0,0) and says "Nothing done."
-            pass
-            
-        return command.result
 
     def deduct_single_loan(self, individual_id, loan_ref):
         """Deduct installment for a single loan (Segregated P&I model).
@@ -599,41 +436,6 @@ class LoanEngine:
         return self.savings_service.catch_up_savings(individual_id, monthly_amount,
                                                      target_date=target_date)
 
-    def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None, target_date=None):
-        """Process multiple catch-up operations atomically with undo support.
-        
-        Delegates to SavingsService via MassSavingsCatchUpCommand.
-        """
-        items = []
-        for item in ind_ids_or_objects:
-            if hasattr(item, "property"):
-                i_id = item.property("ind_id")
-                items.append(i_id)
-            else:
-                items.append(item)
-        
-        command = MassSavingsCatchUpCommand(self.savings_service, items, progress_callback, target_date=target_date)
-        self.undo_manager.execute(command)
-        return command.result
-
-    def mass_catch_up_christmas(self, ind_ids_or_objects, progress_callback=None, target_date=None):
-        """Catch up the Christmas fund across members, with undo support.
-        Returns (processed, total, errors)."""
-        items = [i.property("ind_id") if hasattr(i, "property") else i for i in ind_ids_or_objects]
-        command = MassChristmasCatchUpCommand(self.christmas_service, items, progress_callback,
-                                              target_date=target_date)
-        self.undo_manager.execute(command)
-        return command.result
-
-    def mass_catch_up_benevolent(self, ind_ids_or_objects, progress_callback=None, target_date=None):
-        """Catch up the Benevolent fund across enrolled members, with undo support.
-        Returns (processed, total, errors)."""
-        items = [i.property("ind_id") if hasattr(i, "property") else i for i in ind_ids_or_objects]
-        command = MassBenevolentCatchUpCommand(self.benevolent_service, items, progress_callback,
-                                               target_date=target_date)
-        self.undo_manager.execute(command)
-        return command.result
-    
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual.
         

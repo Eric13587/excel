@@ -9,23 +9,21 @@ single-file "journal" database that can live on a shared drive.
 - **Members** — roster with PF/ID numbers, employment status, retirement
   tracking, and a Members List export (Excel / PDF / CSV).
 - **Loans** — issuance, monthly deductions, top-ups, restructuring, buyoff,
-  suspensions, catch-up runs, and repair/heal tools for legacy records.
-- **Savings** — deposits, withdrawals, interest, mass catch-up.
-- **Christmas & Benevolent funds** — separate ledgers with batch operations
-  and welfare payouts.
-- **General ledger** — double-entry journal with a standard SACCO chart of
-  accounts; member activity auto-posts as it happens.
+  suspensions and catch-up runs.
+- **Savings** — deposits, withdrawals, catch-up.
+- **Christmas & Benevolent funds** — separate ledgers with welfare payouts.
+- **Ledger Grid** — every member and month in one table for bulk work: type,
+  paste, operations (`@W=500`, `@T=20,000/12`), Fill Forward and month
+  deletion. It replaces the old mass operations.
 - **Reports** — quarterly interest reports, fund reports, financial
   statements (income statement / balance sheet / cash flow), member
   statements (PDF/Excel), SASRA loan-loss provisioning.
 - **Excel import** — roster and fund contributions, with duplicate
   detection, preview, and undo.
-- **Repair tools** — legacy loan-term healing and a guided orphaned-record
-  cleanup (audit export + safe delete) under Mass Operations.
 - **Organization branding** — set your organization's name and logo once
   (Settings → Organization); every statement, report and export carries it.
-- **Undo/redo** — Ctrl+Alt+Z / Ctrl+Alt+Y for most operations, including
-  mass operations.
+- **Undo/redo** — Ctrl+Alt+Z / Ctrl+Alt+Y for most ledger operations; the
+  Ledger Grid has its own Undo Last Save.
 - **Audit log** — CRUD audit trail with created/updated timestamps.
 
 ## Getting started (development)
@@ -65,10 +63,8 @@ artifacts on every push to `main`.
 - **Integrity check** — SQLite `quick_check` runs on open; problems are
   logged and surfaced in the UI without blocking data export.
 - **Foreign keys** — enforced on journals whose data passes a consistency
-  check; legacy journals with orphaned rows get a logged warning instead so
-  nothing breaks mid-write. Run *Mass Operations → Repair Orphaned Records*
-  to audit-export and remove such rows — enforcement switches on
-  immediately once the journal is clean.
+  check; a journal with orphaned rows gets a logged warning and must be
+  sanitized by hand.
 - **Logs** — rotating logs are written to the per-user state directory
   (`%LOCALAPPDATA%\LoanMaster\logs` on Windows,
   `~/.local/state/loanmaster/logs` on Linux). Uncaught errors show a dialog

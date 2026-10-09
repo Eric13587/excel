@@ -126,7 +126,10 @@ def test_the_counts_match_what_deletion_actually_removes(db):
         assert db.conn.execute(
             f"SELECT COUNT(*) FROM {table} WHERE individual_id=?", (ind,)).fetchone()[0] == 0
     assert sum(counts.values()) == 5
-    assert db.find_orphaned_rows() == []
+    for table in ("ledger", "loans", "savings", "christmas_savings", "benevolent_ledger"):
+        assert db.conn.execute(
+            f"SELECT COUNT(*) FROM {table} t WHERE NOT EXISTS "
+            f"(SELECT 1 FROM individuals i WHERE i.id = t.individual_id)").fetchone()[0] == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -81,8 +81,6 @@ class TestSavingsEnhancements(unittest.TestCase):
         
     def test_target_date_inclusive(self):
         """Test that explicit target date is inclusive."""
-        # Reset
-        self.db.delete_savings_batch("non-existent") # Just clear logic if needed, but easier to make new user
         u2 = self.db.add_individual("User 2", "222", "u2@test.com")
         self.service.add_deposit(u2, 1000, "2025-01-01", "Start")
         

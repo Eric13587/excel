@@ -7,14 +7,14 @@ The status was decoration.
 
 WHY A PIPELINE RATHER THAN `if` STATEMENTS
 ------------------------------------------
-The same question — *may this happen?* — is asked from eight catch-up entry
-points, the mass-operation dialogs, and every single-transaction path. Written
+The same question — *may this happen?* — is asked from the catch-up entry
+points, the Ledger Grid, and every single-transaction path. Written
 inline it would be eight copies drifting apart, each with its own message, and
 adding a rule would mean finding all of them. As a pipeline there is one list,
 one place to add a rule, and one place to read to know what the system refuses.
 
 It also separates *deciding* from *doing*. A rule is a pure function of
-(journal, operation) with no side effects, so the mass dialogs can ask
+(journal, operation) with no side effects, so the Ledger Grid can ask
 :meth:`Policy.check` to grey out ineligible members **before** running anything,
 and the services can call :meth:`Policy.enforce` at the point of writing. Same
 rules, same wording, two uses.
@@ -26,7 +26,7 @@ has retired must still be able to repay an outstanding loan and withdraw their
 savings, and the books must still be correctable. So the line is drawn at
 *creating new obligations*, not at touching the account:
 
-* **refused** — catch-up, mass deduction, a new loan, a new scheduled
+* **refused** — catch-up, a grid deduction, a new loan, a new scheduled
   contribution: all of these invent activity going forward;
 * **allowed** — repayments, withdrawals, payouts, edits and corrections.
 
@@ -201,22 +201,6 @@ class Policy:
         refusals = self.check(db, op)
         if refusals:
             raise OperationNotAllowed(refusals)
-
-    def partition(self, db, kind, member_ids, date=None):
-        """Split members into (allowed, [(member_id, refusal), ...]).
-
-        What a mass operation needs: run for those it may, and report the rest
-        rather than failing partway through a batch.
-        """
-        allowed, blocked = [], []
-        for member_id in member_ids:
-            refusals = self.check(db, Operation(kind, member_id=member_id, date=date))
-            if refusals:
-                blocked.append((member_id, refusals[0]))
-            else:
-                allowed.append(member_id)
-        return allowed, blocked
-
 
 #: The shared instance. A different rule set is only needed in tests.
 default_policy = Policy()

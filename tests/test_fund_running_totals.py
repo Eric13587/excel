@@ -154,22 +154,6 @@ def test_the_last_row_agrees_with_the_reported_balance(db, table, credit, _debit
     assert abs(running - reported) < 0.005
 
 
-def test_deleting_a_batch_reprices_every_member_it_touched(db):
-    ind_a = db.add_individual("A", "07", "a@x")
-    ind_b = db.add_individual("B", "07", "b@x")
-    for ind in (ind_a, ind_b):
-        db.fund_add_transaction("christmas_savings", ind, "2026-01-01", "Deposit", 500)
-        db.fund_add_transaction("christmas_savings", ind, "2026-02-01", "Deposit", 500,
-                                batch_id="BATCH-1")
-        db.fund_add_transaction("christmas_savings", ind, "2026-03-01", "Deposit", 500)
-
-    db.fund_delete_batch("christmas_savings", "BATCH-1")
-    for ind in (ind_a, ind_b):
-        assert [float(r["balance"]) for _, r
-                in db.fund_transactions("christmas_savings", ind).iterrows()] == [500, 1000]
-        _assert_consistent(db, "christmas_savings", ind)
-
-
 def test_appending_in_order_needs_no_repricing(db):
     """The common case must not pay for the rare one."""
     ind = db.add_individual("M", "07", "m@x")
