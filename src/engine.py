@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 from dateutil.relativedelta import relativedelta
 
 from src.config import DEFAULT_INTEREST_RATE
+from src.db import position_from_frame
 
 from src.services import (LoanService, SavingsService, ChristmasService, BenevolentService,
                           BalanceRecalculator, TransactionManager)
@@ -104,6 +105,15 @@ class LoanEngine:
     def get_ledger_df(self, individual_id, start_date=None, end_date=None):
         return self.db.get_ledger(individual_id, start_date, end_date)
 
+    def get_arrears(self, as_of=None):
+        """Every loan past its due date, as rows with days/instalments missed.
+
+        The population the dashboard's arrears tile counts, turned into
+        something readable. See :mod:`src.services.arrears`.
+        """
+        from src.services.arrears import get_arrears
+        return get_arrears(self.db, as_of)
+
     def add_loan_event(self, individual_id, principal, duration, date_str, interest_rate=None):
         """Issue a new loan (Segregated Principal & Interest model).
         
@@ -131,38 +141,39 @@ class LoanEngine:
         with a parseable 'Loan Issued' note.
         """
         import re
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT id, total_amount, installment, monthly_interest FROM loans "
-                    "WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
-        lr = cur.fetchone()
+        lr = self.db.loans.terms(individual_id, loan_ref)
         if not lr:
             return {"healable": False, "reason": "loan not found"}
         lid, cur_total, cur_inst, cur_mi = lr
 
-        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type IN ('Loan Top-Up','Loan Buyoff')", (individual_id, loan_ref))
-        if cur.fetchone()[0] > 0:
+        if self.db.ledger.count_events(individual_id, loan_ref,
+                                       ("Loan Top-Up", "Loan Buyoff")) > 0:
             return {"healable": False, "reason": "has top-up/buy-off", "loan_id": lid}
         # Any nonzero is_edited means the repayment was edited/restructured. Some
         # legacy rows store the amount there instead of 1, so test != 0, not = 1.
-        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Repayment' AND is_edited<>0", (individual_id, loan_ref))
-        if cur.fetchone()[0] > 0:
+        if self.db.ledger.count_edited(individual_id, loan_ref, "Repayment") > 0:
             return {"healable": False, "reason": "has edited repayments", "loan_id": lid}
 
-        cur.execute("SELECT notes FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Loan Issued' ORDER BY date, id LIMIT 1", (individual_id, loan_ref))
-        row = cur.fetchone()
-        note = row[0] if row else ""
-        mp = re.search(r"Principal:\s*([\d.]+)", note or "")
-        mi = re.search(r"Total Interest:\s*([\d.]+)", note or "")
-        md = re.search(r"Duration:\s*(\d+)", note or "")
-        if not (mp and mi and md and int(md.group(1)) > 0):
-            return {"healable": False, "reason": "no parseable issue note", "loan_id": lid}
+        # Prefer the loan's own stored terms (migration 003). The issue note is
+        # only a fallback for loans whose note never parsed, because a term
+        # carried in prose changes whenever someone edits the note.
+        stored = self.db.loans.contract_terms(individual_id, loan_ref)
+        duration = rate = principal = None
+        if stored and stored[0] and stored[0] > 0:
+            duration, rate, principal = int(stored[0]), stored[1], float(stored[2] or 0)
 
-        principal = float(mp.group(1))
-        interest = float(mi.group(1))
-        duration = int(md.group(1))
+        if duration is None or not principal:
+            note = self.db.ledger.first_note(individual_id, loan_ref, "Loan Issued") or ""
+            mp = re.search(r"Principal:\s*([\d.]+)", note)
+            mi = re.search(r"Total Interest:\s*([\d.]+)", note)
+            md = re.search(r"Duration:\s*(\d+)", note)
+            if not (mp and mi and md and int(md.group(1)) > 0):
+                return {"healable": False, "reason": "no loan terms recorded", "loan_id": lid}
+            principal = float(mp.group(1))
+            interest = float(mi.group(1))
+            duration = int(md.group(1))
+        else:
+            interest = principal * (rate if rate is not None else DEFAULT_INTEREST_RATE)
         total_amount = principal + interest                      # current creation logic
         installment = math.ceil(total_amount / duration)
         monthly_interest = math.ceil(interest / duration)
@@ -175,9 +186,8 @@ class LoanEngine:
         if int(cur_mi or 0) != monthly_interest:
             changes["monthly_interest"] = (cur_mi, monthly_interest)
 
-        cur.execute("SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Interest Earned' AND is_edited=1", (individual_id, loan_ref))
-        contaminated = cur.fetchone()[0]
+        contaminated = self.db.ledger.count_edited(individual_id, loan_ref,
+                                                  "Interest Earned", flag=1)
 
         # monthly_interest is re-derived dynamically by recalc (and legitimately
         # drifts from the static note formula), so it is NOT a heal trigger on its
@@ -197,9 +207,7 @@ class LoanEngine:
         Read-only.
         """
         out = []
-        cur = self.db.conn.cursor()
-        cur.execute("SELECT individual_id, ref FROM loans WHERE status='Active' ORDER BY individual_id, ref")
-        for ind, ref in cur.fetchall():
+        for ind, ref in self.db.loans.active_refs():
             plan = self._loan_heal_plan(ind, ref)
             if plan.get("healable") and plan.get("needs_heal"):
                 out.append({"individual_id": ind, "name": self.db.get_individual_name(ind),
@@ -220,15 +228,11 @@ class LoanEngine:
             return {**plan, "applied": False}  # already healthy (static terms OK)
 
         d = plan["derived"]
-        cur = self.db.conn.cursor()
-        cur.execute("UPDATE loans SET total_amount=?, installment=?, monthly_interest=?, "
-                    "unearned_interest=? WHERE id=?",
-                    (d["total_amount"], d["installment"], d["monthly_interest"],
-                     d["unearned_interest"], plan["loan_id"]))
+        self.db.loans.set_healed_terms(plan["loan_id"], d["total_amount"], d["installment"],
+                                       d["monthly_interest"], d["unearned_interest"])
         # Clear edit-locks the old cross-member bug set on accruals so recalc
         # re-derives them (safe: simple loans have no legitimate interest edits).
-        cur.execute("UPDATE ledger SET is_edited=0 WHERE individual_id=? AND loan_id=? "
-                    "AND event_type='Interest Earned'", (individual_id, loan_ref))
+        self.db.ledger.set_interest_lock(individual_id, loan_ref, locked=False)
         self.db.conn.commit()
 
         self.balance_recalculator.recalculate_loan_history(individual_id, loan_ref)
@@ -239,12 +243,15 @@ class LoanEngine:
 
 
 
-    def catch_up_loan(self, individual_id, loan_ref):
-        """Perform deductions until loan is caught up to current date.
-        
-        Delegates to LoanService.
+    def catch_up_loan(self, individual_id, loan_ref, target_date=None):
+        """Deduct until the loan is caught up to ``target_date`` (default: today).
+
+        Delegates to LoanService. The target is offered on every catch-up in the
+        application — a SACCO reconciling a past payroll run needs to stop at the
+        month that run covered, not at whatever today happens to be.
         """
-        return self.loan_service.catch_up_loan(individual_id, loan_ref)
+        return self.loan_service.catch_up_loan(individual_id, loan_ref,
+                                               target_date=target_date)
 
     def mass_catch_up_loans(self, loan_refs_and_ids, progress_callback=None, target_date=None):
         """Process multiple catch-up operations atomically with undo support.
@@ -309,9 +316,8 @@ class LoanEngine:
         
         # Need ledger context for running balances
         df = self.get_ledger_df(individual_id)
-        last_bal = df["balance"].iloc[-1] if not df.empty else 0.0
-        last_p_bal = df["principal_balance"].iloc[-1] if not df.empty and "principal_balance" in df else 0.0
-        last_i_bal = df["interest_balance"].iloc[-1] if not df.empty and "interest_balance" in df else 0.0
+        pos = position_from_frame(df, loan_ref)
+        last_bal, last_p_bal, last_i_bal = pos.balance, pos.principal_balance, pos.interest_balance
         
         # Load current loan state into variables to track simulation
         curr_loan_p_bal = loan['balance']
@@ -585,12 +591,13 @@ class LoanEngine:
         """
         return self.savings_service.get_suggested_increment(individual_id)
 
-    def catch_up_savings(self, individual_id, monthly_amount=None):
-        """Auto-increment savings from last entry up to (but not including) current month.
-        
+    def catch_up_savings(self, individual_id, monthly_amount=None, target_date=None):
+        """Auto-increment savings up to ``target_date`` (default: this month).
+
         Delegates to SavingsService.
         """
-        return self.savings_service.catch_up_savings(individual_id, monthly_amount)
+        return self.savings_service.catch_up_savings(individual_id, monthly_amount,
+                                                     target_date=target_date)
 
     def mass_catch_up_savings(self, ind_ids_or_objects, progress_callback=None, target_date=None):
         """Process multiple catch-up operations atomically with undo support.
@@ -751,9 +758,8 @@ class LoanEngine:
                     
                     # Update Loan Record (scope to this member — loan refs like
                     # L-001 are NOT unique across individuals).
-                    cursor = self.db.conn.cursor()
-                    cursor.execute("UPDATE loans SET installment = ?, monthly_interest = ? WHERE ref = ? AND individual_id = ?",
-                                   (new_installment, new_monthly_interest, loan_ref, individual_id))
+                    self.db.loans.set_schedule_by_ref(individual_id, loan_ref,
+                                                      new_installment, new_monthly_interest)
                     self.db.conn.commit()
                 else:
                     logger.warning("Transaction ID %s not found in ledger dataframe", trans_id)

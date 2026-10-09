@@ -36,6 +36,9 @@ def build():
         "--output-dir=build",              # Output directory
         "--output-filename=LoanMaster",    # Name of the executable
         "--include-data-dir=resources=resources", # Include resources folder
+        # Schema migrations are .sql data files; Nuitka compiles .py only,
+        # so without this the frozen build opens journals unmigrated.
+        "--include-data-dir=src/migrations=src/migrations",
         "loan.py"                          # Entry Point
     ]
     

@@ -18,6 +18,9 @@ class ReportGenerator:
     def __init__(self, db_manager, printer_view_getter=None):
         self.db = db_manager
         self.printer_view_getter = printer_view_getter
+        # Subtitle for PDFs that are an "as at" listing rather than a period
+        # report; see _export_to_pdf_titled.
+        self._pdf_period_override = None
 
     
     def _get_quarter_dates(self, start_date):
@@ -31,7 +34,7 @@ class ReportGenerator:
 
     def _get_fy_start_date(self, report_start_date):
         """Determine the Financial Year start date based on report date and settings."""
-        fy_start_month_name = self.db.get_setting("fy_start_month", "January")
+        fy_start_month_name = self.db.settings.fy_start_month
         try:
             fy_start_month_idx = datetime.strptime(fy_start_month_name, "%B").month
         except ValueError:
@@ -49,7 +52,7 @@ class ReportGenerator:
 
     def get_fy_start_month_index(self):
         """Get 1-based index of the Financial Year start month from settings."""
-        fy_start_month_name = self.db.get_setting("fy_start_month", "January")
+        fy_start_month_name = self.db.settings.fy_start_month
         try:
             return datetime.strptime(fy_start_month_name, "%B").month
         except ValueError:
@@ -65,15 +68,13 @@ class ReportGenerator:
             
         fy_start_idx = self.get_fy_start_month_index()
         
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT MIN(date) FROM (SELECT date FROM ledger UNION ALL SELECT date FROM savings)")
-        row = cursor.fetchone()
-        
+        earliest = self.db.ledger.earliest_date_overall()
+
         start_year = ref_date.year
-        if row and row[0]:
+        if earliest:
             try:
                 # Expecting YYYY-MM-DD
-                earliest_date = datetime.strptime(row[0][:10], "%Y-%m-%d")
+                earliest_date = datetime.strptime(earliest[:10], "%Y-%m-%d")
                 start_year = earliest_date.year
             except ValueError:
                 pass
@@ -126,7 +127,7 @@ class ReportGenerator:
         if start_date.day != 1:
             return False, "Start date must be the 1st day of the month."
             
-        fy_start_month_name = self.db.get_setting("fy_start_month", "January")
+        fy_start_month_name = self.db.settings.fy_start_month
         try:
             fy_start = datetime.strptime(fy_start_month_name, "%B").month
         except ValueError:
@@ -783,6 +784,84 @@ class ReportGenerator:
             return self._export_to_pdf(df, output_path, None, None, title=title, has_total_row=False)
         return self._export_to_excel(df, output_path, sheet_name=title, has_total_row=False)
 
+    # Arrears listing — the columns, in the order they are printed. Kept beside
+    # the report so the on-screen table and the exported file cannot drift.
+    ARREARS_COLUMNS = [
+        ("name", "Member"),
+        ("pf_no", "PF No"),
+        ("phone", "Phone"),
+        ("ref", "Loan"),
+        ("next_due_date", "Due Since"),
+        ("days", "Days"),
+        ("months_missed", "Missed"),
+        ("installment", "Instalment"),
+        ("overdue_amount", "Overdue (est.)"),
+        ("balance", "Balance"),
+        ("band", "Classification"),
+        ("status", "Status"),
+    ]
+
+    @staticmethod
+    def _arrears_status(row):
+        """The one-word state that explains why a loan is on this list."""
+        if row["suspended"]:
+            until = row["suspend_until"]
+            # "indefinite" is the word the Suspensions dialog already uses for a
+            # span with no end date; the two should not invent separate names.
+            return f"Suspended until {until}" if until else "Suspended (indefinite)"
+        if row["retired"]:
+            return "Retired"
+        return row["employment_status"] or "Active"
+
+    def generate_arrears_report(self, output_path, rows, as_of=None, title="Loans in Arrears"):
+        """Export arrears rows to Excel/PDF/CSV, chosen by file extension.
+
+        Takes the rows rather than fetching them, so what is printed is exactly
+        what the user was looking at — including any filtering they applied.
+        """
+        from src.services import arrears as arrears_service
+
+        as_of = as_of or datetime.now().strftime("%Y-%m-%d")
+        labels = [label for _key, label in self.ARREARS_COLUMNS]
+        table = [
+            {label: (self._arrears_status(row) if key == "status" else row[key])
+             for key, label in self.ARREARS_COLUMNS}
+            for row in rows
+        ]
+        df = pd.DataFrame(table, columns=labels)
+
+        if df.empty:
+            return False, "There are no loans in arrears to report."
+
+        # A totals line, because the first question asked of an arrears list is
+        # "how much?". Blank in the identity columns so it cannot read as a row.
+        totals = arrears_service.summarize(rows)
+        total_row = {label: "" for label in labels}
+        total_row["Member"] = f"TOTAL — {totals['members']} member(s), {totals['loans']} loan(s)"
+        total_row["Overdue (est.)"] = totals["overdue_amount"]
+        total_row["Balance"] = totals["balance"]
+        df.loc[len(df)] = total_row
+
+        subtitle = f"As at {as_of}"
+        if output_path.endswith(".csv"):
+            return self._export_to_csv(df, output_path)
+        if output_path.endswith(".pdf"):
+            return self._export_to_pdf_titled(df, output_path, title, subtitle)
+        return self._export_to_excel(df, output_path, sheet_name="Arrears")
+
+    def _export_to_pdf_titled(self, df, output_path, title, subtitle):
+        """PDF export whose subtitle is a plain string rather than a date range.
+
+        :meth:`_export_to_pdf` builds its own "Period: …" line from two dates,
+        which an as-at listing does not have.
+        """
+        original = self._pdf_period_override
+        self._pdf_period_override = subtitle
+        try:
+            return self._export_to_pdf(df, output_path, None, None, title=title)
+        finally:
+            self._pdf_period_override = original
+
     def _export_to_excel(self, df, output_path, sheet_name='Quarterly Report', has_total_row=True):
         """Export DataFrame to Excel with formatting.
 
@@ -792,8 +871,8 @@ class ReportGenerator:
         """
         try:
             # Get colors from settings
-            header_bg = self.db.get_setting("excel_header_bg", branding.EXCEL_HEADER_BG)
-            total_bg = self.db.get_setting("excel_total_bg", branding.EXCEL_TOTAL_BG)
+            header_bg = self.db.settings.excel_header_bg
+            total_bg = self.db.settings.excel_total_bg
             
             with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
                 df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -852,7 +931,7 @@ class ReportGenerator:
             html_table = df.to_html(index=False, classes='report-table', float_format=lambda x: "{:,.0f}".format(x) if isinstance(x, (int, float)) else str(x))
             
             # 2. Wrap in proper HTML with the shared letterhead + house style
-            period_str = ""
+            period_str = self._pdf_period_override or ""
             if start_date is not None and end_date is not None:
                 period_str = f"Period: {start_date.strftime('%b %Y')} - {end_date.strftime('%b %Y')}"
             # Only emphasise the last row when it's actually a TOTAL row.
@@ -955,214 +1034,3 @@ class ReportGenerator:
             return False, f"Report Generation Failed: {e}"
 
     
-    def generate_financial_statements(self, output_path, target_date_str=None, progress_callback=None):
-        """Generates the Income Statement, Balance Sheet & Cash Flow as PDF."""
-        try:
-            if not target_date_str:
-                target_date_str = datetime.now().strftime("%Y-%m-%d")
-                
-            # Derive the statements from the double-entry general ledger so the
-            # books balance by construction. This replaces the previous
-            # hand-assembled cash/equity equations (which were not guaranteed to
-            # tie out). sync() brings the GL current with ledger/savings first.
-            from src.services.gl_service import GLService
-            from src.services.provisioning import ProvisioningService
-            gl = GLService(self.db)
-            gl.sync(progress=progress_callback)
-
-            inc = gl.get_income_statement(None, target_date_str)
-            bs = gl.get_balance_sheet(target_date_str)
-            cf = gl.get_cash_flow(None, target_date_str)
-            net_surplus = inc['net_surplus']
-
-            # SASRA loan classification schedule (informational; the booked
-            # allowance, if any, already shows inside the balance sheet assets).
-            prov = ProvisioningService(self.db, gl).get_provisioning_summary(target_date_str)
-            allowance_booked = gl.get_account_balance("1190", target_date_str)
-            prov_rows = "".join(
-                f'<tr><td class="label">{b["bucket"]} '
-                f'<span style="color:#94a3b8;">({b["rate"]*100:.0f}%, {b["count"]} loans)</span></td>'
-                f'<td class="amount">{b["gross"]:,.2f}</td>'
-                f'<td class="amount">{b["net"]:,.2f}</td>'
-                f'<td class="amount">{b["provision"]:,.2f}</td></tr>'
-                for b in prov['bands']
-            )
-
-            # Cash flow statement sections (Operating / Lending / Financing).
-            cf_section_html = ""
-            for sec in cf['sections']:
-                cf_section_html += f'<tr><td class="section-title" colspan="2">{sec["label"]}</td></tr>'
-                if sec['lines']:
-                    for l in sec['lines']:
-                        cf_section_html += (f'<tr><td class="label">{l["name"]}</td>'
-                                            f'<td class="amount">{l["amount"]:,.2f}</td></tr>')
-                else:
-                    cf_section_html += '<tr><td class="label">No movement</td><td class="amount">0.00</td></tr>'
-                cf_section_html += (f'<tr class="total-row"><td class="label">Net cash from {sec["label"]}</td>'
-                                    f'<td class="amount">{sec["subtotal"]:,.2f}</td></tr>')
-
-            def _rows(lines, empty_label):
-                if not lines:
-                    return f'<tr><td class="label">{empty_label}</td><td class="amount">0.00</td></tr>'
-                return "".join(
-                    f'<tr><td class="label">{l["name"]}</td>'
-                    f'<td class="amount">{l["amount"]:,.2f}</td></tr>'
-                    for l in lines
-                )
-
-            if bs['is_balanced']:
-                balance_banner = (
-                    '<div style="margin-top:10px;padding:8px;border-radius:5px;text-align:center;'
-                    'background:#dcfce7;color:#166534;font-weight:bold;">'
-                    'Balance check: Assets = Liabilities + Equity ✓</div>'
-                )
-            else:
-                balance_banner = (
-                    '<div style="margin-top:10px;padding:8px;border-radius:5px;text-align:center;'
-                    'background:#fee2e2;color:#991b1b;font-weight:bold;">'
-                    'Balance check FAILED — books do not tie; investigate before relying on this.</div>'
-                )
-
-            # Render HTML
-            html = f"""
-            <!DOCTYPE html>
-            <html>
-                <head>
-                    <style>
-                        body {{ font-family: 'Helvetica', Arial, sans-serif; padding: 30px; font-size: 14px; color: #333; }}
-                        {branding.LETTERHEAD_CSS}
-                        h3 {{ color: #0f172a; border-bottom: 2px solid #cbd5e1; padding-bottom: 5px; font-size: 18px; margin-top: 30px; }}
-                        table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
-                        td {{ padding: 8px 5px; border-bottom: 1px dotted #e2e8f0; }}
-                        .label {{ width: 70%; }}
-                        .amount {{ width: 30%; text-align: right; font-family: 'Courier New', Courier, monospace; }}
-                        .total-row td {{ font-weight: bold; border-top: 2px solid #333; border-bottom: 2px double #333; background: #f8fafc; font-size: 15px; }}
-                        .section-title {{ font-weight: bold; padding-top: 15px; color: #475569; }}
-                    </style>
-                </head>
-                <body>
-                    {branding.letterhead_html(self.db, "Institutional Financial Statements", f"Report up to: {target_date_str}")}
-
-                    <h3>I. INCOME STATEMENT (P&amp;L)</h3>
-                    <table>
-                        <tr><td class="section-title" colspan="2">Revenues</td></tr>
-                        {_rows(inc['revenue'], 'No recorded income')}
-                        <tr class="total-row"><td class="label">Total Revenue</td><td class="amount">{inc['total_revenue']:,.2f}</td></tr>
-
-                        <tr><td class="section-title" colspan="2">Operating Expenses</td></tr>
-                        {_rows(inc['expenses'], 'No recorded expenses')}
-                        <tr class="total-row"><td class="label">Total Expenses</td><td class="amount">{inc['total_expenses']:,.2f}</td></tr>
-                        <tr style="height: 20px;"><td colspan="2"></td></tr>
-                        <tr class="total-row" style="color: {'#166534' if net_surplus >= 0 else '#991b1b'};"><td class="label">NET SURPLUS (PROFIT)</td><td class="amount">{net_surplus:,.2f}</td></tr>
-                    </table>
-
-                    <div style="page-break-before: always;"></div>
-
-                    <h3>II. BALANCE SHEET (as of {target_date_str})</h3>
-                    <table>
-                        <tr><td class="section-title" colspan="2">ASSETS</td></tr>
-                        {_rows(bs['assets'], 'No assets')}
-                        <tr class="total-row"><td class="label">TOTAL ASSETS</td><td class="amount">{bs['total_assets']:,.2f}</td></tr>
-
-                        <tr><td class="section-title" colspan="2">LIABILITIES</td></tr>
-                        {_rows(bs['liabilities'], 'No liabilities')}
-                        <tr class="total-row"><td class="label">Total Liabilities</td><td class="amount">{bs['total_liabilities']:,.2f}</td></tr>
-
-                        <tr><td class="section-title" colspan="2">EQUITY</td></tr>
-                        {_rows(bs['equity'], 'No equity')}
-                        <tr class="total-row"><td class="label">Total Equity</td><td class="amount">{bs['total_equity']:,.2f}</td></tr>
-
-                        <tr style="height: 20px;"><td colspan="2"></td></tr>
-                        <tr class="total-row"><td class="label">TOTAL LIABILITIES &amp; EQUITY</td><td class="amount">{bs['total_liabilities_and_equity']:,.2f}</td></tr>
-                    </table>
-                    {balance_banner}
-
-                    <div style="page-break-before: always;"></div>
-
-                    <h3>III. LOAN CLASSIFICATION &amp; PROVISIONING (SASRA)</h3>
-                    <table>
-                        <tr><td class="section-title">Classification</td><td class="amount">Gross Outstanding</td><td class="amount">Net of Deposits</td><td class="amount">Provision</td></tr>
-                        {prov_rows}
-                        <tr class="total-row"><td class="label">TOTAL PORTFOLIO</td><td class="amount">{prov['total_gross']:,.2f}</td><td class="amount">{prov['total_net']:,.2f}</td><td class="amount">{prov['total_provision']:,.2f}</td></tr>
-                    </table>
-                    <table>
-                        <tr><td class="label">Portfolio at Risk (&gt; 30 days)</td><td class="amount">{prov['par_ratio']*100:.1f}%</td></tr>
-                        <tr><td class="label">Required Provision</td><td class="amount">{prov['total_provision']:,.2f}</td></tr>
-                        <tr><td class="label">Allowance Booked in Ledger</td><td class="amount">{allowance_booked:,.2f}</td></tr>
-                        <tr class="total-row"><td class="label">Shortfall / (Excess) to Book</td><td class="amount">{prov['total_provision'] - allowance_booked:,.2f}</td></tr>
-                    </table>
-
-                    <div style="page-break-before: always;"></div>
-
-                    <h3>IV. CASH FLOW STATEMENT (to {target_date_str})</h3>
-                    <table>
-                        {cf_section_html}
-                        <tr style="height: 15px;"><td colspan="2"></td></tr>
-                        <tr class="total-row"><td class="label">NET CHANGE IN CASH</td><td class="amount">{cf['net_change']:,.2f}</td></tr>
-                        <tr><td class="label">Opening Cash Balance</td><td class="amount">{cf['opening_cash']:,.2f}</td></tr>
-                        <tr class="total-row"><td class="label">CLOSING CASH BALANCE</td><td class="amount">{cf['closing_cash']:,.2f}</td></tr>
-                    </table>
-
-                    <div style="margin-top: 40px; font-size: 11px; text-align: center; color: #64748b;">Generated securely by LoanMaster Treasury Engine on {datetime.now().strftime('%Y-%m-%d %H:%M')}</div>
-                </body>
-            </html>
-            """
-            
-            # Print PDF
-            from PyQt6.QtCore import QMarginsF, QEventLoop, QTimer
-            from PyQt6.QtGui import QPageLayout, QPageSize
-            
-            if not self.printer_view_getter:
-                return False, "PDF printer view unavailable."
-                
-            web_view = self.printer_view_getter()
-            if not web_view:
-                 return False, "Printer View not initialized."
-                 
-            web_view.setHtml(html)
-            
-            loop = QEventLoop()
-            
-            try: web_view.loadFinished.disconnect()
-            except Exception: pass
-            web_view.loadFinished.connect(loop.quit)
-
-            # Timeout so a failed load can't hang the UI; stopped afterwards
-            # so it cannot fire into the print wait below and cut it short.
-            load_timer = QTimer()
-            load_timer.setSingleShot(True)
-            load_timer.timeout.connect(loop.quit)
-            load_timer.start(5000)
-            loop.exec()
-            load_timer.stop()
-
-            pdf_print_success = [False]
-            pdf_print_message = [""]
-            
-            def print_finished(path, success):
-                pdf_print_success[0] = success
-                if not success:
-                    pdf_print_message[0] = "Failed to write PDF file (maybe permission issue)."
-                loop.quit()
-                
-            try: web_view.page().pdfPrintingFinished.disconnect()
-            except Exception: pass
-            
-            page_layout = QPageLayout(
-                QPageSize(QPageSize.PageSizeId.A4),
-                QPageLayout.Orientation.Portrait,
-                QMarginsF(15, 15, 15, 15)
-            )
-            
-            web_view.page().pdfPrintingFinished.connect(print_finished)
-            web_view.page().printToPdf(output_path, page_layout)
-            
-            loop.exec()
-            
-            if pdf_print_success[0]:
-                return True, "Institutional Statement Generated Successfully."
-            else:
-                return False, pdf_print_message[0]
-                
-        except Exception as e:
-            return False, f"Balance Sheet Generation Failed: {e}"

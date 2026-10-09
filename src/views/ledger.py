@@ -1,4 +1,5 @@
 """LedgerView for managing individual loan ledgers."""
+import logging
 import math
 from datetime import datetime
 
@@ -8,7 +9,7 @@ from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel,
                              QMessageBox, QMenu, QDialog,
                              QFormLayout, QDateEdit, QSpinBox, QDialogButtonBox,
                              QHeaderView, QSplitter, QProgressDialog, QApplication,
-                             QTabWidget, QDoubleSpinBox)
+                             QTabWidget, QDoubleSpinBox, QRadioButton, QButtonGroup)
 from PyQt6.QtGui import QAction, QColor, QShortcut, QKeySequence
 from PyQt6.QtCore import Qt, QDate, QTimer
 
@@ -16,6 +17,9 @@ from PyQt6.QtCore import Qt, QDate, QTimer
 from ..theme import ThemeManager
 from ..engine import LoanEngine
 from ..exceptions import ChristmasLockedError
+from ..money import format_money
+
+logger = logging.getLogger(__name__)
 
 
 class LedgerView(QWidget):
@@ -284,7 +288,7 @@ class LedgerView(QWidget):
         loans = self.engine.db.get_active_loans(self.current_individual_id)
         today = datetime.now().strftime("%Y-%m-%d")
         for loan in loans:
-            item_text = f"{loan['ref']} | Bal: {loan['balance']:.2f} | Due: {loan['next_due_date']}"
+            item_text = f"{loan['ref']} | Bal: {format_money(loan['balance'])} | Due: {loan['next_due_date']}"
             list_item = QListWidgetItem(item_text)
             if loan['next_due_date'] < today:
                 list_item.setForeground(QColor(self.theme_manager.get_color('danger')))
@@ -314,12 +318,6 @@ class LedgerView(QWidget):
         for loan_ref in sorted_loan_ids:
             group = loan_groups.get_group(loan_ref).sort_values(by=['date', 'id'])
             
-            # Find latest repayment ID for this group to enforce edit constraints
-            repayments = group[group['event_type'] == "Repayment"]
-            latest_repayment_id = -1
-            if not repayments.empty:
-                latest_repayment_id = repayments.iloc[-1]['id'] # Since sorted ascending
-            
             group_box = QGroupBox()
             group_layout = QVBoxLayout()
             header_layout = QHBoxLayout()
@@ -333,7 +331,9 @@ class LedgerView(QWidget):
             title_text = f"<b>Loan Reference: {loan_ref}</b>"
             if loan_info and loan_info.get('is_suspended', 0):
                 suspend_until = loan_info.get('suspend_until', '')
-                suffix = f" until {suspend_until}" if suspend_until else ""
+                # No end date is a state, not a missing value: say so, or the
+                # header reads the same as a suspension that ends by itself.
+                suffix = f" until {suspend_until}" if suspend_until else " \u2014 until resumed"
                 title_text = f"<b style='color: #F59E0B;'>Loan Reference: {loan_ref} (\u23f8 SUSPENDED{suffix})</b>"
             elif is_overdue:
                 title_text = f"<b style='color: {self.theme_manager.get_color('danger')};'>Loan Reference: {loan_ref} (OVERDUE)</b>"
@@ -377,6 +377,18 @@ class LedgerView(QWidget):
                     suspend_btn.clicked.connect(lambda checked, lid=loan_info['id'], ref=loan_ref: self.suspend_loan_dialog(lid, ref))
                     header_layout.addWidget(suspend_btn)
 
+                # Recorded suspensions had no route out of the application: a
+                # backdated one leaves is_suspended clear, so Resume never
+                # appears for it. Shown only when there is something to manage.
+                if loan_info and self.engine.db.get_loan_suspensions_for_loan(loan_info['id']):
+                    spans_btn = QPushButton("Suspensions")
+                    spans_btn.setStyleSheet(self.theme_manager.outline_button_css("warning", padding="4px 8px"))
+                    spans_btn.setToolTip("View or remove recorded suspension periods")
+                    spans_btn.clicked.connect(
+                        lambda checked, lid=loan_info['id'], ref=loan_ref:
+                        self.manage_suspensions_dialog(lid, ref))
+                    header_layout.addWidget(spans_btn)
+
                 # Order: Catch Up (1) -> Top-Up (2) -> Delete (3) -> Deduct (4) -> Auto (5) -> Undo (6)
 
                 catch_up_btn = QPushButton("Catch Up")
@@ -395,6 +407,9 @@ class LedgerView(QWidget):
                 buyoff_btn = QPushButton("Buyoff")
                 buyoff_btn.setStyleSheet(f"background-color: {self.theme_manager.get_color('purple')}; color: white;")
                 buyoff_btn.clicked.connect(lambda checked, ref=loan_ref: self.buyoff_loan_btn(ref))
+                if loan_info and loan_info.get('status') != 'Active':
+                    buyoff_btn.setEnabled(False)
+                    buyoff_btn.setToolTip(f"Loan is {loan_info.get('status')} — buyoff not permitted")
                 header_layout.addWidget(buyoff_btn)
                 
                 delete_loan_btn = QPushButton("Delete Loan")
@@ -460,14 +475,17 @@ class LedgerView(QWidget):
                 if i == 0:
                     self.running_gross_map = {} # Helper if needed, but simple var works
                     self.current_gross = 0.0
-                    
+                    # Gross-up multiplier from the configurable org interest
+                    # rate (default 0.15 -> x 1.15, the previous hardcode).
+                    self._gross_mult = 1 + self.engine.db.settings.default_interest_rate
+
                 if event == "Loan Issued":
                     prin_delta = added
-                    # Gross = Principal + 15% Interest
-                    self.current_gross += added * 1.15 
+                    # Gross = Principal + interest at the configured rate
+                    self.current_gross += added * self._gross_mult
                 elif event == "Loan Top-Up":
                     prin_delta = added
-                    self.current_gross += added * 1.15
+                    self.current_gross += added * self._gross_mult
                 elif event == "Interest Earned":
                     int_delta = added  # Accrual
                     # Internal accounting, doesn't change Gross Obligation
@@ -482,25 +500,25 @@ class LedgerView(QWidget):
                     if deducted > 0: payment = deducted
                     # Unknown events usually don't affect standard Gross logic unless restructuring
                 
-                # Format to show signs
-                p_text = f"{prin_delta:+.0f}" if prin_delta != 0 else "-"
-                i_text = f"{int_delta:+.0f}" if int_delta != 0 else "-"
-                pay_text = f"{payment:,.0f}" if payment != 0 else "-"
-                
+                # Format to show signs (thousands-separated like the balances)
+                p_text = f"{prin_delta:+,.0f}" if prin_delta != 0 else "-"
+                i_text = f"{int_delta:+,.0f}" if int_delta != 0 else "-"
+                pay_text = format_money(payment) if payment != 0 else "-"
+
                 table.setItem(i, 3, QTableWidgetItem(p_text))
                 table.setItem(i, 4, QTableWidgetItem(i_text))
                 table.setItem(i, 5, QTableWidgetItem(pay_text))
-                
+
                 # Balances
                 p_bal = float(row.get('principal_balance', 0))
                 i_bal = float(row.get('interest_balance', 0))
-                
-                table.setItem(i, 6, QTableWidgetItem(f"{p_bal:,.0f}"))
-                table.setItem(i, 7, QTableWidgetItem(f"{i_bal:,.0f}"))
-                
+
+                table.setItem(i, 6, QTableWidgetItem(format_money(p_bal)))
+                table.setItem(i, 7, QTableWidgetItem(format_money(i_bal)))
+
                 # Total Balance (Gross Obligation) v2
                 # Use the simulated value
-                table.setItem(i, 8, QTableWidgetItem(f"{self.current_gross:,.0f}"))
+                table.setItem(i, 8, QTableWidgetItem(format_money(self.current_gross)))
                 
                 table.setItem(i, 9, QTableWidgetItem(str(row['notes'])))
                 
@@ -510,21 +528,30 @@ class LedgerView(QWidget):
                 table.item(i, 1).setFlags(no_edit)
                 table.item(i, 2).setFlags(no_edit)
                 
-                # Make all columns no_edit by default
+                # Make all columns no_edit by default, and right-align the money
+                # columns so figures line up by place value and are scannable.
                 for c in range(3, 9):
                     table.item(i, c).setFlags(no_edit)
+                    table.item(i, c).setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 
-                # Payment Editable Logic
+                # Any repayment may be edited, not only the newest.
+                #
+                # The old restriction existed because editing an earlier one
+                # corrupted everything after it: the amount changed while the
+                # principal/interest split it had been given did not, and every
+                # recalculator then replayed that stale split. Editing the first
+                # of four repayments left the three below it untouched.
+                #
+                # DatabaseManager.update_transaction now clears the split and
+                # re-derives the loan, so an edit anywhere in the history
+                # reprices the rows below it. The columns that hold derived
+                # values (Prin. Bal, Int. Bal, Total Bal) stay read-only — they
+                # are results, not inputs.
                 if row['event_type'] == "Repayment":
-                     # Payment is col 5
-                     # Only allow if it is the latest repayment
-                     current_id = int(row['id'])
-                     if current_id == latest_repayment_id:
-                        table.item(i, 5).setFlags(edit_flag)
-                     else:
-                        table.item(i, 5).setFlags(no_edit)
-                        # Optional: Add tooltip or style to indicate locked?
-                        table.item(i, 5).setToolTip("Only the latest repayment can be edited.")
+                    table.item(i, 5).setFlags(edit_flag)
+                    table.item(i, 5).setToolTip(
+                        "Editing this repayment re-derives every row below it.")
 
                 # Color logic
                 if row['event_type'] == 'Loan Issued':
@@ -547,6 +574,12 @@ class LedgerView(QWidget):
                     for c in range(10):
                          table.item(i, c).setBackground(bg_color)
                          table.item(i, c).setForeground(fg_color)
+
+            # Show the periods where deductions were skipped, in place. Without
+            # this a suspension is invisible in the one view where its effect is
+            # obvious — a gap in the dates — and the gap looks like missing data.
+            if loan_ref != "-" and loan_info:
+                self._insert_suspension_markers(table, loan_info.get('id'), loan_ref)
 
             table.itemChanged.connect(self.on_item_changed)
             table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -571,7 +604,7 @@ class LedgerView(QWidget):
         self.refresh_benevolent()
 
         name = self.engine.db.get_individual_name(self.current_individual_id)
-        self.title_label.setText(f"<b>Ledger for {name} | Total Debt: {total_balance:.2f}</b>")
+        self.title_label.setText(f"<b>Ledger for {name} | Total Debt: {format_money(total_balance)}</b>")
 
     # ==================================================================== #
     # Shared helpers for the fund tabs
@@ -1082,7 +1115,11 @@ class LedgerView(QWidget):
     def buyoff_loan_btn(self, loan_ref):
         """Show dialog to buyoff/settle the loan fully."""
         loan = self.engine.db.get_loan_by_ref(self.current_individual_id, loan_ref)
-        if not loan: return
+        if not loan:
+            return
+        if loan.get('status') != 'Active':
+            QMessageBox.warning(self, "Loan Inactive", f"Loan '{loan_ref}' is already {loan.get('status')}.")
+            return
         
         principal = loan['balance']
         accrued = loan.get('interest_balance', 0.0)
@@ -1102,15 +1139,28 @@ class LedgerView(QWidget):
                                        
         if confirm == QMessageBox.StandardButton.Yes:
             # Use default date logic (Next Due Date) from LoanService
-            if self.engine.buyoff_loan(self.current_individual_id, loan_ref, None):
-                QMessageBox.information(self, "Success", "Loan Paid Off Successfully!")
-                self.refresh_table()
-                self.refresh_loans_list()
-            else:
-                QMessageBox.warning(self, "Error", "Could not process buyoff.")
+            try:
+                if self.engine.buyoff_loan(self.current_individual_id, loan_ref, None):
+                    QMessageBox.information(self, "Success", "Loan Paid Off Successfully!")
+                    self.refresh_table()
+                    self.refresh_loans_list()
+                else:
+                    QMessageBox.warning(self, "Error", "Could not process buyoff.")
+            except Exception as e:
+                from src.views.error_handling import report
+                report(e, parent=self, context=f"loan buyoff for '{loan_ref}'")
 
     def suspend_loan_dialog(self, loan_id, loan_ref):
-        """Suspend a loan for N months — ongoing, or backdated as a past event."""
+        """Suspend a loan — for N months, or open-ended until somebody resumes it.
+
+        The two are genuinely different decisions. A fixed period is a plan with
+        an end date the software can act on by itself: catch-up auto-resumes at
+        the boundary and the statement says when deductions restart. An
+        open-ended suspension is a hold of unknown length — payroll stopped, a
+        member is on unpaid leave — and it stays in force until a person ends
+        it, which is why it is offered rather than forcing a guessed end date
+        that would silently start deducting again.
+        """
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Suspend Loan {loan_ref}")
         dialog.setMinimumWidth(360)
@@ -1122,6 +1172,9 @@ class LedgerView(QWidget):
 
         start_input = QDateEdit()
         start_input.setCalendarPopup(True)
+        # Same format the rest of the app's date pickers use — "9/1/26" left it
+        # to the reader to guess whether that was September or January.
+        start_input.setDisplayFormat("yyyy-MM-dd")
         # Default to where the loan actually is (its next due date), so
         # "suspend for N months" means the loan's next N due months — even when
         # back-filling a loan whose next due is in the past.
@@ -1131,10 +1184,33 @@ class LedgerView(QWidget):
         start_input.setDate(start_qdate if start_qdate.isValid() else QDate.currentDate())
         form.addRow("Suspended from:", start_input)
 
+        # Fixed-period vs open-ended. The radios are kept together so exactly
+        # one can be chosen, and the months box follows the choice rather than
+        # sitting there enabled but meaningless.
+        fixed_radio = QRadioButton("For a set number of months")
+        fixed_radio.setChecked(True)
+        indefinite_radio = QRadioButton("Until I resume it")
+        mode_group = QButtonGroup(dialog)
+        mode_group.addButton(fixed_radio)
+        mode_group.addButton(indefinite_radio)
+
         months_spin = QSpinBox()
         months_spin.setRange(1, 60)
         months_spin.setValue(3)
-        form.addRow("Suspend for (months):", months_spin)
+        months_spin.setSuffix(" month(s)")
+
+        fixed_row = QHBoxLayout()
+        fixed_row.setContentsMargins(0, 0, 0, 0)
+        fixed_row.addWidget(fixed_radio)
+        fixed_row.addWidget(months_spin)
+        fixed_row.addStretch()
+        form.addRow("Suspend:", fixed_row)
+        form.addRow("", indefinite_radio)
+
+        indefinite_radio.setToolTip(
+            "No end date. Deductions stay paused — and the term keeps extending "
+            "— until you press Resume on this loan.")
+        fixed_radio.toggled.connect(months_spin.setEnabled)
 
         layout.addLayout(form)
 
@@ -1144,15 +1220,46 @@ class LedgerView(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        # What each choice means, updated live, because "until I resume it" has
+        # a consequence (nothing restarts deductions on its own) that the label
+        # alone does not carry.
+        effect = QLabel()
+        effect.setWordWrap(True)
+        effect.setStyleSheet(self.theme_manager.hint_css())
+
+        def describe_effect():
+            if indefinite_radio.isChecked():
+                effect.setText(
+                    "⏸  Open-ended: deductions stay paused until you press Resume. "
+                    "Catch-up and Deduct stay disabled on this loan, and the term "
+                    "extends for every month skipped.")
+            else:
+                end = start_input.date().addMonths(months_spin.value())
+                effect.setText(
+                    f"⏸  Deductions resume automatically from "
+                    f"{end.toString('d MMM yyyy')} — {months_spin.value()} month(s) skipped.")
+
+        indefinite_radio.toggled.connect(describe_effect)
+        months_spin.valueChanged.connect(describe_effect)
+        start_input.dateChanged.connect(describe_effect)
+        describe_effect()
+        layout.addWidget(effect)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            months = months_spin.value()
+            indefinite = indefinite_radio.isChecked()
+            months = None if indefinite else months_spin.value()
             start_str = start_input.date().toString("yyyy-MM-dd")
-            end_str = start_input.date().addMonths(months).toString("yyyy-MM-dd")
+            # None is the stored form of "no end date" (loans.suspend_until is
+            # nullable), and every consumer — catch-up, statements, the event
+            # replay — already reads it that way.
+            end_str = None if indefinite else start_input.date().addMonths(months).toString("yyyy-MM-dd")
+            window_str = (f"on or after {start_str}" if indefinite
+                          else f"between {start_str} and {end_str}")
             today_str = QDate.currentDate().toString("yyyy-MM-dd")
 
             # If the window already has deductions, recording a suspension on its
@@ -1165,19 +1272,32 @@ class LedgerView(QWidget):
                 ind_id = self.current_individual_id
                 if self.engine.loan_service.has_loan_restructure_events(ind_id, loan_ref):
                     proceed = QMessageBox.question(self, "Deductions Found in Period",
-                        f"{existing} deduction(s) exist for {loan_ref} between {start_str} and "
-                        f"{end_str}, and this loan has top-ups / buy-offs so it can't be "
+                        f"{existing} deduction(s) exist for {loan_ref} {window_str}, "
+                        f"and this loan has top-ups / buy-offs so it can't be "
                         f"auto-rebuilt.\n\nRecord the suspension as a note only (it may "
                         f"contradict those deductions)?",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                     if proceed != QMessageBox.StandardButton.Yes:
                         return
                 else:
-                    choice = QMessageBox.question(self, "Apply Suspension to Schedule",
+                    # A rebuild does not surgically remove the window's rows: it
+                    # deletes every Repayment and Interest Earned row on the loan
+                    # and re-derives the whole schedule. Say so, with the real
+                    # count, because "rebuild" does not read as "delete payments"
+                    # and the operation cannot be undone.
+                    total_rows = self.engine.db.ledger.count_events(
+                        self.current_individual_id, loan_ref,
+                        ("Repayment", "Interest Earned"))
+                    choice = QMessageBox.question(self, "Rebuild Schedule — Deletes Entries",
                         f"There {'is' if existing == 1 else 'are'} {existing} deduction(s) recorded "
-                        f"for {loan_ref} between {start_str} and {end_str}.\n\n"
-                        f"Rebuild the loan's schedule to remove those deductions and apply the "
-                        f"suspension (the loan term extends accordingly)?\n\n"
+                        f"for {loan_ref} {window_str}.\n\n"
+                        f"To apply the suspension, this loan's schedule must be rebuilt. "
+                        f"That deletes ALL {total_rows} repayment and interest entries on "
+                        f"{loan_ref} — not only the {existing} in this window — and re-creates "
+                        f"them from the issue date, skipping the suspended months. The loan "
+                        f"term extends accordingly.\n\n"
+                        f"Any manual edits to those entries will be lost, and this cannot be "
+                        f"undone. A backup is saved first.\n\n"
                         f"Yes = rebuild and apply    No = just record a note on statements",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                         | QMessageBox.StandardButton.Cancel)
@@ -1188,17 +1308,35 @@ class LedgerView(QWidget):
             kind = self.engine.db.record_suspension(loan_id, start_str, end_str, today=today_str)
 
             if apply_rebuild:
+                before = self.engine.db.ledger.count_events(
+                    self.current_individual_id, loan_ref, ("Repayment", "Interest Earned"))
+                backup = self._backup_before("rebuild", loan_ref)
+                if backup is False:
+                    return                      # backup failed; the user was told
                 try:
-                    self.engine.loan_service.rebuild_loan_schedule(self.current_individual_id, loan_ref)
+                    created = self.engine.loan_service.rebuild_loan_schedule(
+                        self.current_individual_id, loan_ref)
+                    after = self.engine.db.ledger.count_events(
+                        self.current_individual_id, loan_ref, ("Repayment", "Interest Earned"))
                     QMessageBox.information(self, "Suspension Applied",
-                        f"Rebuilt {loan_ref}: deductions for the suspended months were removed "
-                        f"and the loan term extended accordingly.")
+                        f"Rebuilt {loan_ref}.\n\n"
+                        f"Entries before: {before}\nEntries now: {after}\n"
+                        f"Deductions re-created: {created}\n\n"
+                        f"The suspended months are skipped and the loan term extends "
+                        f"accordingly."
+                        + (f"\n\nBackup saved to:\n{backup}" if backup else ""))
                 except ValueError as e:
                     QMessageBox.warning(self, "Rebuild Skipped", str(e))
             elif kind == 'historical':
                 QMessageBox.information(self, "Past Suspension Recorded",
                     f"Recorded a past suspension for {loan_ref} from {start_str} to {end_str}.\n"
                     f"It will appear as a no-deductions period on statements covering it.")
+            elif indefinite:
+                QMessageBox.information(self, "Suspended Indefinitely",
+                    f"Loan {loan_ref} is suspended from {start_str} with no end date.\n\n"
+                    f"Deductions will keep being skipped — and the term keep extending — "
+                    f"until you press Resume on this loan. Nothing will restart them "
+                    f"automatically.")
             else:
                 QMessageBox.information(self, "Suspended",
                     f"Loan {loan_ref} suspended from {start_str} until {end_str}.\n"
@@ -1206,12 +1344,276 @@ class LedgerView(QWidget):
             self.refresh_table()
             self.refresh_loans_list()
 
+    def _backup_before(self, what, loan_ref):
+        """Snapshot the journal before an irreversible operation.
+
+        Returns the path, or False if it could not be written — in which case
+        the caller must abort, because the point of the snapshot is that the
+        operation is otherwise unrecoverable.
+        """
+        try:
+            return self.engine.db.snapshot(f"{what}-{loan_ref}")
+        except Exception as e:                      # noqa: BLE001 - report, don't crash
+            logger.warning("Could not back up before %s: %s", what, e)
+            QMessageBox.warning(
+                self, "Backup Failed",
+                f"Could not save a backup before this change:\n{e}\n\n"
+                f"The operation has not been performed. Free some disk space or "
+                f"check permissions on the 'backups' folder, then try again.")
+            return False
+
+    def _insert_suspension_markers(self, table, loan_id, loan_ref):
+        """Draw each recorded suspension as a band in the loan's own table.
+
+        A suspension shows up in the ledger as a gap in the dates and nothing
+        else, which reads as missing data rather than a decision somebody took.
+        The band says what happened, for how long, and offers the way out right
+        where the question occurs — rather than behind a button in a header that
+        gives no clue there is anything to look at.
+
+        The row is spanned and non-selectable so it cannot be mistaken for a
+        transaction; `on_item_changed` already ignores it, because a marker has
+        no id cell.
+        """
+        if not loan_id:
+            return
+        try:
+            spans = self.engine.db.get_loan_suspensions_for_loan(loan_id)
+        except Exception:                       # noqa: BLE001 - decoration only
+            logger.exception("Could not read suspensions for loan %s", loan_id)
+            return
+        if not spans:
+            return
+
+        for span in sorted(spans, key=lambda sp: str(sp["start_date"]), reverse=True):
+            start = str(span["start_date"])
+            until = span["suspend_until"]
+            # Sit the band immediately before the first row dated on or after
+            # the suspension started, which is where the gap opens.
+            position = table.rowCount()
+            for row in range(table.rowCount()):
+                cell = table.item(row, 0)
+                if cell and cell.text() >= start:
+                    position = row
+                    break
+
+            table.insertRow(position)
+            months = self._months_between(start, until)
+            label = (f"⏸  Deductions suspended from {start}"
+                     + (f" to {until}" if until else " (no end date)")
+                     + (f"  ·  {months} month(s) skipped" if months else ""))
+            if span["status"] == "active":
+                label += "  ·  currently suspended"
+
+            text = QTableWidgetItem(label)
+            text.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            text.setToolTip("Recorded on " + str(span.get("created_at") or "an unknown date")
+                            + ".\nUse Clear to remove this suspension.")
+            table.setItem(position, 0, text)
+            table.setSpan(position, 0, 1, 9)
+
+            clear = QPushButton("Clear")
+            clear.setToolTip("Remove this suspension. You will be asked whether the "
+                             "skipped months should now be deducted.")
+            clear.setStyleSheet(self.theme_manager.button_css("warning", padding="2px 8px"))
+            clear.clicked.connect(
+                lambda _checked, sid=span["id"], ref=loan_ref: self._clear_suspension(sid, ref))
+            table.setCellWidget(position, 9, clear)
+
+            band = QColor(self.theme_manager.get_color("bg_header"))
+            text.setBackground(band)
+            text.setForeground(QColor(self.theme_manager.get_color("text_secondary")))
+
+    @staticmethod
+    def _months_between(start, until):
+        """Whole months a suspension covers, or None when it is open-ended."""
+        if not until:
+            return None
+        try:
+            a = datetime.strptime(str(start)[:10], "%Y-%m-%d")
+            b = datetime.strptime(str(until)[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            return None
+        return max(0, (b.year - a.year) * 12 + b.month - a.month)
+
+    def _clear_suspension(self, suspension_id, loan_ref):
+        """Remove one suspension from the band in the table.
+
+        Asks the same question the Suspensions dialog asks, because the answer
+        matters either way: removing the record and re-collecting the months are
+        different acts, and doing the second silently would charge a member for
+        months somebody decided to waive.
+        """
+        span = self.engine.db.loans.suspension(suspension_id)
+        if span is None:
+            self.refresh_table()
+            return
+        until = span["suspend_until"] or "no end date"
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Clear Suspension")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"Clear the suspension on {loan_ref} from "
+                    f"{span['start_date']} to {until}?")
+        box.setInformativeText("What should happen to the months it skipped?")
+        keep = box.addButton("Leave them skipped", QMessageBox.ButtonRole.AcceptRole)
+        collect = box.addButton("Deduct them now", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (keep, collect):
+            return
+
+        rebuild = clicked is collect
+        if rebuild and self._backup_before("clear-suspension", loan_ref) is False:
+            return
+        try:
+            _span, created = self.engine.loan_service.remove_suspension(
+                self.current_individual_id, loan_ref, suspension_id, rebuild=rebuild)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot Rebuild", str(e))
+            return
+        self.refresh_table()
+        self.refresh_loans_list()
+        if rebuild:
+            QMessageBox.information(
+                self, "Suspension Cleared",
+                f"{loan_ref} was rebuilt — {created} deduction(s) now cover the period.")
+
+    def manage_suspensions_dialog(self, loan_id, loan_ref):
+        """List a loan's recorded suspensions, and remove one.
+
+        There was previously no way to see or undo these. A backdated span whose
+        window has already closed leaves the loan's `is_suspended` flag clear —
+        correctly, since the loan is not suspended now — so the Resume button
+        never appears for it and the record was permanent, with catch-up
+        skipping its months indefinitely.
+        """
+        from PyQt6.QtWidgets import QDialogButtonBox
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Suspensions — {loan_ref}")
+        dialog.setMinimumSize(620, 340)
+        layout = QVBoxLayout(dialog)
+
+        blurb = QLabel(
+            "Periods when deductions were skipped for this loan. Removing one "
+            "means it never applied, so future catch-ups will deduct those "
+            "months again — it does not restore months already skipped (use "
+            "Suspend → rebuild for that). Resuming, by contrast, ends a "
+            "suspension and leaves its months skipped.")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet(self.theme_manager.hint_css())
+        layout.addWidget(blurb)
+
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["From", "Until", "Status", "Resumed", "Recorded"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(table)
+
+        spans = []
+
+        def reload_spans():
+            spans.clear()
+            spans.extend(self.engine.db.get_loan_suspensions_for_loan(loan_id))
+            table.setRowCount(len(spans))
+            for row, sp in enumerate(spans):
+                cells = (sp["start_date"], sp["suspend_until"] or "indefinite",
+                         "live" if sp["status"] == "active" else "ended",
+                         sp["resumed_date"] or "—", str(sp.get("created_at") or "")[:10])
+                for col, value in enumerate(cells):
+                    table.setItem(row, col, QTableWidgetItem(str(value)))
+            remove_btn.setEnabled(bool(spans))
+
+        def remove_selected():
+            selected = table.selectedItems()
+            if not selected:
+                QMessageBox.information(dialog, "No Selection",
+                                        "Select a suspension to remove.")
+                return
+            span = spans[selected[0].row()]
+            until = span["suspend_until"] or "indefinite"
+            live = span["status"] == "active"
+            # Removing the record and re-collecting the months are different
+            # acts. Conflating them is how a member ends up double-charged or
+            # quietly let off, so the choice is put in front of the user.
+            box = QMessageBox(dialog)
+            box.setWindowTitle("Remove Suspension")
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f"Remove the suspension on {loan_ref} from "
+                        f"{span['start_date']} to {until}?")
+            box.setInformativeText(
+                ("This is the live suspension, so the loan will no longer be "
+                 "suspended.\n\n" if live else "")
+                + "What should happen to the months it skipped?")
+            keep = box.addButton("Leave them skipped", QMessageBox.ButtonRole.AcceptRole)
+            collect = box.addButton("Deduct them now", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            keep.setToolTip("The record goes; the loan keeps its extended term.")
+            collect.setToolTip("Rebuild the schedule so those months are collected.")
+            box.setDefaultButton(keep)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked not in (keep, collect):
+                return
+
+            rebuild = clicked is collect
+            if rebuild:
+                backup = self._backup_before("remove-suspension", loan_ref)
+                if backup is False:
+                    return
+            try:
+                _span, created = self.engine.loan_service.remove_suspension(
+                    self.current_individual_id, loan_ref, span["id"], rebuild=rebuild)
+            except ValueError as e:
+                QMessageBox.warning(dialog, "Cannot Rebuild", str(e))
+                return
+            reload_spans()
+            self.refresh_table()
+            self.refresh_loans_list()
+            if rebuild:
+                QMessageBox.information(
+                    dialog, "Suspension Removed",
+                    f"The suspension was removed and {loan_ref}'s schedule "
+                    f"rebuilt — {created} deduction(s) now cover the period.")
+
+        buttons = QHBoxLayout()
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.setStyleSheet(self.theme_manager.button_css("danger"))
+        remove_btn.clicked.connect(remove_selected)
+        buttons.addWidget(remove_btn)
+        buttons.addStretch()
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_box.rejected.connect(dialog.reject)
+        buttons.addWidget(close_box)
+        layout.addLayout(buttons)
+
+        reload_spans()
+        if not spans:
+            QMessageBox.information(self, "No Suspensions",
+                                    f"No suspensions have been recorded for {loan_ref}.")
+            return
+        dialog.exec()
+
     def resume_loan_btn(self, loan_id):
-        """Resume a suspended loan."""
+        """Resume a suspended loan.
+
+        The months already skipped stay skipped either way — resuming ends the
+        suspension, it does not backfill it — so the confirmation says so
+        rather than leaving the user to find out from the balance.
+        """
+        span = self.engine.db.loans.open_suspension(loan_id)
+        since = f" It has been suspended since {span['start_date']}." if span else ""
         confirm = QMessageBox.question(self, "Resume Loan",
-            "Are you sure you want to resume deductions for this loan?",
+            f"Resume deductions for this loan?{since}\n\n"
+            "The months it skipped stay skipped and the term stays extended; "
+            "only future months are deducted again.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        
+
         if confirm == QMessageBox.StandardButton.Yes:
             self.engine.db.resume_loan(loan_id)
             QMessageBox.information(self, "Resumed", "Loan deductions have been resumed.")
@@ -1329,7 +1731,6 @@ class LedgerView(QWidget):
                         # Adding this difference to another date applies the same relative shift (e.g. +1 month).
                         
                         # Batch Update
-                        cursor = self.engine.db.conn.cursor()
                         
                         for i in range(row, total_rows):
                             r_id = table.item(i, 2).data(Qt.ItemDataRole.UserRole)
@@ -1345,7 +1746,7 @@ class LedgerView(QWidget):
                             n_date_obj = r_old + shift_delta
                             n_date_str = n_date_obj.strftime("%Y-%m-%d")
                             
-                            cursor.execute("UPDATE ledger SET date = ? WHERE id = ?", (n_date_str, r_id))
+                            self.db.ledger.set_date(r_id, n_date_str)
                         
                         self.engine.db.conn.commit()
                         self.engine.recalculate_balances(self.current_individual_id)
@@ -1383,9 +1784,51 @@ class LedgerView(QWidget):
                      table.blockSignals(False)
                      return
                  
-                 # Special logic for Payment Amount
+                 # Special logic for Payment Amount.
+                 #
+                 # Editing a repayment re-derives every row below it on the loan
+                 # (DatabaseManager.update_transaction clears the split and
+                 # replays), so a stray keystroke here silently reprices the
+                 # loan's whole history. Confirm the change, show its scope, and
+                 # snapshot the journal first — the same safety the rebuild and
+                 # delete paths already get.
+                 from PyQt6.QtCore import QTimer
+                 tx = self.engine.get_transaction(trans_id)
+                 old_amount = float(tx['deducted']) if tx else 0.0
+
+                 def _revert_repayment():
+                     # Redraw from the DB so the cell matches stored state.
+                     table.blockSignals(False)
+                     QTimer.singleShot(0, self.refresh_table)
+
+                 # Re-entering the same value is a no-op: don't back up and
+                 # re-derive for a change that isn't one.
+                 if abs(new_amount - old_amount) < 0.005:
+                     _revert_repayment()
+                     return
+
+                 loan_ref = table.item(row, 2).text()
+                 rows_below = table.rowCount() - row - 1
+                 confirm = QMessageBox.question(
+                     self, "Change this repayment?",
+                     f"Change this repayment from {old_amount:,.0f} to "
+                     f"{new_amount:,.0f}?\n\n"
+                     f"This re-derives the {rows_below} entr"
+                     f"{'y' if rows_below == 1 else 'ies'} below it on this "
+                     f"loan — their balances and interest split are recalculated. "
+                     f"A backup is saved first.",
+                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                     QMessageBox.StandardButton.No)
+                 if confirm != QMessageBox.StandardButton.Yes:
+                     _revert_repayment()
+                     return
+
+                 if self._backup_before("edit-repayment", loan_ref) is False:
+                     _revert_repayment()     # backup failed; the user was told
+                     return
+
                  self.engine.update_repayment_amount(self.current_individual_id, trans_id, new_amount, notes)
-                 
+
             else:
                  # Generic Edit fallback (Date, Notes, or weird edits)
                  # Reconstruct added/deducted
@@ -1433,7 +1876,7 @@ class LedgerView(QWidget):
             deduction = self.engine.add_loan_event(self.current_individual_id, p, d, dt, interest_rate)
             self.refresh_table()
             self.refresh_loans_list()
-            QMessageBox.information(self, "Success", f"New Monthly Deduction: {deduction:.2f}")
+            QMessageBox.information(self, "Success", f"New Monthly Deduction: {format_money(deduction)}")
         except ValueError:
             QMessageBox.critical(self, "Error", "Please enter valid numbers.")
 
@@ -1448,18 +1891,42 @@ class LedgerView(QWidget):
             QMessageBox.warning(self, "Warning", "Could not process deduction.")
 
     def delete_loan_btn(self, loan_ref):
-        confirm = QMessageBox.question(self, "Confirm Delete", 
-                                       f"Delete loan {loan_ref} and ALL its history?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if confirm == QMessageBox.StandardButton.Yes:
-            self.engine.delete_loan(self.current_individual_id, loan_ref)
-            self.refresh_table()
-            self.refresh_loans_list()
+        ind = self.current_individual_id
+        entries = self.engine.db.ledger.count_events(
+            ind, loan_ref, ("Loan Issued", "Loan Top-Up", "Interest Earned",
+                            "Repayment", "Loan Buyoff"))
+        loan = self.engine.db.get_loan_by_ref(ind, loan_ref)
+        outstanding = float((loan or {}).get("balance") or 0)
+
+        confirm = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Permanently delete loan {loan_ref} and all {entries} of its ledger "
+            f"entries?\n\n"
+            + (f"This loan still shows {format_money(outstanding)} outstanding.\n\n"
+               if abs(outstanding) > 0.005 else "")
+            + "The member's other loans and savings are not affected. This cannot "
+              "be undone; a backup is saved first.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        backup = self._backup_before("delete-loan", loan_ref)
+        if backup is False:
+            return                              # backup failed; the user was told
+        self.engine.delete_loan(ind, loan_ref)
+        self.refresh_table()
+        self.refresh_loans_list()
+        if backup:
+            QMessageBox.information(
+                self, "Loan Deleted",
+                f"Loan {loan_ref} and its {entries} entries were deleted.\n\n"
+                f"A backup was saved to:\n{backup}")
 
 
 
     def loans_catch_up_to_current(self, loan_ref=None):
-        """Run auto deductions for all active loans from next_due_date to current month (exclusive)."""
+        """Run auto deductions for active loans up to a month the user chooses."""
         active_loans = self.engine.db.get_active_loans(self.current_individual_id)
         if loan_ref:
             active_loans = [l for l in active_loans if l['ref'] == loan_ref]
@@ -1472,10 +1939,20 @@ class LedgerView(QWidget):
             return
         
         from dateutil.relativedelta import relativedelta
-        
-        # Target: last day of previous month
-        current_month_start = datetime.now().replace(day=1)
-        to_date = (current_month_start - relativedelta(days=1)).strftime("%Y-%m-%d")
+
+        from src.views.catch_up_target import ask_catch_up_target
+
+        # Which month to stop at. It used to be "the month before today" with no
+        # say in it, which invents deductions nobody took when the SACCO is
+        # reconciling an older payroll run.
+        target = ask_catch_up_target(
+            self, what="loan deductions",
+            default=datetime.now() - relativedelta(months=1),
+            hint="Deductions are created for every due month up to and including "
+                 "this one. Set it to the month your last payroll run covered.")
+        if target is None:
+            return
+        to_date = (target.replace(day=1) + relativedelta(months=1, days=-1)).strftime("%Y-%m-%d")
         
         total_deductions = 0
         loans_processed = 0
@@ -1486,8 +1963,17 @@ class LedgerView(QWidget):
         progress.setMinimumDuration(0)
         progress.show()
         
+        # Qt trap: QProgressDialog.close() sets the cancellation flag, so
+        # asking wasCanceled() *after* closing reports a successful run as
+        # cancelled — which is what put "Operation cancelled" in front of users
+        # who had just watched it finish. Verified: wasCanceled() is False after
+        # a completed loop and True immediately after close(). Capture the
+        # answer while the loop is still running.
+        cancelled = False
+
         for i, loan in enumerate(active_loans):
             if progress.wasCanceled():
+                cancelled = True
                 break
                 
             progress.setLabelText(f"Processing {loan['ref']}...")
@@ -1506,7 +1992,7 @@ class LedgerView(QWidget):
         
         progress.close()
         
-        if progress.wasCanceled():
+        if cancelled:
             self.refresh_table()
             self.refresh_loans_list()
             QMessageBox.information(self, "Cancelled", f"Operation cancelled. Processed {total_deductions} deductions.")
@@ -2336,7 +2822,6 @@ class LedgerView(QWidget):
                         from datetime import datetime as dt
                         
                         base_date = dt.strptime(new_date, "%Y-%m-%d")
-                        cursor = self.db.conn.cursor()
                         
                         # Update all rows from current to end
                         for i in range(row, total_rows):
@@ -2346,10 +2831,9 @@ class LedgerView(QWidget):
                             row_amount = float(table.item(i, 3).text().replace(',', ''))
                             row_notes = table.item(i, 5).text()
                             
-                            cursor.execute("""
-                                UPDATE savings SET date=?, amount=?, notes=? WHERE id=?
-                            """, (calc_date, row_amount, row_notes, row_trans_id))
-                        
+                            self.db.funds.update("savings", row_trans_id, calc_date,
+                                                 row_amount, row_notes)
+
                         self.db.conn.commit()
                         self.db.recalculate_savings_balances(self.current_individual_id)
                         table.blockSignals(False)
@@ -2358,11 +2842,7 @@ class LedgerView(QWidget):
                         return
             
             # Update the single transaction
-            cursor = self.db.conn.cursor()
-            cursor.execute("""
-                UPDATE savings SET date=?, amount=?, notes=? WHERE id=?
-            """, (new_date, new_amount, new_notes, trans_id))
-            self.db.conn.commit()
+            self.db.update_savings_transaction(trans_id, new_date, new_amount, new_notes)
             
             # Recalculate balances
             self.db.recalculate_savings_balances(self.current_individual_id)
@@ -2441,9 +2921,7 @@ class LedgerView(QWidget):
                                        f"Delete ALL {len(savings_df)} savings entries?\nThis cannot be undone!",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if confirm == QMessageBox.StandardButton.Yes:
-            cursor = self.db.conn.cursor()
-            cursor.execute("DELETE FROM savings WHERE individual_id=?", (self.current_individual_id,))
-            self.db.conn.commit()
+            self.db.fund_delete_all("savings", self.current_individual_id)
             self.refresh_table()
             self.refresh_savings_balance()
             QMessageBox.information(self, "Success", "All savings entries deleted.")
@@ -2521,9 +2999,26 @@ class LedgerView(QWidget):
         progress.setMinimumDuration(0)
         progress.show()
         
+        # Ask before doing. The membership rules would refuse the first deposit
+        # anyway, but discovering that behind a progress dialog — or as a
+        # traceback — is worse than being told up front. This is what
+        # src/services/posting.py separates check() from post() for.
+        from src.services.posting import Posting
+        from src.services.posting import check as check_posting
+        _tidy, problems = check_posting(self.db, Posting(
+            table='savings', member_id=self.current_individual_id,
+            date=current_date.strftime('%Y-%m-%d'), kind='Deposit', amount=amount))
+        if problems:
+            progress.close()
+            QMessageBox.information(self, 'Not Allowed', ' '.join(problems))
+            return
+
         count = 0
+        cancelled = False       # see loans_catch_up_to_current
+
         while current_date < current_month_start:
             if progress.wasCanceled():
+                cancelled = True
                 break
                 
             date_str = current_date.strftime("%Y-%m-%d")
@@ -2545,7 +3040,7 @@ class LedgerView(QWidget):
         self.refresh_table()
         new_balance = self.db.get_savings_balance(self.current_individual_id)
         
-        if progress.wasCanceled():
+        if cancelled:
             QMessageBox.information(self, "Cancelled", f"Operation cancelled. Added {count} deposits.\nNew balance: {new_balance:,.0f}")
         else:
             QMessageBox.information(self, "Success", f"Added {count} deposits of {amount:,.0f} each.\nNew balance: {new_balance:,.0f}")

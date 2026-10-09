@@ -273,22 +273,26 @@ class StatementGenerator:
                 current_gross = 0.0
                 snapshot_balance = 0.0
                 snapshot_gross = 0.0
-                
+                # Gross-up multiplier from the configurable org interest rate
+                # (default 0.15 -> x 1.15, matching the LedgerView and the
+                # figure this previously hardcoded).
+                gross_mult = 1 + self.db.settings.default_interest_rate
+
                 # Full Replay Simulation
                 for _, row in group.iterrows():
                     event = row['event_type']
                     added = float(row['added'])
                     deducted = float(row['deducted'])
                     date_str = str(row['date'])
-                    
+
                     if date_str > to_date:
                         break
-                    
+
                     # Simulation Logic (Matches LedgerView)
                     if event == "Loan Issued" or event == "Loan Top-Up":
-                        # Gross increases by Principal + 15% Interest (Standard Rule)
-                        # TODO: Should we read rate from loan config? defaulting to 0.15 matches UI.
-                        current_gross += added * 1.15
+                        # Gross increases by Principal + interest at the
+                        # configured rate.
+                        current_gross += added * gross_mult
                     elif event == "Repayment" or event == "Loan Buyoff":
                         current_gross -= deducted
                         
@@ -631,45 +635,65 @@ class StatementGenerator:
         filepath = os.path.join(folder, filename)
         
         try:
-            from PyQt6.QtCore import QMarginsF, QEventLoop
+            from PyQt6.QtCore import QMarginsF, QEventLoop, QTimer
             from PyQt6.QtGui import QPageLayout, QPageSize
-            
+
             web_view = self._get_printer_view() if self._get_printer_view else None
             if web_view is None:
                 raise ImportError("QWebEngineView not available")
-            
+
             web_view.setHtml(html)
-            
+
             loop = QEventLoop()
+
+            # Wait for the async setHtml load, but time out so a failed load can
+            # never hang a batch of statements. The timer is stopped before the
+            # print wait so it cannot cut that wait short.
             try:
                 web_view.loadFinished.disconnect()
             except Exception:
                 pass
-            
             web_view.loadFinished.connect(loop.quit)
+            load_timer = QTimer()
+            load_timer.setSingleShot(True)
+            load_timer.timeout.connect(loop.quit)
+            load_timer.start(5000)
             loop.exec()
-            
+            load_timer.stop()
+
             page_layout = QPageLayout(
                 QPageSize(QPageSize.PageSizeId.A4),
                 QPageLayout.Orientation.Landscape,
                 QMarginsF(10, 10, 10, 10)
             )
-            
+
             pdf_done = [False]
-            
+
             def on_pdf_done(filepath_out, success):
-                pdf_done[0] = True
+                pdf_done[0] = bool(success)
                 loop.quit()
-            
+
             try:
                 web_view.page().pdfPrintingFinished.disconnect()
             except Exception:
                 pass
-            
+
             web_view.page().pdfPrintingFinished.connect(on_pdf_done)
             web_view.page().printToPdf(filepath, page_layout)
+            # Rendering a large statement can take a while; time out rather than
+            # hang forever if Qt never fires pdfPrintingFinished.
+            print_timer = QTimer()
+            print_timer.setSingleShot(True)
+            print_timer.timeout.connect(loop.quit)
+            print_timer.start(60000)
             loop.exec()
-            
+            print_timer.stop()
+
+            if not pdf_done[0]:
+                # Timed out or Qt reported failure: fall through to the HTML
+                # fallback (or "failed") instead of returning a truncated PDF.
+                raise RuntimeError("PDF rendering did not finish")
+
         except Exception as e:
             if config and not config.allow_html_fallback:
                  logger.exception("PDF generation failed; HTML fallback disabled")

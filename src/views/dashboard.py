@@ -18,6 +18,7 @@ from src.dialogs import IndividualDialog, ImportDialog, StatementConfigDialog, I
 from src.reports import ReportGenerator
 from ..theme import ThemeManager
 from ..database import DatabaseManager
+from ..money import format_money
 
 
 class IndividualCard(QFrame):
@@ -111,6 +112,27 @@ class IndividualCard(QFrame):
         self.dashboard.open_ledger_by_id(self.ind_id, self.name)
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event):
+        """Per-member actions on right-click, so the list needs no button bar."""
+        self.dashboard.select_individual(self)
+        menu = QMenu(self)
+        open_a = menu.addAction("Open Ledger")
+        edit_a = menu.addAction("Edit Details…")
+        retire_a = menu.addAction("Reinstate" if self.is_retired else "Retire")
+        menu.addSeparator()
+        delete_a = menu.addAction("Delete")
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
+            return
+        if chosen == open_a:
+            self.dashboard.open_ledger_by_id(self.ind_id, self.name)
+        elif chosen == edit_a:
+            self.dashboard.edit_individual()
+        elif chosen == retire_a:
+            self.dashboard.retire_individual_btn()
+        elif chosen == delete_a:
+            self.dashboard.delete_individual()
+
     def set_selected(self, selected):
         self._is_selected = selected
         self.update_style()
@@ -144,6 +166,53 @@ class IndividualCard(QFrame):
 
 
 
+class _ClickableFrame(QFrame):
+    """A KPI tile that can be pressed.
+
+    A number that answers "how many" invites the question "which ones", and the
+    tile is where that question is asked. Plain QFrame swallows clicks, so the
+    press is caught here and handed to the callback the tile was built with.
+    """
+
+    def __init__(self, on_click):
+        super().__init__()
+        self._on_click = on_click
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.pos()):
+            self._on_click()
+        super().mouseReleaseEvent(event)
+
+
+class _NumericItem(QTableWidgetItem):
+    """A cell that shows a formatted number but sorts on the number itself.
+
+    QTableWidgetItem treats Qt.EditRole and Qt.DisplayRole as the same storage,
+    so stashing an int sort key and then calling setText replaces the key with
+    the formatted text — after which "2,787" sorts *before* "230", as strings
+    do. Keeping the number in a role of its own and comparing it here keeps what
+    is displayed and what is ordered independent.
+    """
+
+    SORT_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def __init__(self, text, value):
+        super().__init__(text)
+        self.setData(self.SORT_ROLE, value)
+
+    def __lt__(self, other):
+        mine = self.data(self.SORT_ROLE)
+        theirs = other.data(self.SORT_ROLE) if isinstance(other, QTableWidgetItem) else None
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return mine < theirs
+
+
+class _ReportCancelled(Exception):
+    """Raised inside the worker's progress callback to unwind on cancel."""
+
+
 class ReportWorker(QThread):
     """Background worker for report generation."""
     progress = pyqtSignal(int, int, str) # current, total, message
@@ -151,7 +220,8 @@ class ReportWorker(QThread):
     
     finished = pyqtSignal(bool, str)     # success, message
     
-    def __init__(self, db_name, printer_view_getter, start_date, output_path, report_type='loan', columns=None):
+    def __init__(self, db_name, printer_view_getter, start_date, output_path,
+                 report_type='loan', columns=None, end_date=None, fund=None):
         super().__init__()
         self.db_name = db_name
         self.printer_view_getter = printer_view_getter
@@ -159,46 +229,83 @@ class ReportWorker(QThread):
         self.output_path = output_path
         self.report_type = report_type
         self.columns = columns
-        
+        self.end_date = end_date          # 'fund' custom-range reports only
+        self.fund = fund                  # 'fund' reports: which ledger
+        self._cancelled = False
+
+    def cancel(self):
+        """Request a cooperative stop.
+
+        The flag is checked in the progress callback, so the worker unwinds
+        through its normal ``finally`` (closing the SQLite connection) instead
+        of being killed mid-write by ``terminate()``.
+        """
+        self._cancelled = True
+
     def run(self):
         db_manager = None
         try:
             # Create thread-local DB connection
             db_manager = DatabaseManager(self.db_name)
-            
+
             # Create generator with thread-local DB
-            # Note: printer_view_getter usage in thread might be risky for PDF. 
-            # If PDF export is requested, we might need to rethink this, 
+            # Note: printer_view_getter usage in thread might be risky for PDF.
+            # If PDF export is requested, we might need to rethink this,
             # but for Excel/CSV this fixes the SQLite error.
             generator = ReportGenerator(db_manager, printer_view_getter=self.printer_view_getter)
-            
+
             def callback(current, total, msg):
+                if self._cancelled:
+                    raise _ReportCancelled()
                 self.progress.emit(current, total, msg)
-                
+
             if self.report_type == 'savings':
                 success, msg = generator.generate_quarterly_savings_report(
-                    self.start_date, 
-                    self.output_path, 
+                    self.start_date,
+                    self.output_path,
+                    columns=self.columns,
+                    progress_callback=callback
+                )
+            elif self.report_type == 'fund':
+                success, msg = generator.generate_fund_report(
+                    self.fund,
+                    self.output_path,
+                    self.start_date,
+                    self.end_date,
                     columns=self.columns,
                     progress_callback=callback
                 )
             else:
                 success, msg = generator.generate_quarterly_report(
-                    self.start_date, 
-                    self.output_path, 
+                    self.start_date,
+                    self.output_path,
                     columns=self.columns,
                     progress_callback=callback
                 )
             self.finished.emit(success, msg)
-            
+
+        except _ReportCancelled:
+            # Cooperative cancel: remove any half-written output so the user
+            # can't mistake a truncated file for a finished report.
+            try:
+                if self.output_path and os.path.exists(self.output_path):
+                    os.remove(self.output_path)
+            except OSError:
+                logger.warning("Could not remove cancelled report output: %s",
+                               self.output_path, exc_info=True)
+            self.finished.emit(False, "Cancelled")
         except Exception as e:
             self.finished.emit(False, str(e))
         finally:
             if db_manager and hasattr(db_manager, 'conn'):
                 try:
                     db_manager.conn.close()
-                except Exception:
-                    pass
+                except Exception:       # noqa: BLE001 - worker teardown
+                    # Nothing useful can be done about a connection that will
+                    # not close on a worker thread, but it must not vanish
+                    # either: it is how a leaked handle gets noticed.
+                    logger.warning("Report worker could not close its connection",
+                                   exc_info=True)
 
 
 class Dashboard(QWidget):
@@ -322,7 +429,11 @@ class Dashboard(QWidget):
         content_layout = QVBoxLayout(self.content_container)
         content_layout.setContentsMargins(40, 30, 40, 30)
         content_layout.setSpacing(20)
-        
+
+        # Portfolio summary — the home screen's job is money management, so the
+        # totals belong up top rather than one member-ledger at a time.
+        content_layout.addWidget(self._build_summary_band())
+
         # Search Section
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
@@ -358,147 +469,28 @@ class Dashboard(QWidget):
         self.scroll_content_layout.setSpacing(12)
         self.scroll_content_layout.setContentsMargins(0, 5, 5, 5) # Right margin for scrollbar
         self.scroll_content_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        
+
+        # Empty-state message: shown when there are no members at all, or when a
+        # search matches none. It stays in the layout across refreshes (cards are
+        # removed around it), so a fresh install and a no-match search are no
+        # longer a silent blank panel.
+        self.empty_label = QLabel("")
+        self.empty_label.setObjectName("emptyState")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setContentsMargins(20, 40, 20, 40)
+        self.empty_label.setVisible(False)
+        self.scroll_content_layout.addWidget(self.empty_label)
+
         self.scroll_area.setWidget(self.scroll_content)
         content_layout.addWidget(self.scroll_area)
-        
-        # Bottom Actions Section
-        self.actions_container = QFrame()
-        self.actions_container.setFixedHeight(72)
-        
-        # Shadow for actions bar
-        action_shadow = QGraphicsDropShadowEffect()
-        action_shadow.setBlurRadius(30)
-        action_shadow.setOffset(0, 10)
-        action_shadow.setColor(QColor(0, 0, 0, 20))
-        self.actions_container.setGraphicsEffect(action_shadow)
-        self.actions_shadow = action_shadow
-        
-        actions_layout = QHBoxLayout(self.actions_container)
-        actions_layout.setContentsMargins(20, 10, 20, 10)
-        actions_layout.setSpacing(15)
-        
-        self.open_btn = QPushButton("Open Ledger")
-        self.open_btn.clicked.connect(self.open_ledger_btn)
-        self.open_btn.setEnabled(False)
-        
-        self.edit_btn = QPushButton("Edit Details")
-        self.edit_btn.clicked.connect(self.edit_individual)
-        self.edit_btn.setEnabled(False)
-        
-        self.delete_btn = QPushButton("Delete")
-        self.delete_btn.clicked.connect(self.delete_individual)
-        self.delete_btn.setEnabled(False)
-        
-        self.retire_btn = QPushButton("Retire")
-        self.retire_btn.clicked.connect(self.retire_individual_btn)
-        self.retire_btn.setEnabled(False)
-        
-        actions_layout.addWidget(self.open_btn)
-        actions_layout.addWidget(self.edit_btn)
-        actions_layout.addWidget(self.retire_btn)
-        actions_layout.addStretch()
-        actions_layout.addWidget(self.delete_btn)
-        
-        content_layout.addWidget(self.actions_container)
-        
-        # --- FOOTER / UTILITY SECTION ---
-        utility_layout = QHBoxLayout()
-        utility_layout.setSpacing(15)
-        
-        self.print_selected_btn = QPushButton("Print Statements")
-        self.print_selected_btn.clicked.connect(self.batch_print_selected)
-        
-        self.reports_btn = QPushButton("Quarterly Reports")
-        reports_menu = QMenu(self)
-        
-        loan_report_action = QAction("Loan Report", self)
-        loan_report_action.triggered.connect(self.generate_quarterly_report)
-        reports_menu.addAction(loan_report_action)
 
-        savings_report_action = QAction("Savings / Shares Report", self)
-        savings_report_action.triggered.connect(
-            lambda: self._open_fund_report_dialog("savings", "Savings / Shares"))
-        reports_menu.addAction(savings_report_action)
+        # Per-member actions (Open Ledger / Edit / Retire / Delete) live on the
+        # card right-click menu; whole-journal actions (Reports, Operations,
+        # Settings) live on the window menu bar — so the list stays uncluttered.
 
-        christmas_report_action = QAction("Christmas Report", self)
-        christmas_report_action.triggered.connect(
-            lambda: self._open_fund_report_dialog("christmas", "Christmas"))
-        reports_menu.addAction(christmas_report_action)
-
-        benevolent_report_action = QAction("Benevolent Report", self)
-        benevolent_report_action.triggered.connect(
-            lambda: self._open_fund_report_dialog("benevolent", "Benevolent"))
-        reports_menu.addAction(benevolent_report_action)
-
-        reports_menu.addSeparator()
-        members_list_action = QAction("Members List (Excel / PDF)…", self)
-        members_list_action.triggered.connect(self.export_members_list)
-        reports_menu.addAction(members_list_action)
-
-        self.reports_btn.setMenu(reports_menu)
-        
-        self.settings_btn = QPushButton("Settings")
-        self.settings_btn.clicked.connect(self.open_settings)
-        
-        self.mass_ops_btn = QPushButton("Mass Operations")
-
-        mass_menu = QMenu(self)
-        deduct_action = QAction("Mass Deduct (Loans)", self)
-        deduct_action.triggered.connect(self.open_mass_deduction_dialog)
-        mass_menu.addAction(deduct_action)
-        
-        savings_action = QAction("Mass Savings (Increments)", self)
-        savings_action.triggered.connect(self.open_mass_savings_dialog)
-        mass_menu.addAction(savings_action)
-
-        christmas_action = QAction("Mass Christmas (Contributions)", self)
-        christmas_action.triggered.connect(self.open_mass_christmas_dialog)
-        mass_menu.addAction(christmas_action)
-
-        benevolent_action = QAction("Mass Benevolent (Deductions)", self)
-        benevolent_action.triggered.connect(self.open_mass_benevolent_dialog)
-        mass_menu.addAction(benevolent_action)
-
-        mass_menu.addSeparator()
-
-        repair_action = QAction("Repair Loans (legacy terms)…", self)
-        repair_action.triggered.connect(self.open_repair_loans_dialog)
-        mass_menu.addAction(repair_action)
-
-        orphan_action = QAction("Repair Orphaned Records…", self)
-        orphan_action.triggered.connect(self.open_orphan_repair_dialog)
-        mass_menu.addAction(orphan_action)
-
-        activity_action = QAction("Activity Log…", self)
-        activity_action.triggered.connect(self.show_activity_log)
-        mass_menu.addAction(activity_action)
-
-        mass_menu.addSeparator()
-        
-        self.undo_mass_action = QAction("Undo Last Mass Operation", self)
-        self.undo_mass_action.triggered.connect(self.undo_mass_operation)
-        self.undo_mass_action.setEnabled(True) # Always enabled, check in handler?
-        # Or better: Context menu 'aboutToShow' capable?
-        # For simplicity: Keep enabled, show message if nothing to undo.
-        mass_menu.addAction(self.undo_mass_action)
-        
-        self.mass_ops_btn.setMenu(mass_menu)
-        
-        self.treasury_btn = QPushButton("Treasury & GL")
-        self.treasury_btn.clicked.connect(self.open_treasury)
-        
-        utility_layout.addWidget(self.print_selected_btn)
-        utility_layout.addWidget(self.reports_btn)
-        utility_layout.addStretch()
-        utility_layout.addWidget(self.treasury_btn)
-        utility_layout.addWidget(self.settings_btn)
-        utility_layout.addWidget(self.mass_ops_btn)
-        
-        content_layout.addLayout(utility_layout)
-        
         self.main_layout.addWidget(self.content_container)
-        
+
         self.refresh_list()
 
     def apply_theme(self):
@@ -572,9 +564,11 @@ class Dashboard(QWidget):
              # QColor can parse this
              c = QColor(t.get_color("shadow"))
              self.search_shadow.setColor(c)
-             self.actions_shadow.setColor(c)
-        except Exception:
-             pass
+        except Exception:       # noqa: BLE001 - cosmetic only
+             # A theme without a parseable shadow colour must not stop the
+             # dashboard painting; debug rather than warning, since the only
+             # consequence is a flat card edge.
+             logger.debug("Could not apply the shadow colour", exc_info=True)
 
         # Results Label
         self.results_label.setStyleSheet(f"font-size: 16px; font-weight: 700; color: {t.get_color('text_secondary')}; letter-spacing: 0.3px; text-transform: uppercase;")
@@ -598,63 +592,363 @@ class Dashboard(QWidget):
             }}
         """)
 
-        # Action Bar
-        self.actions_container.setStyleSheet(f"""
-            QFrame {{
-                background-color: {t.get_color('bg_secondary')}; 
-                border: 1px solid {t.get_color('border')}; 
-                border-radius: 12px;
-            }}
-        """)
-
-        # Action Buttons
-        self.open_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {t.get_color('accent')}; color: white; font-weight: 600; padding: 10px 24px; border-radius: 6px; border: none; }}
-            QPushButton:disabled {{ background-color: {t.get_color('border')}; color: {t.get_color('text_secondary')}; }}
-            QPushButton:hover:!disabled {{ background-color: {t.get_color('accent_hover')}; }}
-        """)
-        
-        self.edit_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {t.get_color('bg_secondary')}; color: {t.get_color('text_primary')}; font-weight: 600; padding: 10px 24px; border-radius: 6px; border: 1px solid {t.get_color('border')}; }}
-            QPushButton:disabled {{ color: {t.get_color('border')}; border-color: {t.get_color('border')}; }}
-            QPushButton:hover:!disabled {{ background-color: {t.get_color('bg_primary')}; border-color: {t.get_color('text_secondary')}; }}
-        """)
-        
-        self.delete_btn.setStyleSheet(f"""
-            QPushButton {{ background-color: {t.get_color('danger_bg')}; color: {t.get_color('danger')}; font-weight: 600; padding: 10px 24px; border-radius: 6px; border: 1px solid {t.get_color('danger_border')}; }}
-            QPushButton:disabled {{ background-color: {t.get_color('bg_secondary')}; color: {t.get_color('border')}; border-color: {t.get_color('border')}; }}
-            QPushButton:hover:!disabled {{ background-color: {t.get_color('danger_border')}; border-color: {t.get_color('danger')}; }}
-        """)
-        
-        # Action buttons — semantic roles from the theme palette, so they
-        # follow Light/Dark switches (incl. hover + disabled states).
-        self.retire_btn.setStyleSheet(t.button_css("danger"))
-        self.print_selected_btn.setStyleSheet(t.button_css("accent"))
-        self.reports_btn.setStyleSheet(t.button_css("success"))
-        self.settings_btn.setStyleSheet(t.button_css("neutral"))
-        self.mass_ops_btn.setStyleSheet(t.button_css("purple"))
-        self.treasury_btn.setStyleSheet(t.button_css("accent"))
-
         # Update all cards
         for card in self.card_widgets:
             card.apply_theme()
 
+        # KPI band tracks the theme too; refresh_summary re-sets the arrears colour.
+        self._style_summary_band()
+        self.refresh_summary()
+
+        if hasattr(self, "empty_label"):
+            self.empty_label.setStyleSheet(t.hint_css(15))
+
+
+    def _make_stat_card(self, caption, on_click=None):
+        """One KPI tile: a big value over a small caption. Returns (card, value_label).
+
+        Passing ``on_click`` makes the whole tile pressable and marks it as such
+        — a pointer cursor and a "›" on the caption — so it does not look like
+        the tiles that only display.
+        """
+        card = _ClickableFrame(on_click) if on_click else QFrame()
+        card.setObjectName("statCard")
+        card.setProperty("clickable", bool(on_click))
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 12, 16, 12)
+        v.setSpacing(2)
+        value = QLabel("—")
+        value.setObjectName("statValue")
+        cap = QLabel(f"{caption}  ›" if on_click else caption)
+        cap.setObjectName("statCaptionLink" if on_click else "statCaption")
+        v.addWidget(value)
+        v.addWidget(cap)
+        return card, value
+
+    def _build_summary_band(self):
+        """A row of KPI tiles: members, active loans, outstanding, arrears, savings."""
+        self.summary_frame = QFrame()
+        row = QHBoxLayout(self.summary_frame)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(16)
+        specs = [
+            ("stat_members", "Members", None),
+            ("stat_loans", "Active Loans", None),
+            ("stat_outstanding", "Outstanding", None),
+            # The only tile that names work to be done, so it is the only one
+            # that opens onto the people behind the number.
+            ("stat_arrears", "Loans in Arrears", self.show_arrears_dialog),
+            ("stat_savings", "Total Savings", None),
+        ]
+        for attr, caption, on_click in specs:
+            card, value = self._make_stat_card(caption, on_click)
+            setattr(self, attr, value)
+            if on_click:
+                self.arrears_card = card
+                card.setToolTip("Click to see who is in arrears, and print the list")
+            row.addWidget(card)
+        return self.summary_frame
+
+    def _style_summary_band(self):
+        """Theme the KPI tiles (called on build and on theme change)."""
+        if not hasattr(self, "summary_frame"):
+            return
+        t = self.theme_manager
+        self.summary_frame.setStyleSheet(
+            f"#statCard {{ background-color: {t.get_color('card_bg')}; "
+            f"border: 1px solid {t.get_color('card_border')}; border-radius: 10px; }} "
+            f"#statValue {{ font-size: 22px; font-weight: bold; "
+            f"color: {t.get_color('text_primary')}; }} "
+            f"#statCaption {{ font-size: 11px; color: {t.get_color('text_secondary')}; }} "
+            # The pressable tile borrows the accent colour on its caption and
+            # lights its border on hover — the same affordance the member cards
+            # use, so "this one does something" reads without a legend.
+            f"#statCaptionLink {{ font-size: 11px; font-weight: bold; "
+            f"color: {t.get_color('accent')}; }} "
+            f"#statCard[clickable=\"true\"]:hover {{ border-color: "
+            f"{t.get_color('card_hover_border')}; }}")
+
+    def refresh_summary(self):
+        """Recompute the KPI band from cheap aggregate queries (no per-member loop)."""
+        if not hasattr(self, "stat_members"):
+            return
+        try:
+            active_loans = self.db.get_all_active_loans()
+            outstanding = sum(float(loan.get("balance") or 0) for loan in active_loans)
+            members = len(self.db.get_individuals())
+            arrears = self.db.get_overdue_count()
+            savings = self.db.get_total_savings()
+        except Exception:
+            logger.exception("Could not compute the dashboard summary")
+            return
+
+        self.stat_members.setText(f"{members:,}")
+        self.stat_loans.setText(f"{len(active_loans):,}")
+        self.stat_outstanding.setText(format_money(outstanding))
+        self.stat_savings.setText(format_money(savings))
+
+        # Arrears is the number to act on: colour it when there is anything there.
+        self.stat_arrears.setText(f"{arrears:,}")
+        colour = self.theme_manager.get_color("danger" if arrears else "text_primary")
+        self.stat_arrears.setStyleSheet(
+            f"font-size: 22px; font-weight: bold; color: {colour};")
+
+    # ------------------------------------------------------------------ #
+    # Arrears
+    # ------------------------------------------------------------------ #
+
+    def show_arrears_dialog(self):
+        """Who is behind, how far, and a way to print it.
+
+        Opened from the arrears KPI tile and from Reports. The list is the same
+        population the tile counts — including suspended loans, which are shown
+        with their state rather than hidden, since whether a deliberate hold
+        belongs in an arrears chase is the user's judgement and not this
+        dialog's. A filter takes them out for whoever wants only real defaults.
+        """
+        from PyQt6.QtWidgets import QTableWidget, QComboBox, QHeaderView
+        from src.config import PAR_THRESHOLD_DAYS
+        from src.services import arrears as arrears_service
+        from src.reports import ReportGenerator
+
+        as_of = datetime.now().strftime("%Y-%m-%d")
+        try:
+            all_rows = self.engine.get_arrears(as_of)
+        except Exception as e:                  # noqa: BLE001 - report, don't crash
+            logger.exception("Could not compute arrears")
+            QMessageBox.critical(self, "Loans in Arrears",
+                                 f"Could not work out who is in arrears:\n{e}")
+            return
+
+        if not all_rows:
+            QMessageBox.information(
+                self, "Loans in Arrears",
+                "Nothing is in arrears — every active loan is up to date as at "
+                f"{as_of}.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Loans in Arrears")
+        dialog.setMinimumSize(1020, 560)
+        layout = QVBoxLayout(dialog)
+
+        headline = QLabel()
+        headline.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; "
+            f"color: {self.theme_manager.get_color('text_primary')};")
+        layout.addWidget(headline)
+
+        subhead = QLabel()
+        subhead.setWordWrap(True)
+        subhead.setStyleSheet(self.theme_manager.hint_css())
+        layout.addWidget(subhead)
+
+        controls = QHBoxLayout()
+        search = QLineEdit()
+        search.setPlaceholderText("Filter by member, PF number or loan…")
+        search.setClearButtonEnabled(True)
+        controls.addWidget(search, 2)
+
+        band_filter = QComboBox()
+        band_filter.addItem("All classifications", "")
+        for label in arrears_service.BAND_LABELS:
+            band_filter.addItem(label, label)
+        controls.addWidget(band_filter, 1)
+
+        hide_suspended = QCheckBox("Hide suspended loans")
+        hide_suspended.setToolTip(
+            "Suspended loans are past due because deductions were deliberately "
+            "paused, not because a member defaulted.")
+        controls.addWidget(hide_suspended)
+        layout.addLayout(controls)
+
+        columns = ReportGenerator.ARREARS_COLUMNS
+        table = QTableWidget()
+        table.setColumnCount(len(columns))
+        table.setHorizontalHeaderLabels([label for _key, label in columns])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSortingEnabled(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        # Not setStretchLastSection: the last column is the loan's status, and
+        # stretching it to whatever space is left elided "Suspended (open-ended)"
+        # down to "Suspended (open-…". Any slack goes to the member's name
+        # instead, which is the column that can always use more room.
+        layout.addWidget(table)
+
+        hint = QLabel(
+            "Double-click a row to open that member's ledger. “Overdue (est.)” "
+            "is missed instalments × the current instalment, capped at the "
+            "balance — the ledger records what was received, not what was due.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(self.theme_manager.hint_css())
+        layout.addWidget(hint)
+
+        visible = list(all_rows)
+        money_columns = {"installment", "overdue_amount", "balance"}
+        numeric_columns = {"days", "months_missed"} | money_columns
+        # Which arrears row each table row came from, so the export can follow
+        # the order on screen after the user sorts by a column.
+        ROW_INDEX = Qt.ItemDataRole.UserRole + 1
+
+        def _fill_width():
+            """Give any leftover width to the member column, not the last one."""
+            header = table.horizontalHeader()
+            used = sum(header.sectionSize(c) for c in range(table.columnCount()))
+            slack = table.viewport().width() - used
+            if slack > 0:
+                header.resizeSection(0, header.sectionSize(0) + slack)
+
+        def repopulate():
+            text = search.text().strip().lower()
+            band = band_filter.currentData()
+            visible.clear()
+            for row in all_rows:
+                if hide_suspended.isChecked() and row["suspended"]:
+                    continue
+                if band and row["band"] != band:
+                    continue
+                if text and text not in " ".join(
+                        (row["name"], row["pf_no"], row["ref"], row["phone"])).lower():
+                    continue
+                visible.append(row)
+
+            # Sorting is switched off while the rows are written, or Qt re-sorts
+            # mid-fill and the cells land against the wrong rows.
+            table.setSortingEnabled(False)
+            table.setRowCount(len(visible))
+            for r, row in enumerate(visible):
+                for c, (key, _label) in enumerate(columns):
+                    value = (ReportGenerator._arrears_status(row) if key == "status"
+                             else row[key])
+                    if key in numeric_columns:
+                        # Shown with separators, sorted as a number.
+                        shown = (format_money(value) if key in money_columns
+                                 else f"{int(value):,}")
+                        item = _NumericItem(shown, int(value))
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight
+                                              | Qt.AlignmentFlag.AlignVCenter)
+                    else:
+                        item = QTableWidgetItem(str(value))
+                    if row["suspended"]:
+                        item.setForeground(QColor(self.theme_manager.get_color("warning")))
+                    elif row["days"] > PAR_THRESHOLD_DAYS:
+                        item.setForeground(QColor(self.theme_manager.get_color("danger")))
+                    item.setData(Qt.ItemDataRole.UserRole, row["individual_id"])
+                    item.setData(ROW_INDEX, r)
+                    table.setItem(r, c, item)
+            table.setSortingEnabled(True)
+            table.resizeColumnsToContents()
+            _fill_width()
+
+            totals = arrears_service.summarize(visible)
+            headline.setText(
+                f"{totals['loans']:,} loan(s) · {totals['members']:,} member(s) · "
+                f"{format_money(totals['overdue_amount'])} overdue")
+            held = (f" {totals['suspended']} of them are suspended."
+                    if totals["suspended"] else "")
+            shown = ("" if len(visible) == len(all_rows)
+                     else f" Showing {len(visible)} of {len(all_rows)}.")
+            subhead.setText(
+                f"As at {as_of}. Worst is {totals['worst_days']:,} day(s) past due; "
+                f"{format_money(totals['balance'])} of principal sits behind these "
+                f"loans.{held}{shown}")
+
+        def rows_in_view():
+            """The filtered rows in the order the table is currently showing.
+
+            Printing something other than what is on screen is how a report
+            loses an argument, so the export walks the table rather than the
+            unsorted list behind it.
+            """
+            out = []
+            for r in range(table.rowCount()):
+                item = table.item(r, 0)
+                if item is None:
+                    continue
+                index = item.data(ROW_INDEX)
+                if index is not None and index < len(visible):
+                    out.append(visible[index])
+            return out
+
+        search.textChanged.connect(repopulate)
+        band_filter.currentIndexChanged.connect(repopulate)
+        hide_suspended.stateChanged.connect(repopulate)
+
+        def open_member(item):
+            ind_id = item.data(Qt.ItemDataRole.UserRole)
+            details = self.db.get_individual(ind_id) or {}
+            if not details:
+                return
+            dialog.accept()
+            self.open_ledger_by_id(ind_id, details.get("name", ""))
+
+        table.itemDoubleClicked.connect(open_member)
+
+        buttons = QHBoxLayout()
+        export_btn = QPushButton("Print / Export…")
+        export_btn.setStyleSheet(self.theme_manager.button_css("accent"))
+        export_btn.setToolTip("Save the list shown here as PDF, Excel or CSV")
+        export_btn.clicked.connect(
+            lambda: self._export_arrears(dialog, rows_in_view(), as_of))
+        buttons.addWidget(export_btn)
+        buttons.addStretch()
+        close_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_box.rejected.connect(dialog.reject)
+        buttons.addWidget(close_box)
+        layout.addLayout(buttons)
+
+        repopulate()
+        dialog.exec()
+
+    def _export_arrears(self, parent, rows, as_of):
+        """Save the arrears list the user is looking at, and open it."""
+        from src.reports import ReportGenerator
+
+        if not rows:
+            QMessageBox.information(parent, "Print / Export",
+                                    "There is nothing in the list to print.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            parent, "Save Arrears List", f"Loans_In_Arrears_{as_of}.pdf",
+            "PDF Files (*.pdf);;Excel Files (*.xlsx);;CSV Files (*.csv)")
+        if not path:
+            return
+
+        generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
+        progress = QProgressDialog("Preparing the arrears list…", None, 0, 0, parent)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            success, message = generator.generate_arrears_report(path, rows, as_of=as_of)
+        finally:
+            progress.close()
+
+        if success:
+            from .file_actions import report_saved
+            report_saved(parent, "Arrears List", path, what="arrears list")
+        else:
+            QMessageBox.critical(parent, "Arrears List", f"Export failed:\n{message}")
 
     def refresh_list(self, select_id=None):
+        # Keep the portfolio totals in step with every add/edit/delete/import.
+        self.refresh_summary()
         # Clear existing items
         self.card_widgets = []
         self.selected_card = None
-        self.update_action_buttons()
-        
-        while self.scroll_content_layout.count():
-            item = self.scroll_content_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
+
+        # Remove the previous cards, but keep the empty-state label in place.
+        for i in reversed(range(self.scroll_content_layout.count())):
+            widget = self.scroll_content_layout.itemAt(i).widget()
+            if widget is not None and widget is not self.empty_label:
+                self.scroll_content_layout.takeAt(i)
                 widget.deleteLater()
-                
+
         individuals = self.db.get_individuals()
         individuals.sort(key=lambda x: x[1].lower())
-        
+
         for idx, ind in enumerate(individuals, 1):
              # ind: [id, name, phone, email, default_deduction, created_at, import_id, is_retired, retired_date]
              ind_details = self.db.get_individual(ind[0])
@@ -662,7 +956,15 @@ class Dashboard(QWidget):
              card = IndividualCard(ind[0], ind[1], ind[2], ind[3], self, is_retired=is_retired)
              self.scroll_content_layout.addWidget(card)
              self.card_widgets.append(card)
-        
+
+        # Fresh install / everyone deleted: guide the user instead of a blank panel.
+        if individuals:
+            self.empty_label.setVisible(False)
+        else:
+            self.empty_label.setText(
+                "No members yet.\nClick “+ New Individual” above to add one.")
+            self.empty_label.setVisible(True)
+
         # Sync to UIStateManager
         self._ui_state.set_cards(self.card_widgets)
         
@@ -676,36 +978,21 @@ class Dashboard(QWidget):
     def filter_list(self, text):
         """Filter cards by text using UIStateManager."""
         self._ui_state.apply_filter(text)
+        # Tell the user when a search matches nobody, rather than showing blank.
+        if self.card_widgets and not self._ui_state.get_visible_cards():
+            self.empty_label.setText(f"No members match “{text}”.")
+            self.empty_label.setVisible(True)
+        elif self.card_widgets:
+            self.empty_label.setVisible(False)
         
     def _on_selection_changed(self, card):
         """Callback when selection changes via UIStateManager."""
         self.selected_card = card  # Sync legacy attribute
-        self.update_action_buttons()
 
     def select_individual(self, card):
         """Select a card using UIStateManager."""
         self._ui_state.select(card)
         # Legacy sync is handled via _on_selection_changed callback
-
-    def update_action_buttons(self):
-        enabled = (self.selected_card is not None)
-        self.open_btn.setEnabled(enabled)
-        self.edit_btn.setEnabled(enabled)
-        self.delete_btn.setEnabled(enabled)
-        self.retire_btn.setEnabled(enabled)
-        
-        # Update retire button text/colour; grey out when nothing is selected
-        # (a :disabled rule, since the solid red/green otherwise looks enabled).
-        disabled_css = ("QPushButton:disabled { background-color: "
-                        f"{self.theme_manager.get_color('border')}; "
-                        f"color: {self.theme_manager.get_color('text_secondary')}; }}")
-        if self.selected_card and self.selected_card.is_retired:
-            self.retire_btn.setText("Reinstate")
-            base = "background-color: #10B981; color: white; padding: 8px 15px; border-radius: 5px;"
-        else:
-            self.retire_btn.setText("Retire")
-            base = "background-color: #DC2626; color: white; padding: 8px 15px; border-radius: 5px;"
-        self.retire_btn.setStyleSheet(f"QPushButton {{ {base} }} {disabled_css}")
 
     def add_individual(self):
         self.loan_controller.add_individual(IndividualDialog)
@@ -756,7 +1043,7 @@ class Dashboard(QWidget):
             
             msg = f"Are you sure you want to retire '{name}'?\n\n"
             if savings_bal > 0:
-                msg += f"\u2022 Savings balance of {savings_bal:,.0f} will be auto-withdrawn\n"
+                msg += f"\u2022 Savings balance of {format_money(savings_bal)} will be auto-withdrawn\n"
             if has_loans:
                 msg += "\u2022 Outstanding loans will remain active until cleared\n"
                 msg += "\u2022 They will still appear in Loan Reports\n"
@@ -773,11 +1060,44 @@ class Dashboard(QWidget):
                 
                 msg = f"'{name}' has been retired."
                 if withdrawn > 0:
-                    msg += f"\nSavings withdrawal of {withdrawn:,.0f} was created."
+                    msg += f"\nSavings withdrawal of {format_money(withdrawn)} was created."
                 
                 self.refresh_list(select_id=ind_id)
                 QMessageBox.information(self, "Retired", msg)
     
+    @staticmethod
+    def _format_names(names, cap=10):
+        """Join names for a summary, capping a long list so the dialog stays readable."""
+        names = list(names)
+        if len(names) <= cap:
+            return ", ".join(names)
+        return ", ".join(names[:cap]) + f", and {len(names) - cap} more"
+
+    def _show_batch_summary(self, dest, saved, html_fallbacks=(), skipped_empty=(), failed=()):
+        """Report a batch statement run: what saved, what was skipped, what failed.
+
+        Replaces a bare "Saved N" that hid every statement which errored, had no
+        activity, or fell back to HTML.
+        """
+        total_saved = len(saved) + len(html_fallbacks)
+        lines = [f"Saved {total_saved} statement(s) to:\n{dest}"]
+        if html_fallbacks:
+            lines.append(f"\n{len(html_fallbacks)} saved as HTML (PDF unavailable): "
+                         + self._format_names(html_fallbacks))
+        if skipped_empty:
+            lines.append(f"\n{len(skipped_empty)} skipped — no activity in this period: "
+                         + self._format_names(skipped_empty))
+        if failed:
+            lines.append(f"\n{len(failed)} failed — see the log: "
+                         + self._format_names(failed))
+        text = "\n".join(lines)
+        if failed:
+            QMessageBox.warning(self, "Batch complete with problems", text)
+        elif total_saved == 0:
+            QMessageBox.warning(self, "Nothing saved", text)
+        else:
+            QMessageBox.information(self, "Batch complete", text)
+
     def batch_print_all(self):
         """Print all statements to a selected folder."""
         # Get date range first
@@ -794,9 +1114,9 @@ class Dashboard(QWidget):
             QMessageBox.information(self, "Info", "No individuals to print.")
             return
         
-        count = 0
+        saved, html_fallbacks, skipped_empty, failed = [], [], [], []
         total_steps = len(individuals)
-        
+
         progress = QProgressDialog("Generating Statements...", "Cancel", 0, total_steps, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0) # Show immediately
@@ -808,14 +1128,20 @@ class Dashboard(QWidget):
                 
             progress.setLabelText(f"Generating Statement for {ind[1]}...")
             success, path, fmt = self._statement_generator.generate_pdf_statement(ind[0], ind[1], folder, date_range[0], date_range[1])
-            
-            if success:
-                count += 1
+
+            if success and fmt == "html":
+                html_fallbacks.append(ind[1])
+            elif success:
+                saved.append(ind[1])
+            elif fmt == "empty":
+                skipped_empty.append(ind[1])
+            else:
+                failed.append(ind[1])
             progress.setValue(i + 1)
             QApplication.processEvents() # Ensure UI remains responsive
-        
+
         progress.close()
-        QMessageBox.information(self, "Success", f"Saved {count} statement(s) to:\n{folder}")
+        self._show_batch_summary(folder, saved, html_fallbacks, skipped_empty, failed)
     
     def batch_print_selected(self):
         """Open dialog to select which statements to print."""
@@ -933,8 +1259,8 @@ class Dashboard(QWidget):
             to_str = self.print_config_data["to"]
             config = self.print_config_data["config"]
             
-            count = 0
-            
+            saved, html_fallbacks, skipped_empty, failed = [], [], [], []
+
             # Filter checks that are checked
             selected_checks = [cb for cb in checkboxes if cb.isChecked()]
             total_steps = len(selected_checks)
@@ -954,31 +1280,53 @@ class Dashboard(QWidget):
                     
                     progress.setLabelText(f"Generating Statement for {name}...")
                     
-                    success = False
                     if self.print_mode == "pdf":
                         # Updated signature returns (success, path, format)
                         res = self._statement_generator.generate_pdf_statement(ind_id, name, folder, from_str, to_str, config=config)
-                        if isinstance(res, tuple):
-                             success = res[0]
+                        success, fmt = (res[0], res[2]) if isinstance(res, tuple) else (res, "pdf")
+                        if success and fmt == "html":
+                            html_fallbacks.append(name)
+                        elif success:
+                            saved.append(name)
+                        elif fmt == "empty":
+                            skipped_empty.append(name)
                         else:
-                             success = res
+                            failed.append(name)
                     elif self.print_mode == "excel":
-                        success = self._statement_generator.generate_excel_statement(ind_id, name, folder, from_str, to_str, config=config)
-                        
-                    if success:
-                        count += 1
-                    
+                        if self._statement_generator.generate_excel_statement(ind_id, name, folder, from_str, to_str, config=config):
+                            saved.append(name)
+                        else:
+                            failed.append(name)
+
                     progress.setValue(i + 1)
                     QApplication.processEvents()
-                
+
                 progress.close()
-            
-            if count > 0:
-                QMessageBox.information(self, "Success", f"Saved {count} check(s) to:\n{folder}")
+
+            if saved or html_fallbacks or skipped_empty or failed:
+                self._show_batch_summary(folder, saved, html_fallbacks, skipped_empty, failed)
             else:
                 QMessageBox.warning(self, "Warning", "No statements saved.")
 
     
+    def open_fund_grid(self):
+        """Open the members × months spreadsheet over the three funds.
+
+        A second way into the same data, not a second copy of it: the grid
+        writes through the same posting pipeline the member screens use, so
+        nothing here depends on it and nothing it does is invisible to them.
+        """
+        from .fund_grid import FundGridWindow
+
+        window = FundGridWindow(self, self.db, self.theme_manager,
+                                on_open_member=self.open_ledger_by_id)
+        # The grid's export offers PDF, which needs the hidden web view the
+        # report exports already share.
+        window.printer_view_getter = self.get_printer_view
+        window.exec()
+        # Fund edits move the savings total on the KPI band.
+        self.refresh_summary()
+
     def get_printer_view(self):
         """Get or create the hidden QWebEngineView for printing."""
         if self.printer_view is None:
@@ -993,7 +1341,8 @@ class Dashboard(QWidget):
 
     def open_settings(self):
         """Open settings dialog (Organization / Financial / Appearance)."""
-        from PyQt6.QtWidgets import QComboBox, QDialogButtonBox, QGroupBox
+        from PyQt6.QtWidgets import (QComboBox, QDialogButtonBox, QDoubleSpinBox,
+                                     QGroupBox)
         from src import branding
         dialog = QDialog(self)
         dialog.setWindowTitle("Settings")
@@ -1003,12 +1352,12 @@ class Dashboard(QWidget):
         # --- Organization (branding used on every statement and report) ---
         org_box = QGroupBox("Organization")
         org_form = QFormLayout(org_box)
-        org_name_edit = QLineEdit(self.db.get_setting(branding.ORG_NAME_KEY, "") or "")
+        org_name_edit = QLineEdit(self.db.settings.org_name)
         org_name_edit.setPlaceholderText("e.g. Umoja Staff Co-operative")
         org_form.addRow("Organization Name:", org_name_edit)
 
         logo_row = QHBoxLayout()
-        logo_edit = QLineEdit(self.db.get_setting(branding.ORG_LOGO_KEY, "") or "")
+        logo_edit = QLineEdit(self.db.settings.org_logo_path)
         logo_edit.setPlaceholderText("Bundled default logo")
         logo_edit.setReadOnly(True)
         browse_btn = QPushButton("Browse…")
@@ -1036,16 +1385,55 @@ class Dashboard(QWidget):
         months = ["January", "February", "March", "April", "May", "June",
                   "July", "August", "September", "October", "November", "December"]
         fy_combo.addItems(months)
-        current_fy_str = self.db.get_setting("fy_start_month", "November")
+        current_fy_str = self.db.settings.fy_start_month
         if current_fy_str in months:
             fy_combo.setCurrentText(current_fy_str)
         fin_form.addRow("Financial Year Start:", fy_combo)
 
+        interest_rate = QDoubleSpinBox()
+        interest_rate.setRange(0, 100)
+        interest_rate.setDecimals(2)
+        interest_rate.setSuffix(" %")
+        interest_rate.setValue(self.db.settings.default_interest_rate * 100)
+        interest_rate.setToolTip("Flat rate used to gross-up a loan's total "
+                                 "obligation on the ledger and statements.")
+        fin_form.addRow("Loan Interest Rate:", interest_rate)
+
         deduct_cb = QCheckBox("Allow Deduction in Same Month of Issue")
-        deduct_val = self.db.get_setting("deduct_same_month", "false")
-        deduct_cb.setChecked(deduct_val.lower() == "true")
+        deduct_cb.setChecked(self.db.settings.deduct_same_month)
         fin_form.addRow(deduct_cb)
         outer.addWidget(fin_box)
+
+        # --- Funds ---
+        # These three were readable by the code but had no UI, so the only way
+        # to change them was to edit the settings table by hand.
+        fund_box = QGroupBox("Funds")
+        fund_form = QFormLayout(fund_box)
+
+        unlock_combo = QComboBox()
+        unlock_combo.addItems(months)
+        unlock_idx = self.db.settings.christmas_unlock_month
+        if 1 <= unlock_idx <= 12:
+            unlock_combo.setCurrentIndex(unlock_idx - 1)
+        fund_form.addRow("Christmas Withdrawal Month:", unlock_combo)
+
+        savings_inc = QDoubleSpinBox()
+        savings_inc.setRange(0, 10_000_000)
+        savings_inc.setDecimals(2)
+        savings_inc.setGroupSeparatorShown(True)
+        savings_inc.setValue(self.db.settings.default_savings_increment)
+        fund_form.addRow("Default Monthly Savings:", savings_inc)
+
+        xmas_inc = QDoubleSpinBox()
+        xmas_inc.setRange(0, 10_000_000)
+        xmas_inc.setDecimals(2)
+        xmas_inc.setGroupSeparatorShown(True)
+        xmas_inc.setValue(self.db.settings.default_christmas_increment)
+        fund_form.addRow("Default Monthly Christmas:", xmas_inc)
+
+        fund_form.addRow(QLabel("<small>Defaults used when a member has no "
+                                "contribution history to infer an amount from.</small>"))
+        outer.addWidget(fund_box)
 
         # --- Appearance ---
         app_box = QGroupBox("Appearance")
@@ -1065,8 +1453,12 @@ class Dashboard(QWidget):
             self.db.set_setting(branding.ORG_NAME_KEY, org_name_edit.text().strip())
             self.db.set_setting(branding.ORG_LOGO_KEY, logo_edit.text().strip())
             self.db.set_setting("fy_start_month", fy_combo.currentText())
+            self.db.set_setting("default_interest_rate", interest_rate.value() / 100)
             self.db.set_setting("deduct_same_month",
                                 "true" if deduct_cb.isChecked() else "false")
+            self.db.set_setting("christmas_unlock_month", unlock_combo.currentIndex() + 1)
+            self.db.set_setting("default_savings_increment", savings_inc.value())
+            self.db.set_setting("default_christmas_increment", xmas_inc.value())
 
             # Reflect the organization name in the window title immediately.
             main_win = self.window()
@@ -1082,6 +1474,9 @@ class Dashboard(QWidget):
                 if hasattr(main_win, "ledger_view"):
                     main_win.ledger_view.theme_manager = self.theme_manager
                     main_win.ledger_view.apply_theme()
+                # Re-theme dialogs (application-level stylesheet) to match.
+                if hasattr(main_win, "apply_app_theme"):
+                    main_win.apply_app_theme()
                 QMessageBox.information(self, "Settings Saved", f"Settings updated. Theme changed to {selected_theme}.")
             else:
                 QMessageBox.information(self, "Settings Saved", "Settings have been updated successfully.")
@@ -1401,9 +1796,6 @@ class Dashboard(QWidget):
         from PyQt6.QtCore import QDate, Qt
         from dateutil.relativedelta import relativedelta
         from datetime import datetime
-        import platform
-        import subprocess
-        import os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
 
@@ -1588,29 +1980,59 @@ class Dashboard(QWidget):
                           for i in range(col_list.count())
                           if col_list.item(i).checkState() == Qt.CheckState.Checked]
 
+        # Generate off the GUI thread with progress + safe cancel, instead of
+        # freezing the window until the file is written.
+        db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
         if fund == "savings" and not custom:
-            success, msg = generator.generate_quarterly_savings_report(start, path, columns=chosen_columns)
+            worker = ReportWorker(db_name, self.get_printer_view, start, path,
+                                  report_type='savings', columns=chosen_columns)
         else:
-            success, msg = generator.generate_fund_report(fund, path, start, end, columns=chosen_columns)
+            worker = ReportWorker(db_name, self.get_printer_view, start, path,
+                                  report_type='fund', columns=chosen_columns,
+                                  end_date=end, fund=fund)
+        self._run_report_worker(worker, path)
 
-        if success:
-            QMessageBox.information(self, "Success", f"Report saved to:\n{path}")
-            try:
-                if platform.system() == 'Windows':
-                    os.startfile(path)
-                elif platform.system() == 'Darwin':
-                    subprocess.Popen(['open', path])
-                else:
-                    subprocess.Popen(['xdg-open', path])
-            except Exception:
-                pass
-        else:
-            QMessageBox.critical(self, "Error", f"Failed to generate report:\n{msg}")
+    def _run_report_worker(self, worker, file_path):
+        """Drive a ReportWorker with a modal progress dialog and safe cancel.
+
+        Shared by the loan and fund/savings report flows so each generates off
+        the GUI thread with real progress and cooperative cancellation instead
+        of freezing the window. On success the saved file is offered for opening
+        via report_saved.
+        """
+        progress = QProgressDialog("Generating Report...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        self.report_worker = worker
+
+        def on_progress(curr, total, msg):
+            progress.setMaximum(total)
+            progress.setValue(curr)
+            progress.setLabelText(msg)
+            if progress.wasCanceled() and getattr(self, 'report_worker', None):
+                self.report_worker.cancel()
+
+        def on_finished(success, message):
+            progress.close()
+            if success:
+                from .file_actions import report_saved
+                report_saved(self, "Success", file_path)
+            elif message == "Cancelled":
+                pass  # user asked to stop; nothing to report
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
+            self.report_worker = None
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.start()
 
     def generate_quarterly_report(self):
         """Generate quarterly loan interest report."""
         from ..reports import ReportGenerator
-        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox, QFileDialog, QMessageBox,
+        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDialogButtonBox, QFileDialog,
                                      QComboBox, QPushButton, QListWidget, QListWidgetItem, QGroupBox,
                                      QHBoxLayout, QVBoxLayout)
         from PyQt6.QtCore import Qt
@@ -1755,39 +2177,12 @@ class Dashboard(QWidget):
             )
             
             if file_path:
-                # Pass printer_view_getter for PDF support
-                # generator already instantiated
-                
-                # Setup Progress Dialog
-                progress = QProgressDialog("Generating Report...", "Cancel", 0, 100, self)
-                progress.setWindowModality(Qt.WindowModality.WindowModal)
-                progress.setMinimumDuration(0)
-                progress.setValue(0)
-                
-                # Setup Thread
+                # Generate off the GUI thread with progress + safe cancel.
                 db_name = self.db.db_name if hasattr(self.db, 'db_name') else "loan_master.db"
-                self.report_worker = ReportWorker(db_name, self.get_printer_view, start_date, file_path, report_type='loan', columns=chosen_columns)
-                
-                def on_progress(curr, total, msg):
-                    progress.setMaximum(total)
-                    progress.setValue(curr)
-                    progress.setLabelText(msg)
-                    if progress.wasCanceled():
-                        if getattr(self, 'report_worker', None):
-                            self.report_worker.terminate()
-                        
-                def on_finished(success, message):
-                    progress.close()
-                    if success:
-                        QMessageBox.information(self, "Success", f"Report saved to:\n{file_path}")
-                    else:
-                        QMessageBox.critical(self, "Error", f"Failed to generate report:\n{message}")
-                    self.report_worker = None
-                    
-                self.report_worker.progress.connect(on_progress)
-                self.report_worker.finished.connect(on_finished)
-                
-                self.report_worker.start()
+                worker = ReportWorker(db_name, self.get_printer_view, start_date,
+                                      file_path, report_type='loan',
+                                      columns=chosen_columns)
+                self._run_report_worker(worker, file_path)
 
     def open_mass_savings_dialog(self):
         """Open dialog for Mass Savings Increment."""
@@ -1799,7 +2194,7 @@ class Dashboard(QWidget):
         
         layout.addWidget(QLabel("<b>Select individuals to increment savings:</b>"))
         layout.addWidget(QLabel("Checked individuals will be processed to catch up savings contributions."))
-        default_amount = self.db.get_setting("default_savings_increment", "2500")
+        default_amount = self.db.settings.default_savings_increment
         layout.addWidget(QLabel(f"<i>Amt will be auto-detected from each user's last transaction (Default: {default_amount}).</i>"))
         
         # Get all individuals
@@ -1847,10 +2242,10 @@ class Dashboard(QWidget):
             
             if bal > 0:
                 cb.setChecked(True)
-                cb.setText(label_text + f" (Bal: {bal:,.0f}) [Auto: {auto_amt:,.0f}]")
+                cb.setText(label_text + f" (Bal: {format_money(bal)}) [Auto: {format_money(auto_amt)}]")
             else:
                  # Even if bal is 0, show what auto would correspond to (likely 2500)
-                 cb.setText(label_text + f" [Auto: {auto_amt:,.0f}]")
+                 cb.setText(label_text + f" [Auto: {format_money(auto_amt)}]")
             
             cb.setProperty("ind_id", ind[0])
             checkboxes.append(cb)
@@ -2009,9 +2404,6 @@ class Dashboard(QWidget):
         from ..reports import ReportGenerator
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QDialogButtonBox, QFileDialog,
                                      QProgressDialog)
-        import platform
-        import subprocess
-        import os
 
         generator = ReportGenerator(self.db, printer_view_getter=self.get_printer_view)
         default_on = {"name", "pf_no", "id_no", "phone", "employment_status"}
@@ -2079,18 +2471,57 @@ class Dashboard(QWidget):
         progress.close()
 
         if success:
-            QMessageBox.information(self, "Members List", f"Saved to:\n{path}")
-            try:
-                if platform.system() == 'Windows':
-                    os.startfile(path)
-                elif platform.system() == 'Darwin':
-                    subprocess.Popen(['open', path])
-                else:
-                    subprocess.Popen(['xdg-open', path])
-            except Exception:
-                pass
+            from .file_actions import report_saved
+            report_saved(self, "Members List", path, what="members list")
         else:
             QMessageBox.critical(self, "Members List", f"Export failed:\n{msg}")
+
+    @staticmethod
+    def _format_before_image(raw):
+        """Render an audit before-image as a short, readable line.
+
+        Stored as JSON by the triggers so it survives any schema change; shown
+        as `date 2026-01-15, deducted 5,750` rather than raw JSON, with the
+        full record on the tooltip.
+        """
+        if not raw:
+            return ""
+        import json
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return str(raw)
+        skip = {"individual_id"}
+        parts = []
+        for key, value in data.items():
+            if key in skip or value in (None, 0, 0.0, ""):
+                continue
+            if isinstance(value, float):
+                value = f"{value:,.2f}"
+            parts.append(f"{key.replace('_', ' ')} {value}")
+        return ", ".join(parts)
+
+    def show_health_check(self):
+        """Open the full integrity report."""
+        from .integrity_report import IntegrityReportDialog
+        IntegrityReportDialog(self.db, self.theme_manager, self).exec()
+
+    def open_restore_dialog(self):
+        """Restore the journal from a backup, refreshing everything after."""
+        from .restore_backup import RestoreBackupDialog
+        RestoreBackupDialog(self.db, self.theme_manager, self,
+                            on_restored=self._after_restore).exec()
+
+    def _after_restore(self):
+        """Every cached figure on screen is now stale — reload from the journal."""
+        try:
+            self.refresh_list()
+        except Exception:                       # noqa: BLE001 - never leave a dead screen
+            logger.exception("Could not refresh the dashboard after a restore")
+            QMessageBox.information(
+                self, "Restored",
+                "The journal was restored. Please close and reopen the "
+                "application so every screen reloads.")
 
     def show_activity_log(self):
         """View the CRUD audit trail (member/loan create/update/delete with dates)."""
@@ -2103,8 +2534,9 @@ class Dashboard(QWidget):
         layout = QVBoxLayout(dlg)
         layout.addWidget(QLabel(f"Most recent {len(entries)} create/update/delete events:"))
         table = QTableWidget()
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["When", "Operation", "Type", "Who / What"])
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(
+            ["When", "Operation", "Type", "Who / What", "Previous values"])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setRowCount(len(entries))
@@ -2113,6 +2545,12 @@ class Dashboard(QWidget):
             table.setItem(i, 1, QTableWidgetItem(e["operation"]))
             table.setItem(i, 2, QTableWidgetItem(e["entity"]))
             table.setItem(i, 3, QTableWidgetItem(str(e["summary"] or "")))
+            # The before-image recorded by the migration-007 triggers. Without
+            # it the log answers "this was changed" but never "from what?",
+            # which is the only question worth asking about a money row.
+            before = QTableWidgetItem(self._format_before_image(e.get("before_image")))
+            before.setToolTip(str(e.get("before_image") or ""))
+            table.setItem(i, 4, before)
         layout.addWidget(table)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(dlg.reject); bb.accepted.connect(dlg.accept)
@@ -2122,11 +2560,24 @@ class Dashboard(QWidget):
     def open_repair_loans_dialog(self):
         """Scan for legacy loans with stale terms / contaminated accruals and heal them."""
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
-                                     QHeaderView, QDialogButtonBox, QProgressDialog)
-        import shutil
-        from datetime import datetime
+                                     QHeaderView, QDialogButtonBox, QProgressDialog, QMessageBox)
+        from src import migrations
 
-        healable = self.engine.scan_healable_loans()
+        if migrations.schema_version(self.db.conn) < 3:
+            QMessageBox.warning(
+                self, "Migration Required",
+                "Database migrations have not completed. Please run the Orphan Repair tool "
+                "first to resolve legacy data issues before repairing loan terms."
+            )
+            return
+
+        try:
+            healable = self.engine.scan_healable_loans()
+        except Exception as e:
+            from src.views.error_handling import report
+            report(e, parent=self, context="scanning healable loans")
+            return
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Repair Loans")
         dlg.setMinimumSize(640, 460)
@@ -2182,7 +2633,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    shutil.copy(src, f"{src}.pre-repair-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.snapshot("repair-loans")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return
@@ -2212,7 +2663,6 @@ class Dashboard(QWidget):
         """
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget,
                                      QHeaderView, QDialogButtonBox)
-        import shutil
         from datetime import datetime
 
         orphans = self.db.find_orphaned_rows()
@@ -2287,7 +2737,7 @@ class Dashboard(QWidget):
             src = getattr(self.db, "db_name", None)
             if src:
                 try:
-                    shutil.copy(src, f"{src}.pre-orphan-clean-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+                    self.db.snapshot("orphan-clean")
                 except Exception as e:
                     QMessageBox.warning(dlg, "Backup", f"Could not back up DB ({e}). Aborted.")
                     return
@@ -2509,13 +2959,6 @@ class Dashboard(QWidget):
             msg += f"\n... and {len(errors) - 10} more."
             
         QMessageBox.warning(self, "Partial Failures", msg)
-
-    def open_treasury(self):
-        """Open the Treasury and General Ledger dialog."""
-        from .treasury import TreasuryDialog
-        dialog = TreasuryDialog(self.db, self.theme_manager, self)
-        dialog.exec()
-
 
 from PyQt6.QtCore import QThread, pyqtSignal
 

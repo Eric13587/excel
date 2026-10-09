@@ -2,6 +2,7 @@
 import glob
 import logging
 import os
+import re
 import sqlite3
 import pandas as pd
 import json
@@ -10,22 +11,96 @@ from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
+from src import migrations
+from src.db import import_rules
+from src.db import (AuditRepository, FundRepository, ImportHistoryRepository,
+                    LedgerRepository, LoanRepository, MemberRepository,
+                    RepairRepository, SettingsRepository, SourceJournal)
 from src.exceptions import TransactionError
 from src.data_structures import StatementData
 
 # How many timestamped on-open backups to keep per journal.
 BACKUP_KEEP_COUNT = 10
+# What an on-open backup's name looks like after "<stem>.": a timestamp only.
+_ON_OPEN_BACKUP = re.compile(r"\d{8}-\d{6}\.db")
+
+# How long a writer waits for a competing writer before giving up. Mass
+# operations (catch-up over thousands of loans) and the report thread's second
+# connection routinely hold locks for seconds, and the previous 5s ceiling
+# surfaced as a hard failure mid-operation rather than as latency.
+BUSY_TIMEOUT_MS = 30000
+
+# Page cache (negative == KiB rather than pages). 64 MiB keeps the hot ledger
+# and journal pages resident during recalculation loops.
+CACHE_SIZE_KIB = -65536
+
+# Cap the WAL file after a checkpoint so a large batch cannot leave a
+# permanently inflated sidecar next to the journal.
+WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
+
+# Filesystems where SQLite's locking is unreliable. WAL additionally needs a
+# shared-memory (-shm) mapping that these do not provide, so a journal hosted
+# on one stays in rollback-journal mode.
+NETWORK_FILESYSTEMS = frozenset({
+    "nfs", "nfs4", "cifs", "smbfs", "smb2", "smb3", "afs", "ncpfs",
+    "9p", "davfs", "fuse.davfs", "fuse.sshfs", "glusterfs", "ceph", "lustre",
+})
+
+# Override the journal-mode decision: "wal", "delete", or "auto" (default).
+JOURNAL_MODE_ENV = "LOANMASTER_JOURNAL_MODE"
 
 
 class DatabaseManager:
-    """Handles all SQLite database operations."""
+    """Owns the connection and composes the repository layer.
 
-    def __init__(self, db_name="loan_master.db", auto_backup=False):
+    This is the composition root the Phase 2 design called ``DatabaseService``.
+    It was not introduced as a separate class: ``DatabaseManager`` already owns
+    the connection, already provides the transaction boundary, and after Phase 2
+    exposes exactly one repository per aggregate. A second class beside it would
+    have duplicated that for a name, and renaming this one would have touched
+    every call site for no functional gain.
+
+    Repositories (each owns every statement touching its tables)::
+
+        db.members    individuals
+        db.loans      loans, loan_suspensions
+        db.ledger     ledger
+        db.funds      savings, christmas_savings, benevolent_ledger,
+                      benevolent_accounts
+        db.settings   settings
+        db.imports    import_history
+        db.audit      audit_log
+        db.repair     cross-table orphan queries
+
+    ``SourceJournal`` wraps a *foreign* journal read-only during an import.
+
+    The methods on this class are the API the rest of the application uses;
+    each one now delegates to a repository and supplies the transaction. The
+    remaining SQL here is schema DDL in ``create_tables``, which
+    ``schema.sql`` plus the migration runner will take over.
+
+    Repositories never commit — the caller owns the transaction — so a
+    multi-statement operation is atomic.
+    """
+
+    def __init__(self, db_name="loan_master.db", auto_backup=False, bootstrap="auto"):
+        """Open (or create) a journal.
+
+        ``bootstrap`` controls how a brand-new journal is built. "auto" applies
+        the generated final schema directly; "legacy" forces the historical
+        path — legacy table shapes plus every migration — which is how
+        tools/dump_schema regenerates that schema without circularity.
+        """
         self.db_name = db_name
         pre_existing = db_name != ":memory:" and os.path.exists(db_name)
         self.conn = sqlite3.connect(db_name)
         self._closed = False
         self.integrity_ok = True
+        # Set by _configure_connection; declared here so callers can read them
+        # even if configuration failed.
+        self.journal_mode = "delete"
+        self.fk_enforced = False
+        self.fk_violations = 0
         # Snapshot the journal before create_tables() runs schema migrations,
         # so a bad migration can always be rolled back from the backup.
         if auto_backup and pre_existing:
@@ -33,36 +108,176 @@ class DatabaseManager:
         if pre_existing:
             self._check_integrity()
         self._configure_connection()
-        # Optional write-path hooks: called with a list of just-inserted row ids
-        # after a ledger/savings insert, so the general ledger can post the
-        # matching journals live (see GLService.post_ledger_rows). Left as None
-        # in tests / headless contexts; a failing hook never breaks the insert.
-        self.ledger_post_hook = None
-        self.savings_post_hook = None
-        self.create_tables()
+        # Repository layer (Phase 2). DatabaseManager delegates to these as each
+        # one lands, so its public API is unchanged for existing callers.
+        self.settings = SettingsRepository(self.conn)
+        self.members = MemberRepository(self.conn)
+        self.funds = FundRepository(self.conn)
+        self.loans = LoanRepository(self.conn)
+        self.ledger = LedgerRepository(self.conn)
+        self.repair = RepairRepository(self.conn)
+        self.imports = ImportHistoryRepository(self.conn)
+        self.audit = AuditRepository(self.conn)
+        if bootstrap == "auto" and self._is_empty_journal():
+            # A brand-new journal is built in its final shape. The legacy path
+            # below creates the pre-migration tables and then has migration 004
+            # rebuild all fourteen of them — 52% of the cost of creating a
+            # journal, spent undoing work that was just done.
+            self.migration_report = self._bootstrap_new_journal()
+        else:
+            self.create_tables()
+            # Versioned migrations run after the legacy bootstrap, so an
+            # existing journal converges on the same schema a new one is built
+            # with. Failure is reported, never fatal: a journal that cannot be
+            # migrated must still open so its data can be exported or repaired.
+            self.migration_report = migrations.apply_pending(self.conn)
+        # Needed on both paths — a new journal is bootstrapped, not migrated.
+        self._create_participation_table()
+        if not self.migration_report.ok:
+            logger.error("Schema migration incomplete — %s", self.migration_report.summary())
+        # Cascading deletes may have just become available, and a repaired
+        # journal may now qualify for enforcement.
+        self._evaluate_foreign_keys()
+
+    def _storage_kind(self):
+        """Classify where the journal lives: 'memory', 'local', 'network' or
+        'unknown'.
+
+        Only a *positively identified* local filesystem is allowed to run in
+        WAL mode. Anything unrecognised is treated as unsafe, so the fallback
+        is always the mode this application already shipped with.
+        """
+        if self.db_name == ":memory:" or not self.db_name:
+            return "memory"
+        try:
+            path = os.path.abspath(self.db_name)
+        except Exception:
+            return "unknown"
+
+        # Windows: UNC paths and mapped network drives.
+        if os.name == "nt":
+            if path.startswith("\\\\"):
+                return "network"
+            try:
+                import ctypes
+                drive = os.path.splitdrive(path)[0]
+                if drive:
+                    # 3 == DRIVE_FIXED, 4 == DRIVE_REMOTE
+                    kind = ctypes.windll.kernel32.GetDriveTypeW(f"{drive}\\")
+                    if kind == 4:
+                        return "network"
+                    if kind == 3:
+                        return "local"
+            except Exception:
+                logger.debug("Could not classify drive for %s", path, exc_info=True)
+            return "unknown"
+
+        # Linux: resolve the path to its mount point via /proc/mounts.
+        try:
+            with open("/proc/mounts", encoding="utf-8", errors="replace") as fh:
+                mounts = []
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        mounts.append((parts[1], parts[2]))
+        except OSError:
+            return "unknown"
+
+        best_point, best_type = "", None
+        for point, fstype in mounts:
+            if (path == point or path.startswith(point.rstrip("/") + "/")) \
+                    and len(point) >= len(best_point):
+                best_point, best_type = point, fstype
+        if best_type is None:
+            return "unknown"
+        return "network" if best_type.lower() in NETWORK_FILESYSTEMS else "local"
+
+    def _select_journal_mode(self):
+        """Decide the journal mode, honouring an explicit operator override.
+
+        WAL lets the report thread's second connection read while a mass
+        operation writes; in rollback-journal mode those block each other.
+        It is only safe on local storage, so 'auto' enables it exclusively
+        there.
+        """
+        override = (os.environ.get(JOURNAL_MODE_ENV) or "auto").strip().lower()
+        if override in ("wal", "delete"):
+            return override, f"explicit {JOURNAL_MODE_ENV}={override}"
+        if override != "auto":
+            logger.warning("Ignoring unrecognised %s=%r", JOURNAL_MODE_ENV, override)
+
+        kind = self._storage_kind()
+        if kind == "local":
+            return "wal", "local storage"
+        if kind == "memory":
+            return "delete", "in-memory journal"
+        return "delete", f"{kind} storage (WAL unsafe)"
 
     def _configure_connection(self):
-        """Apply per-connection safety settings.
+        """Apply per-connection safety and durability settings.
 
         - busy_timeout: wait instead of failing immediately when another
-          process (this is a multi-user app) briefly locks the journal.
-        - foreign_keys: enforce the FKs the schema already declares, but only
-          when the existing data passes a consistency check — enabling
-          enforcement on top of legacy orphan rows would make unrelated
-          writes start failing at runtime.
-
-        journal_mode is deliberately left at the SQLite default (DELETE):
-        WAL persists inside the database file and is unsafe on network
-        shares, which is how multi-user journals are commonly hosted.
+          process (this is a multi-user app) locks the journal.
+        - foreign_keys: enforce the FKs the schema already declares. Left OFF
+          only when the existing data would immediately violate them —
+          enabling enforcement on top of legacy orphan rows makes unrelated
+          writes start failing at runtime. That fallback is now reported
+          through ``fk_enforced``/``fk_violations`` so the UI can surface it
+          rather than only logging.
+        - journal_mode: WAL on local storage (concurrent reader + writer,
+          cheaper commits, faster crash recovery); rollback journal anywhere
+          it is not provably safe. See _select_journal_mode.
+        - synchronous FULL: a financial journal must not lose committed
+          transactions on power loss.
         """
         cur = self.conn.cursor()
-        cur.execute("PRAGMA busy_timeout = 5000")
+        cur.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+
+        desired, reason = self._select_journal_mode()
+        try:
+            actual = cur.execute(f"PRAGMA journal_mode = {desired}").fetchone()[0]
+        except sqlite3.DatabaseError as e:
+            actual, = ("unknown",)
+            logger.warning("Could not set journal_mode=%s: %s", desired, e)
+        self.journal_mode = (actual or "").lower()
+        if desired == "wal" and self.journal_mode != "wal":
+            # SQLite refused (typically a filesystem without shared memory).
+            # It has already fallen back on its own; record what we ended up with.
+            logger.warning("WAL requested (%s) but journal is in %r mode",
+                           reason, self.journal_mode)
+        else:
+            logger.info("journal_mode=%s (%s)", self.journal_mode, reason)
+
+        cur.execute("PRAGMA synchronous = FULL")
+        cur.execute(f"PRAGMA cache_size = {CACHE_SIZE_KIB}")
+        cur.execute("PRAGMA temp_store = MEMORY")
+        if self.journal_mode == "wal":
+            cur.execute(f"PRAGMA journal_size_limit = {WAL_SIZE_LIMIT_BYTES}")
+
+        self._evaluate_foreign_keys()
+
+    def _evaluate_foreign_keys(self):
+        """Turn foreign-key enforcement on unless the data would break instantly.
+
+        Split out from _configure_connection so it can be re-run cheaply after a
+        repair or a migration without redoing the whole pragma set (the
+        foreign_key_check itself is a full scan and should not be paid twice on
+        open). PRAGMA foreign_keys is a no-op inside a transaction, so this
+        refuses to guess when one is in flight.
+        """
+        if self.conn.in_transaction:
+            logger.debug("Skipping foreign-key evaluation: transaction in flight")
+            return self.fk_enforced
+        cur = self.conn.cursor()
         try:
             violations = cur.execute("PRAGMA foreign_key_check").fetchall()
         except sqlite3.DatabaseError:
             violations = None
+        self.fk_violations = len(violations) if violations else 0
         if violations:
             tables = sorted({v[0] for v in violations})
+            cur.execute("PRAGMA foreign_keys = OFF")
+            self.fk_enforced = False
             logger.warning(
                 "Foreign-key enforcement left OFF: %d orphaned row(s) in %s. "
                 "Run the Repair tools to fix legacy data.",
@@ -70,6 +285,10 @@ class DatabaseManager:
             )
         elif violations is not None:
             cur.execute("PRAGMA foreign_keys = ON")
+            self.fk_enforced = bool(cur.execute("PRAGMA foreign_keys").fetchone()[0])
+        else:
+            self.fk_enforced = False
+        return self.fk_enforced
 
     def _check_integrity(self):
         """Run SQLite's quick_check and record the result.
@@ -104,17 +323,39 @@ class DatabaseManager:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             dest_path = os.path.join(backup_dir, f"{stem}.{stamp}.db")
             if not os.path.exists(dest_path):
-                dest = sqlite3.connect(dest_path)
-                try:
-                    self.conn.backup(dest)
-                finally:
-                    dest.close()
-                logger.info("Journal backed up to %s", dest_path)
-            old_backups = sorted(glob.glob(os.path.join(backup_dir, f"{stem}.*.db")))
+                self.backup_to(dest_path)
+            # Only the dated on-open copies rotate. A bare "{stem}.*.db" also
+            # matched the named safety backups (pre-delete-loan-…, pre-repair-…),
+            # and since digits sort before letters, the copy just written was
+            # always the first to go — every on-open backup was deleted the
+            # moment it was made once ten named ones had built up.
+            old_backups = sorted(
+                path for path in glob.glob(os.path.join(backup_dir, f"{stem}.*.db"))
+                if _ON_OPEN_BACKUP.fullmatch(os.path.basename(path)[len(stem) + 1:]))
             for stale in old_backups[:-keep]:
                 os.remove(stale)
         except Exception:
             logger.exception("Automatic backup failed (continuing without it)")
+
+    def backup_to(self, dest_path):
+        """Write a consistent copy of the journal to dest_path.
+
+        Uses SQLite's online-backup API rather than a file copy. Under WAL the
+        committed state is split between the database file and its -wal
+        sidecar, so copying only the .db silently loses every transaction that
+        has not been checkpointed yet — a backup that looks fine and is
+        missing the most recent work. The backup API always produces a single
+        fully-checkpointed file, and is safe against concurrent writers.
+
+        Returns the destination path.
+        """
+        dest = sqlite3.connect(dest_path)
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
+        logger.info("Journal backed up to %s", dest_path)
+        return dest_path
 
     # ------------------------------------------------------------------
     # Orphaned-record repair
@@ -128,18 +369,7 @@ class DatabaseManager:
 
     def _tables_with_individual_id(self):
         """All tables (except individuals) that carry an individual_id column."""
-        cur = self.conn.cursor()
-        tables = [r[0] for r in cur.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()]
-        out = []
-        for t in tables:
-            if t == "individuals":
-                continue
-            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t})").fetchall()]
-            if "individual_id" in cols:
-                out.append(t)
-        return out
+        return self.repair.child_tables()
 
     def find_orphaned_rows(self):
         """Group child rows whose individual_id no longer exists.
@@ -152,18 +382,10 @@ class DatabaseManager:
         (dates are None for tables without a date column).
         """
         summary = []
-        cur = self.conn.cursor()
-        for t in self._tables_with_individual_id():
-            cols = [c[1] for c in cur.execute(f"PRAGMA table_info({t})").fetchall()]
-            date_expr = "MIN(o.date), MAX(o.date)" if "date" in cols else "NULL, NULL"
-            rows = cur.execute(
-                f"SELECT o.individual_id, COUNT(*), {date_expr} FROM {t} o "
-                f"LEFT JOIN individuals i ON i.id = o.individual_id "
-                f"WHERE i.id IS NULL GROUP BY o.individual_id "
-                f"ORDER BY o.individual_id").fetchall()
-            for ind_id, n, dmin, dmax in rows:
-                summary.append({"table": t, "individual_id": ind_id, "rows": n,
-                                "first_date": dmin, "last_date": dmax})
+        for table in self.repair.child_tables():
+            for ind_id, n, first, last in self.repair.orphan_groups(table):
+                summary.append({"table": table, "individual_id": ind_id, "rows": n,
+                                "first_date": first, "last_date": last})
         return summary
 
     def export_orphaned_rows(self, path):
@@ -179,13 +401,10 @@ class DatabaseManager:
             pd.DataFrame(summary, columns=["table", "individual_id", "rows",
                                            "first_date", "last_date"]) \
                 .to_excel(writer, sheet_name="Summary", index=False)
-            for t in self._tables_with_individual_id():
-                df = pd.read_sql_query(
-                    f"SELECT o.* FROM {t} o "
-                    f"LEFT JOIN individuals i ON i.id = o.individual_id "
-                    f"WHERE i.id IS NULL", self.conn)
+            for table in self.repair.child_tables():
+                df = self.repair.orphan_frame(table)
                 if not df.empty:
-                    df.to_excel(writer, sheet_name=t[:31], index=False)
+                    df.to_excel(writer, sheet_name=table[:31], index=False)
                     total += len(df)
         logger.info("Exported %d orphaned row(s) to %s", total, path)
         return total
@@ -194,34 +413,38 @@ class DatabaseManager:
         """Delete every orphaned row in a single transaction.
 
         Matches find_orphaned_rows() exactly (NULL individual_id included).
-        Afterwards the connection is re-configured, so FK enforcement
-        switches on immediately if the journal is now consistent.
+        Afterwards foreign-key enforcement is re-evaluated, so it switches on
+        immediately if the journal is now consistent.
         Returns {table: rows_deleted} for tables that had orphans.
         """
         counts = {}
         with self.transaction():
-            cur = self.conn.cursor()
-            for t in self._tables_with_individual_id():
-                cur.execute(
-                    f"DELETE FROM {t} WHERE individual_id IS NULL "
-                    f"OR individual_id NOT IN (SELECT id FROM individuals)")
-                if cur.rowcount:
-                    counts[t] = cur.rowcount
+            for table in self.repair.child_tables():
+                removed = self.repair.delete_orphans(table)
+                if removed:
+                    counts[table] = removed
         logger.info("Deleted orphaned rows: %s", counts or "none")
-        self._configure_connection()
+        self._evaluate_foreign_keys()
         return counts
 
-    def _fire_post_hook(self, hook, ids):
-        """Invoke a write-path hook defensively — never break the core write."""
-        if hook and ids:
-            try:
-                hook(ids)
-            except Exception as e:
-                logger.warning("GL post hook failed (will reconcile on next sync): %s", e)
-    
     def close(self):
-        """Close the database connection."""
-        if self.conn and not self._closed:
+        """Close the database connection.
+
+        PRAGMA optimize refreshes the query planner's statistics for indexes
+        whose selectivity has shifted during the session. Without it SQLite
+        plans against stale (or absent) sqlite_stat1 data, which is how a
+        journal that was fast at 2,000 ledger rows starts full-scanning at
+        200,000. Best effort — never let it block a clean shutdown.
+        """
+        # getattr, not attribute access: if __init__ raised before setting
+        # these, __del__ still calls close(), and an AttributeError raised
+        # there is swallowed by the interpreter and printed as "Exception
+        # ignored" — burying the real failure under noise.
+        if getattr(self, "conn", None) and not getattr(self, "_closed", False):
+            try:
+                self.conn.execute("PRAGMA optimize")
+            except sqlite3.DatabaseError:
+                logger.debug("PRAGMA optimize failed on close", exc_info=True)
             self.conn.close()
             self._closed = True
     
@@ -256,15 +479,32 @@ class DatabaseManager:
     @contextmanager
     def transaction(self):
         """Context manager for database transactions with automatic rollback on failure.
-        
+
         Usage:
             with db.transaction():
                 db.add_individual(...)
                 db.add_loan_record(...)
-        
+
         If any exception occurs, the transaction is rolled back.
+
+        Opens with BEGIN IMMEDIATE, which takes the write lock up front. The
+        default deferred BEGIN acquires a read lock and only tries to upgrade
+        at the first write; if another connection took the write lock in
+        between, SQLite returns SQLITE_BUSY *without consulting the busy
+        handler* — because waiting there would deadlock. So busy_timeout does
+        not protect a read-then-write transaction, and this application has
+        exactly that shape (read the ledger, compute, write it back) plus a
+        second connection opened by the report thread.
+
+        Re-entrant: a nested call joins the transaction already in flight
+        rather than failing on "cannot start a transaction within a
+        transaction", so composing two guarded operations stays safe.
         """
+        if self.conn.in_transaction:
+            yield          # already inside a transaction; the outermost owns commit/rollback
+            return
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
             yield
             self.conn.commit()
         except sqlite3.Error as e:
@@ -273,6 +513,129 @@ class DatabaseManager:
         except Exception:
             self.conn.rollback()
             raise
+
+    def _is_empty_journal(self):
+        """True when this connection holds no user tables at all.
+
+        File existence is not the test: several callers create the file with
+        tempfile.mkstemp and hand over an empty one, and an empty file is a new
+        journal however it came to exist.
+        """
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 0
+
+    def _bootstrap_new_journal(self):
+        """Create a new journal directly in its final shape.
+
+        Applies src/migrations/schema_bootstrap.sql — generated from the legacy
+        path plus every migration, and verified by tests to be schema-identical
+        to it — then records those migrations as applied, because they have
+        been, by construction.
+
+        Falls back to the legacy path if the file is missing or unusable. It is
+        an optimisation; being unable to read it must not stop a journal
+        opening.
+        """
+        path = os.path.join(migrations.migrations_dir(), "schema_bootstrap.sql")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                script = fh.read()
+            self.conn.executescript(script)
+            self.conn.commit()
+        except (OSError, sqlite3.DatabaseError) as e:
+            logger.warning("Could not bootstrap from %s (%s); using the legacy path",
+                           path, e)
+            self.conn.rollback()
+            self.create_tables()
+            return migrations.apply_pending(self.conn)
+
+        self._seed_reference_data(self.conn.cursor())
+        self.conn.commit()
+        return migrations.mark_all_applied(self.conn)
+
+    # Migrations that carry *data*, not schema. schema_bootstrap.sql is dumped
+    # from sqlite_master, so it holds DDL only; anything a migration inserts has
+    # to be applied separately when a journal takes the fast path. Getting this
+    # wrong gives a journal the right shape and the wrong contents, which is why
+    # test_a_new_journal_has_the_same_reference_data_as_a_migrated_one exists.
+    _SEED_MIGRATIONS = ("002_seed_default_settings.sql",)
+
+    def _seed_reference_data(self, cursor):
+        """Rows a journal is unusable without. Idempotent.
+
+        Shared by both bootstrap paths, so a new journal cannot end up with the
+        schema but not the chart of accounts or the default settings.
+        """
+        for filename in self._SEED_MIGRATIONS:
+            path = os.path.join(migrations.migrations_dir(), filename)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    statements = migrations.split_statements(fh.read())
+            except OSError:
+                logger.warning("Seed migration %s is missing", filename)
+                continue
+            for statement in statements:
+                cursor.execute(statement)
+
+    def _general_ledger_removed(self):
+        """True once migration 011 has withdrawn the general ledger."""
+        try:
+            return self.conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE version >= 11 LIMIT 1"
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            return False        # pre-migration journal: nothing recorded yet
+
+    def _create_legacy_gl_tables(self, cursor):
+        """The general-ledger tables as migrations 001 and 004 expect them.
+
+        Retained only so already-applied history runs unmodified on a new
+        journal; migration 011 drops all of it a moment later.
+        """
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS general_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT, category TEXT, type TEXT, amount REAL,
+                notes TEXT, batch_id TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chart_of_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                normal_balance TEXT NOT NULL,
+                is_active INTEGER DEFAULT 1,
+                description TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS journal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_date TEXT NOT NULL,
+                memo TEXT, source TEXT, source_ref TEXT,
+                status TEXT DEFAULT 'posted',
+                reversal_of INTEGER, created_at TEXT, created_by TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS journal_lines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id INTEGER NOT NULL,
+                account_code TEXT NOT NULL,
+                debit REAL DEFAULT 0, credit REAL DEFAULT 0, line_memo TEXT,
+                FOREIGN KEY(entry_id) REFERENCES journal_entries(id),
+                FOREIGN KEY(account_code) REFERENCES chart_of_accounts(code)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_entry "
+                       "ON journal_lines(entry_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_account "
+                       "ON journal_lines(account_code)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_source "
+                       "ON journal_entries(source, source_ref)")
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -482,6 +845,15 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE savings ADD COLUMN import_id INTEGER")
         except sqlite3.OperationalError:
             pass
+        # batch_id was only ever added by create_savings_table(), which runs
+        # lazily from the savings read/write helpers — so a freshly created
+        # journal had a `savings` table without it until the first savings
+        # operation. The two definitions of this table disagreed; this makes the
+        # canonical one authoritative.
+        try:
+            cursor.execute("ALTER TABLE savings ADD COLUMN batch_id TEXT")
+        except sqlite3.OperationalError:
+            pass
 
         # ===== Christmas fund (a second savings pot, withdrawals lock outside
         # the unlock month) and Benevolent fund (perpetual welfare contribution
@@ -563,74 +935,20 @@ class DatabaseManager:
             )
         """)
         
-        # Legacy single-entry treasury table — FROZEN. No longer written to;
-        # retained so GLService.migrate_legacy_gl can convert any historical
-        # rows into balanced double-entry journals. New treasury activity is
-        # posted via journal_entries/journal_lines.
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS general_ledger (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                category TEXT,
-                type TEXT,
-                amount REAL,
-                notes TEXT,
-                batch_id TEXT
-            )
-        """)
+        # ----------------------------------------------------------------- #
+        # General-ledger tables, created only so the already-applied history
+        # in migrations 001 and 004 can run over them; 011 drops them again.
+        #
+        # Skipped once 011 has run. create_tables executes on *every* open, so
+        # without this guard each reopen would resurrect the tables that
+        # migration had just dropped — and 011, already recorded as applied,
+        # would never run again to clear them.
+        # ----------------------------------------------------------------- #
+        if not self._general_ledger_removed():
+            self._create_legacy_gl_tables(cursor)
 
-        # ===== Double-entry General Ledger =====
-        # chart_of_accounts is the account master; journal_entries are balanced
-        # transaction headers; journal_lines carry the debit/credit detail. Every
-        # posted entry satisfies SUM(debit) == SUM(credit), so the books balance
-        # by construction (enforced in GLService.post_journal, not the schema).
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS chart_of_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                type TEXT NOT NULL,            -- Asset|Liability|Equity|Income|Expense
-                normal_balance TEXT NOT NULL,  -- 'debit' | 'credit'
-                is_active INTEGER DEFAULT 1,
-                description TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS journal_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_date TEXT NOT NULL,
-                memo TEXT,
-                source TEXT,            -- manual|loan_disbursement|repayment|savings|interest|migration|backfill
-                source_ref TEXT,        -- link back to the originating subledger row (idempotency key)
-                status TEXT DEFAULT 'posted',  -- posted|reversed|reversal
-                reversal_of INTEGER,    -- journal_entries.id this reverses, if any
-                created_at TEXT,
-                created_by TEXT
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS journal_lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry_id INTEGER NOT NULL,
-                account_code TEXT NOT NULL,
-                debit REAL DEFAULT 0,
-                credit REAL DEFAULT 0,
-                line_memo TEXT,
-                FOREIGN KEY(entry_id) REFERENCES journal_entries(id),
-                FOREIGN KEY(account_code) REFERENCES chart_of_accounts(code)
-            )
-        """)
-        # Indexes for the hot lookups (posting balance checks, trial balance).
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_entry ON journal_lines(entry_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_code)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_journal_entries_source ON journal_entries(source, source_ref)")
 
-        # Seed the standard chart of accounts (idempotent — UNIQUE code + IGNORE).
-        from src.config import DEFAULT_CHART_OF_ACCOUNTS
-        cursor.executemany(
-            "INSERT OR IGNORE INTO chart_of_accounts (code, name, type, normal_balance) VALUES (?, ?, ?, ?)",
-            DEFAULT_CHART_OF_ACCOUNTS,
-        )
+        self._seed_reference_data(cursor)
 
         # Normalise a legacy corruption where an edited repayment stored the
         # payment AMOUNT in is_edited (e.g. 5857) instead of the flag 1. The
@@ -643,6 +961,28 @@ class DatabaseManager:
 
         self._create_audit_infrastructure(cursor)
 
+        self.conn.commit()
+
+    def _create_participation_table(self):
+        """Who takes part in which ledger's bulk-edit grid.
+
+        Absence means included, so a journal that has never used the grids
+        behaves exactly as it did and the table only ever holds the exceptions
+        somebody deliberately made. Created outside ``create_tables`` because a
+        brand-new journal is bootstrapped rather than migrated, and both paths
+        need it.
+        """
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS grid_participation (
+                individual_id INTEGER NOT NULL,
+                scope TEXT NOT NULL,        -- savings | christmas_savings |
+                                            -- benevolent_ledger | loans
+                excluded INTEGER NOT NULL DEFAULT 1,
+                note TEXT,
+                created_at TEXT,
+                PRIMARY KEY (individual_id, scope)
+            )
+        """)
         self.conn.commit()
 
     def _create_audit_infrastructure(self, cursor):
@@ -734,136 +1074,245 @@ class DatabaseManager:
 
     def get_audit_log(self, limit=500, entity=None, entity_id=None):
         """Recent audit entries (most recent first)."""
-        cur = self.conn.cursor()
-        q = "SELECT ts, operation, entity, entity_id, summary FROM audit_log"
-        params = []
-        if entity is not None and entity_id is not None:
-            q += " WHERE entity=? AND entity_id=?"
-            params = [entity, entity_id]
-        q += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        cur.execute(q, params)
-        return [dict(zip(["ts", "operation", "entity", "entity_id", "summary"], r))
-                for r in cur.fetchall()]
+        return self.audit.recent(limit, entity, entity_id)
 
-    # Individual operations
-    @staticmethod
-    def _retirement_for_status(status, existing_retired_date=None):
-        """Derive (is_retired, retired_date) from an employment status.
-
-        Every status except 'Active' is treated as retired/inactive (mirrors the
-        retirement flag), keeping an existing retirement date if one is set,
-        otherwise stamping today. 'Active' clears the flag.
-        """
-        if (status or 'Active') == 'Active':
-            return 0, None
-        return 1, (existing_retired_date or datetime.now().strftime("%Y-%m-%d"))
+    # ------------------------------------------------------------------
+    # Individual operations — delegated to MemberRepository (Phase 2b).
+    # These signatures and return shapes are unchanged; ten call sites index
+    # get_individuals() positionally, so the raw-tuple shape is load-bearing.
+    # ------------------------------------------------------------------
 
     def add_individual(self, name, phone, email, default_deduction=0,
                        employment_status='Active', pf_no='', id_no=''):
-        cursor = self.conn.cursor()
-        status = employment_status or 'Active'
-        is_retired, retired_date = self._retirement_for_status(status)
-        cursor.execute(
-            "INSERT INTO individuals (name, phone, email, default_deduction, created_at, "
-            "employment_status, pf_no, id_no, is_retired, retired_date) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (name, phone, email, default_deduction,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-             status, pf_no or '', id_no or '', is_retired, retired_date))
-        self.conn.commit()
-        return cursor.lastrowid
+        with self.transaction():
+            return self.members.add(name, phone, email, default_deduction,
+                                    employment_status, pf_no, id_no)
 
     def individual_name_exists(self, name):
         """Check if an individual with the given name already exists (case-insensitive)."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM individuals WHERE LOWER(name) = LOWER(?)", (name,))
-        return cursor.fetchone()[0] > 0
+        return self.members.name_exists(name)
 
     def pf_no_owner(self, pf_no, exclude_id=None):
-        """Return the name of the individual already using this PF number, or None.
-
-        Empty/blank PF numbers are never considered duplicates.
-        """
-        if not pf_no or not str(pf_no).strip():
-            return None
-        cursor = self.conn.cursor()
-        if exclude_id is not None:
-            cursor.execute("SELECT name FROM individuals WHERE pf_no=? AND id<>?",
-                           (str(pf_no).strip(), exclude_id))
-        else:
-            cursor.execute("SELECT name FROM individuals WHERE pf_no=?", (str(pf_no).strip(),))
-        row = cursor.fetchone()
-        return row[0] if row else None
+        """Return the name of the individual already using this PF number, or None."""
+        return self.members.owner_of_pf_no(pf_no, exclude_id)
 
     def id_no_owner(self, id_no, exclude_id=None):
-        """Return the name of the individual already using this ID number, or None.
-
-        Empty/blank ID numbers are never considered duplicates.
-        """
-        if not id_no or not str(id_no).strip():
-            return None
-        cursor = self.conn.cursor()
-        if exclude_id is not None:
-            cursor.execute("SELECT name FROM individuals WHERE id_no=? AND id<>?",
-                           (str(id_no).strip(), exclude_id))
-        else:
-            cursor.execute("SELECT name FROM individuals WHERE id_no=?", (str(id_no).strip(),))
-        row = cursor.fetchone()
-        return row[0] if row else None
+        """Return the name of the individual already using this ID number, or None."""
+        return self.members.owner_of_id_no(id_no, exclude_id)
 
     def get_individuals(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM individuals")
-        return cursor.fetchall()
+        return self.members.rows()
 
     def get_individual_name(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT name FROM individuals WHERE id=?", (id,))
-        row = cursor.fetchone()
-        return row[0] if row else f"Individual {id}"
+        name = self.members.name_of(id)
+        return name if name is not None else f"Individual {id}"
 
     def get_individual(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM individuals WHERE id=?", (id,))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
-        return None
+        return self.members.get(id)
 
     def update_individual(self, id, name, phone, email,
                           employment_status=None, pf_no=None, id_no=None):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET name=?, phone=?, email=? WHERE id=?",
-                       (name, phone, email, id))
-        # Only touch the new fields when supplied, so callers that pass just the
-        # core details don't clobber an existing status / PF / ID number.
-        if employment_status is not None:
-            # Setting the status also drives the retirement flag: any non-Active
-            # status retires the member; 'Active' reinstates them.
-            row = cursor.execute("SELECT retired_date FROM individuals WHERE id=?", (id,)).fetchone()
-            is_retired, retired_date = self._retirement_for_status(
-                employment_status, row[0] if row else None)
-            cursor.execute(
-                "UPDATE individuals SET employment_status=?, is_retired=?, retired_date=? WHERE id=?",
-                (employment_status, is_retired, retired_date, id))
-        if pf_no is not None:
-            cursor.execute("UPDATE individuals SET pf_no=? WHERE id=?", (pf_no, id))
-        if id_no is not None:
-            cursor.execute("UPDATE individuals SET id_no=? WHERE id=?", (id_no, id))
-        self.conn.commit()
+        # Only touch the optional fields when supplied, so callers that pass
+        # just the core details don't clobber an existing status / PF / ID.
+        with self.transaction():
+            self.members.update_core(id, name, phone, email)
+            if employment_status is not None:
+                self.members.set_employment_status(id, employment_status)
+            if pf_no is not None:
+                self.members.set_pf_no(id, pf_no)
+            if id_no is not None:
+                self.members.set_id_no(id, id_no)
 
     def update_individual_deduction(self, id, amount):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET default_deduction=? WHERE id=?", (amount, id))
-        self.conn.commit()
+        with self.transaction():
+            self.members.set_default_deduction(id, amount)
+
+    def snapshot(self, tag):
+        """Back the journal up before an irreversible change. Returns the path.
+
+        Deletion cascades since migration 004 — removing a member removes their
+        ledger, savings, both funds, enrolments and suspensions with them, which
+        is right for integrity and unforgiving of a mis-click. A snapshot turns
+        that from unrecoverable into a restore.
+
+        Raises OSError or sqlite3.Error if it cannot be written; callers must
+        decide whether to proceed, and the UI does not.
+        """
+        if not self.db_name or self.db_name == ":memory:":
+            return None
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.db_name)), "backups")
+        stem = os.path.splitext(os.path.basename(self.db_name))[0]
+        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in str(tag))[:60]
+        os.makedirs(folder, exist_ok=True)
+        # The stamp is only second-resolution, so two snapshots in the same
+        # second would collide — and backup_to overwrites its destination. That
+        # is not merely untidy: restoring twice in one second wrote the safety
+        # copy over the very file being restored from, destroying it. Never
+        # reuse a path.
+        base = os.path.join(
+            folder, f"{stem}.pre-{safe}-{datetime.now():%Y%m%d-%H%M%S}")
+        dest, suffix = f"{base}.db", 1
+        while os.path.exists(dest):
+            dest = f"{base}-{suffix}.db"
+            suffix += 1
+        return self.backup_to(dest)
+
+    # Tables a file must have before it is credible as a journal of this app.
+    _JOURNAL_MARKER_TABLES = ("individuals", "loans", "ledger")
+
+    def inspect_backup(self, path):
+        """Describe a candidate backup without touching the live journal.
+
+        Returns a dict with ``ok``, ``problem`` and, when readable, the row
+        counts and schema version — enough for a restore screen to show what a
+        file contains and for :meth:`restore_from` to refuse a bad one.
+
+        Opened read-only, so inspecting a file can never modify it.
+        """
+        info = {"path": path, "ok": False, "problem": None, "counts": {},
+                "schema_version": None}
+        if not os.path.exists(path):
+            info["problem"] = "The file does not exist."
+            return info
+        try:
+            src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            info["problem"] = f"Cannot open the file: {e}"
+            return info
+        try:
+            check = src.execute("PRAGMA quick_check").fetchone()[0]
+            if check != "ok":
+                info["problem"] = f"The file is damaged: {check}"
+                return info
+            present = {r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = [t for t in self._JOURNAL_MARKER_TABLES if t not in present]
+            if missing:
+                info["problem"] = ("This does not look like a LoanMaster journal "
+                                   f"(missing {', '.join(missing)}).")
+                return info
+            for table in ("individuals", "loans", "ledger", "savings"):
+                if table in present:
+                    info["counts"][table] = src.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            info["schema_version"] = migrations.schema_version(src)
+            info["ok"] = True
+            return info
+        except sqlite3.DatabaseError as e:
+            info["problem"] = f"Could not read the file: {e}"
+            return info
+        finally:
+            src.close()
+
+    def restore_from(self, path):
+        """Replace this journal's contents with a backup's. Returns a report dict.
+
+        Two things make this safe enough to offer in the UI:
+
+        * the source is inspected first and a file that is damaged, unreadable
+          or not a journal is refused before anything is touched;
+        * the current state is snapshotted first, so restoring is itself
+          reversible — the commonest way to lose data with a restore feature is
+          restoring the wrong file.
+
+        The copy goes through SQLite's backup API *into the open connection*
+        rather than replacing the file. That avoids the whole class of problems
+        around overwriting a database that is currently open (which simply
+        fails on Windows), and leaves every repository still pointing at a
+        valid connection.
+
+        A backup may predate the current schema, so migrations are re-applied
+        afterwards and their report is returned with the rest.
+        """
+        info = self.inspect_backup(path)
+        if not info["ok"]:
+            raise ValueError(info["problem"])
+
+        safety = self.snapshot("pre-restore")
+        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            src.backup(self.conn)
+        finally:
+            src.close()
+
+        # The restored contents may be on an older schema than the code.
+        report = migrations.apply_pending(self.conn)
+        self._check_integrity()
+        self._evaluate_foreign_keys()
+        logger.warning("Journal restored from %s (safety copy: %s)", path, safety)
+        return {"restored_from": path, "safety_copy": safety,
+                "counts": info["counts"], "migration_report": report,
+                "integrity_ok": self.integrity_ok}
+
+    def available_backups(self):
+        """Every backup beside this journal, newest first.
+
+        Covers both the rotation written on open and the snapshots taken before
+        an irreversible change; they share the folder and differ only in name.
+        """
+        if not self.db_name or self.db_name == ":memory:":
+            return []
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.db_name)), "backups")
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return []
+        found = []
+        for name in names:
+            if not name.endswith(".db"):
+                continue
+            full = os.path.join(folder, name)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            found.append({"path": full, "name": name, "size": stat.st_size,
+                          "modified": datetime.fromtimestamp(stat.st_mtime)})
+        found.sort(key=lambda b: b["modified"], reverse=True)
+        return found
+
+    def member_record_counts(self, individual_id):
+        """What deleting this member would remove, per table.
+
+        Only non-empty tables, so a confirmation can state the real cost rather
+        than "and all their records".
+        """
+        counts = {}
+        for table, label in (("ledger", "loan ledger entries"),
+                             ("loans", "loans"),
+                             ("savings", "savings transactions"),
+                             ("christmas_savings", "Christmas savings entries"),
+                             ("benevolent_ledger", "benevolent entries"),
+                             ("benevolent_accounts", "benevolent enrolments"),
+                             ("loan_suspensions", "suspension records")):
+            try:
+                n = self.conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE individual_id=?",
+                    (individual_id,)).fetchone()[0]
+            except sqlite3.OperationalError:
+                continue
+            if n:
+                counts[label] = n
+        return counts
 
     def delete_individual(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE individual_id=?", (id,))
-        cursor.execute("DELETE FROM individuals WHERE id=?", (id,))
-        self.conn.commit()
+        """Delete a member and their records as a single atomic operation.
+
+        The two statements were previously issued without a transaction. Once
+        foreign-key enforcement engaged (which happens automatically as soon as
+        a journal has no orphaned rows), the second began failing — the member
+        still has savings, fund, enrolment and suspension rows that no code path
+        removed — while the first had already succeeded. The exception
+        propagated with the transaction still open, so the *next* unrelated
+        write committed the half-delete: the member's entire loan ledger
+        destroyed, the member still listed. Reproduced against a copy of a
+        production journal before this change.
+
+        Migration 001 additionally installs cascade triggers so the remaining
+        child tables are cleared with the parent instead of being left behind.
+        """
+        with self.transaction():
+            self.members.delete(id)
 
     def get_statement_data(self, individual_id, start_date=None, end_date=None) -> StatementData:
         """Fetch all data required for statement generation in one go."""
@@ -892,304 +1341,155 @@ class DatabaseManager:
 
     def get_earliest_record_date(self, individual_id):
         """Get the earliest transaction date for an individual across ledger and savings."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT MIN(date) FROM (
-                SELECT MIN(date) AS date FROM ledger WHERE individual_id = ?
-                UNION ALL
-                SELECT MIN(date) AS date FROM savings WHERE individual_id = ?
-            )
-        """, (individual_id, individual_id))
-        row = cursor.fetchone()
-        return row[0] if row and row[0] else None
+        return self.ledger.earliest_date_for_members([individual_id])
 
     def get_earliest_record_date_for_ids(self, individual_ids):
-        """Get the earliest transaction date across multiple individuals.
-        
-        Uses a single query with IN clause for efficiency.
-        """
-        if not individual_ids:
-            return None
-        placeholders = ','.join('?' * len(individual_ids))
-        cursor = self.conn.cursor()
-        cursor.execute(f"""
-            SELECT MIN(date) FROM (
-                SELECT MIN(date) AS date FROM ledger WHERE individual_id IN ({placeholders})
-                UNION ALL
-                SELECT MIN(date) AS date FROM savings WHERE individual_id IN ({placeholders})
-            )
-        """, list(individual_ids) + list(individual_ids))
-        row = cursor.fetchone()
-        return row[0] if row and row[0] else None
+        """Get the earliest transaction date across multiple individuals."""
+        return self.ledger.earliest_date_for_members(list(individual_ids))
 
     # Ledger operations
     def get_ledger(self, individual_id, start_date=None, end_date=None):
-        query = "SELECT * FROM ledger WHERE individual_id = ?"
-        params = [individual_id]
-        
-        if start_date:
-            query += " AND date >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND date <= ?"
-            params.append(end_date)
-            
-        query += " ORDER BY date, id"
-            
-        return pd.read_sql_query(query, self.conn, params=tuple(params))
+        return self.ledger.for_member(individual_id, start_date, end_date)
 
     def get_transaction(self, trans_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM ledger WHERE id=?", (trans_id,))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
-        return None
+        return self.ledger.get(trans_id)
 
-    def add_transaction(self, individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
-                       installment_amount=0, interest_amount=0, batch_id=None, 
+    def add_transaction(self, individual_id, date, event_type, loan_id, added, deducted, balance, notes,
+                       installment_amount=0, interest_amount=0, batch_id=None,
                        principal_balance=0, interest_balance=0, principal_portion=0, interest_portion=0,
                        previous_state=None):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO ledger (
-                individual_id, date, event_type, loan_id, added, deducted, balance, notes, 
+        with self.transaction():
+            new_id = self.ledger.add((
+                individual_id, date, event_type, loan_id, added, deducted, balance, notes,
                 installment_amount, interest_amount, batch_id,
-                principal_balance, interest_balance, principal_portion, interest_portion, previous_state
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-              installment_amount, interest_amount, batch_id,
-              principal_balance, interest_balance, principal_portion, interest_portion, previous_state))
-        new_id = cursor.lastrowid
-        self.conn.commit()
-        self._fire_post_hook(self.ledger_post_hook, [new_id])
+                principal_balance, interest_balance, principal_portion, interest_portion,
+                previous_state))
         return new_id
 
     def bulk_insert_transactions(self, transactions):
         """Bulk insert multiple transactions into the ledger."""
         if not transactions:
             return
-            
-        cursor = self.conn.cursor()
-        
-        vals = []
-        for tx in transactions:
-            vals.append((
-                tx.get('individual_id'),
-                tx.get('date'),
-                tx.get('event_type'),
-                tx.get('loan_id'),
-                tx.get('added', 0),
-                tx.get('deducted', 0),
-                tx.get('balance', 0),
-                tx.get('notes', ""),
-                tx.get('installment_amount', 0),
-                tx.get('interest_amount', 0),
-                tx.get('batch_id'),
-                tx.get('principal_balance', 0),
-                tx.get('interest_balance', 0),
-                tx.get('principal_portion', 0),
-                tx.get('interest_portion', 0),
-                tx.get('previous_state', None)
-            ))
-            
-        # lastrowid is unreliable after executemany; if a GL hook is registered,
-        # snapshot the max id first and read back the new rows afterwards.
-        prev_max = None
-        if self.ledger_post_hook:
-            cursor.execute("SELECT COALESCE(MAX(id), 0) FROM ledger")
-            prev_max = cursor.fetchone()[0]
 
-        cursor.executemany("""
-            INSERT INTO ledger (
-                individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-                installment_amount, interest_amount, batch_id,
-                principal_balance, interest_balance, principal_portion, interest_portion, previous_state
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, vals)
-        self.conn.commit()
+        rows = [tuple(tx.get(col, default) for col, default in (
+            ("individual_id", None), ("date", None), ("event_type", None), ("loan_id", None),
+            ("added", 0), ("deducted", 0), ("balance", 0), ("notes", ""),
+            ("installment_amount", 0), ("interest_amount", 0), ("batch_id", None),
+            ("principal_balance", 0), ("interest_balance", 0),
+            ("principal_portion", 0), ("interest_portion", 0), ("previous_state", None)))
+            for tx in transactions]
 
-        if self.ledger_post_hook and prev_max is not None:
-            cursor.execute("SELECT id FROM ledger WHERE id > ? ORDER BY id", (prev_max,))
-            new_ids = [r[0] for r in cursor.fetchall()]
-            self._fire_post_hook(self.ledger_post_hook, new_ids)
+        with self.transaction():
+            self.ledger.add_many(rows)
 
-    def update_transaction(self, id, date, added, deducted, notes, principal_portion=None, interest_portion=None, mark_edited=False, interest_amount=None):
-        """Update a transaction with parameterized queries (SQL injection safe)."""
-        cursor = self.conn.cursor()
-        id = int(id)  # Ensure native int for SQLite compatibility
-        
-        # Build query dynamically using parameterized approach
-        set_clauses = ["date=?", "added=?", "deducted=?", "notes=?"]
-        params = [date, added, deducted, notes]
-        
-        # Add optional columns
-        if principal_portion is not None and interest_portion is not None:
-            set_clauses.extend(["principal_portion=?", "interest_portion=?"])
-            params.extend([principal_portion, interest_portion])
-        
-        # Hysteresis Fix: Store the Target Amount in `is_edited` to preserve user intent
-        if mark_edited:
-            # Use the value of deducted as the "Anchor Value".
-            val = deducted if deducted > 1 else 1
-            set_clauses.append("is_edited=?")
-            params.append(val)
-        
-        # Rate Storage Logic
-        if interest_amount is not None:
-            set_clauses.append("interest_amount=?")
-            params.append(interest_amount)
-        
-        # Add id at the end for WHERE clause
-        params.append(id)
-        
-        query = f"UPDATE ledger SET {', '.join(set_clauses)} WHERE id=?"
-        cursor.execute(query, tuple(params))
-        self.conn.commit()
+    def update_transaction(self, id, date, added, deducted, notes, principal_portion=None,
+                           interest_portion=None, mark_edited=False, interest_amount=None):
+        """Edit a ledger row, then re-derive everything that follows from it.
+
+        The principal/interest split and the running balances are *derived*, so
+        changing an amount without recomputing them leaves the row asserting a
+        split that belonged to a different payment. Every recalculator then
+        replayed that stale split, which is how a repayment edited from 5,750 to
+        9,000 kept reducing principal by 5,000.
+
+        When the caller does not supply a split, the old one is cleared and the
+        derivation works it out. When the caller does supply one it is an
+        assertion and is kept.
+        """
+        from src.services.loan_projection import clear_derived, project_loan
+
+        row = self.conn.execute(
+            "SELECT individual_id, loan_id FROM ledger WHERE id=?", (id,)).fetchone()
+        with self.transaction():
+            self.ledger.update_core(id, date, added, deducted, notes, principal_portion,
+                                    interest_portion, mark_edited, interest_amount)
+            if principal_portion is None and interest_portion is None:
+                clear_derived(self, id)
+            if row and row[1]:
+                project_loan(self, row[0], row[1], commit=False)
 
     def update_balance(self, id, balance):
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE ledger SET balance=? WHERE id=?", (balance, id))
-        self.conn.commit()
-    
+        with self.transaction():
+            self.ledger.set_balance(id, balance)
+
     def update_ledger_balances(self, id, balance, principal_bal, interest_bal, gross_bal=0):
         """Update all three balance types for a ledger entry."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE ledger 
-            SET balance=?, principal_balance=?, interest_balance=?, gross_balance=? 
-            WHERE id=?
-        """, (balance, principal_bal, interest_bal, gross_bal, id))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.set_running_balances(id, balance, principal_bal, interest_bal, gross_bal)
 
     def delete_transaction(self, id):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE id=?", (id,))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.delete(id)
 
     # Loan operations
-    def add_loan_record(self, individual_id, ref, principal, total, balance, installment, monthly_interest, start_date, next_due_date, unearned_interest=0):
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO loans (
-                individual_id, ref, principal, total_amount, balance, installment, 
-                monthly_interest, start_date, next_due_date, unearned_interest, interest_balance, status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'Active')
-        """, (individual_id, ref, principal, total, balance, installment, monthly_interest, start_date, next_due_date, unearned_interest))
-        self.conn.commit()
+    def add_loan_record(self, individual_id, ref, principal, total, balance, installment,
+                        monthly_interest, start_date, next_due_date, unearned_interest=0,
+                        duration_months=None, interest_rate=None):
+        with self.transaction():
+            self.loans.add(individual_id, ref, principal, total, balance, installment,
+                           monthly_interest, start_date, next_due_date, unearned_interest,
+                           duration_months, interest_rate)
 
     def get_active_loans(self, individual_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE individual_id=? AND status='Active'", (individual_id,))
-        cols = [description[0] for description in cursor.description]
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        return self.loans.active_for_member(individual_id)
 
     def get_loans(self, individual_id):
         """Get ALL loans (Active and Paid) for an individual."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE individual_id=?", (individual_id,))
-        cols = [description[0] for description in cursor.description]
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        return self.loans.for_member(individual_id)
 
     def get_all_active_loans(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE status='Active'")
-        cols = [description[0] for description in cursor.description]
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        return self.loans.all_active()
 
     def get_overdue_count(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM loans WHERE status='Active' AND next_due_date < ?", (today,))
-        return cursor.fetchone()[0]
+        return self.loans.overdue_count(datetime.now().strftime("%Y-%m-%d"))
+
+    def get_overdue_loans(self, as_of=None):
+        """Every loan behind the count returned by :meth:`get_overdue_count`."""
+        return self.loans.overdue(as_of or datetime.now().strftime("%Y-%m-%d"))
 
     def get_loan_by_ref(self, individual_id, ref):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM loans WHERE individual_id=? AND ref=?", (individual_id, ref))
-        row = cursor.fetchone()
-        if row:
-            cols = [description[0] for description in cursor.description]
-            return dict(zip(cols, row))
-        return None
+        return self.loans.by_ref(individual_id, ref)
 
-    def update_loan_status(self, loan_id, balance, next_due_date, status, interest_balance=None, unearned_interest=None):
-        cursor = self.conn.cursor()
-        
-        # Build query dynamically based on provided args
-        query = "UPDATE loans SET balance=?, next_due_date=?, status=?"
-        params = [balance, next_due_date, status]
-        
-        if interest_balance is not None:
-            query += ", interest_balance=?"
-            params.append(interest_balance)
-            
-        if unearned_interest is not None:
-            query += ", unearned_interest=?"
-            params.append(unearned_interest)
-            
-        query += " WHERE id=?"
-        params.append(loan_id)
-        
-        cursor.execute(query, tuple(params))
-        self.conn.commit()
+    def update_loan_status(self, loan_id, balance, next_due_date, status,
+                           interest_balance=None, unearned_interest=None):
+        with self.transaction():
+            self.loans.set_status(loan_id, balance, next_due_date, status,
+                                  interest_balance, unearned_interest)
 
     def update_loan_recalc_state(self, loan_id, monthly_interest, unearned_interest):
         """Update loan terms derived from history replay."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE loans 
-            SET monthly_interest = ?, unearned_interest = ?
-            WHERE id = ?
-        """, (monthly_interest, unearned_interest, loan_id))
-        self.conn.commit()
+        with self.transaction():
+            self.loans.set_recalc_state(loan_id, monthly_interest, unearned_interest)
 
     def unlock_future_interest(self, individual_id, loan_ref, date_str):
         """Reset is_edited flag for future interest rows, allowing re-simulation.
 
         Scoped to one member — loan refs (L-001) are not unique across individuals.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            UPDATE ledger
-            SET is_edited = 0
-            WHERE individual_id = ? AND loan_id = ? AND event_type = 'Interest Earned' AND date > ?
-        """, (individual_id, loan_ref, date_str))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.set_interest_lock(individual_id, loan_ref, locked=False,
+                                          from_date=date_str)
 
-    def update_loan_details(self, loan_id, total_amount, balance, installment, monthly_interest, next_due_date, unearned_interest=None, principal_update=None, interest_balance=None):
-        cursor = self.conn.cursor()
-        
-        query = """UPDATE loans 
-                   SET total_amount=?, balance=?, installment=?, monthly_interest=?, next_due_date=?"""
-        params = [total_amount, balance, installment, monthly_interest, next_due_date]
-        
-        if unearned_interest is not None:
-            query += ", unearned_interest=?"
-            params.append(unearned_interest)
-            
-        if principal_update is not None:
-            query += ", principal=?"
-            params.append(principal_update)
-            
-        if interest_balance is not None:
-            query += ", interest_balance=?"
-            params.append(interest_balance)
-            
-        query += " WHERE id=?"
-        params.append(loan_id)
-        
-        # print(f"DB DEBUG: Executing UPDATE loans: {query} with {params}") 
-        cursor.execute(query, tuple(params))
-        self.conn.commit()
+    def update_loan_details(self, loan_id, total_amount, balance, installment, monthly_interest,
+                            next_due_date, unearned_interest=None, principal_update=None,
+                            interest_balance=None):
+        with self.transaction():
+            self.loans.set_details(loan_id, total_amount, balance, installment, monthly_interest,
+                                   next_due_date, unearned_interest, principal_update,
+                                   interest_balance)
 
     def delete_loan(self, individual_id, loan_ref):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE individual_id=? AND loan_id=?", (individual_id, loan_ref))
-        cursor.execute("DELETE FROM loans WHERE individual_id=? AND ref=?", (individual_id, loan_ref))
-        self.conn.commit()
+        """Delete a loan and its transactions as a single atomic operation.
+
+        Same shape as the delete_individual bug fixed in Phase 1a: two
+        statements with one trailing commit, so a failure on the second (a
+        suspension row still referencing the loan on a pre-migration journal,
+        say) left the ledger delete pending, to be committed by the next
+        unrelated write. Scoped by individual_id because loan refs are unique
+        per member only.
+        """
+        with self.transaction():
+            self.loans.delete_with_ledger(individual_id, loan_ref)
 
     # ========== LOAN SUSPENSION OPERATIONS ==========
 
@@ -1202,41 +1502,21 @@ class DatabaseManager:
             start_date: Optional YYYY-MM-DD date the suspension takes effect.
                 Defaults to today.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE loans SET is_suspended=1, suspend_until=? WHERE id=?", (until_date, loan_id))
-
         if start_date is None:
             start_date = datetime.now().strftime("%Y-%m-%d")
-
-        # Resolve loan_ref / individual_id for the audit record.
-        cursor.execute("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
-        row = cursor.fetchone()
-        loan_ref = row[0] if row else None
-        individual_id = row[1] if row else None
-
-        # If an open span already exists (re-suspending an already-suspended loan,
-        # or extending it), update it in place rather than creating a duplicate.
-        # Only the intended resume date moves; the original start_date is
-        # preserved so the recorded span still covers the full skipped period.
-        cursor.execute(
-            "SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL AND status='active' ORDER BY id DESC LIMIT 1",
-            (loan_id,),
-        )
-        existing = cursor.fetchone()
-        if existing:
-            cursor.execute(
-                "UPDATE loan_suspensions SET suspend_until=? WHERE id=?",
-                (until_date, existing[0]),
-            )
-        else:
-            cursor.execute(
-                """INSERT INTO loan_suspensions
-                       (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, NULL, 'active', ?)""",
-                (loan_id, individual_id, loan_ref, start_date, until_date,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
-        self.conn.commit()
+        with self.transaction():
+            self.loans.set_suspended(loan_id, until_date)
+            loan_ref, individual_id = self.loans.identity(loan_id)
+            # Re-suspending or extending an already-suspended loan updates the
+            # open span in place rather than creating a duplicate. Only the
+            # intended resume date moves; the original start_date is preserved
+            # so the recorded span still covers the full skipped period.
+            existing = self.loans.open_suspension_id(loan_id)
+            if existing:
+                self.loans.extend_suspension(existing, until_date)
+            else:
+                self.loans.add_suspension(loan_id, individual_id, loan_ref,
+                                          start_date, until_date)
 
     def resume_loan(self, loan_id, resumed_date=None):
         """Resume deductions for a suspended loan and close its suspension span.
@@ -1248,20 +1528,11 @@ class DatabaseManager:
                 intended ``suspend_until`` boundary so the recorded span reflects
                 the real skipped period rather than when the job happened to run.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE loans SET is_suspended=0, suspend_until=NULL WHERE id=?", (loan_id,))
-
         if resumed_date is None:
             resumed_date = datetime.now().strftime("%Y-%m-%d")
-
-        # Close the most recent open suspension span for this loan.
-        cursor.execute(
-            "UPDATE loan_suspensions SET resumed_date=?, status='resumed' "
-            "WHERE id = (SELECT id FROM loan_suspensions WHERE loan_id=? AND resumed_date IS NULL "
-            "ORDER BY id DESC LIMIT 1)",
-            (resumed_date, loan_id),
-        )
-        self.conn.commit()
+        with self.transaction():
+            self.loans.clear_suspended(loan_id)
+            self.loans.close_open_suspension(loan_id, resumed_date)
 
     def get_loan_suspensions(self, individual_id):
         """Return all recorded suspension spans for an individual.
@@ -1270,14 +1541,34 @@ class DatabaseManager:
             List of dicts with keys: id, loan_id, individual_id, loan_ref,
             start_date, suspend_until, resumed_date, status.
         """
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT id, loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status "
-            "FROM loan_suspensions WHERE individual_id=? ORDER BY start_date, id",
-            (individual_id,),
-        )
-        cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, r)) for r in cursor.fetchall()]
+        return self.loans.suspensions_for_member(individual_id)
+
+    def get_loan_suspensions_for_loan(self, loan_id):
+        """Every recorded suspension span for one loan, earliest first."""
+        return self.loans.suspensions_for_loan(loan_id)
+
+    def delete_suspension(self, suspension_id):
+        """Remove a recorded suspension span.
+
+        Not the same as resuming. Resuming says the suspension *ended*, which
+        leaves its months permanently skipped; deleting says it never applied,
+        so catch-up will deduct those months again. There was previously no way
+        to do this at all — a backdated span leaves ``is_suspended`` clear, so
+        no Resume button ever appears for it and the record was permanent.
+
+        If the deleted span was the live one, the loan's suspended flag is
+        cleared with it; otherwise the flag belongs to a different span and is
+        left alone. Returns the deleted row, or None if it did not exist.
+        """
+        span = self.loans.suspension(suspension_id)
+        if span is None:
+            return None
+        with self.transaction():
+            was_open = self.loans.open_suspension_id(span["loan_id"]) == suspension_id
+            self.loans.delete_suspension(suspension_id)
+            if was_open:
+                self.loans.clear_suspended(span["loan_id"])
+        return span
 
     def record_suspension(self, loan_id, start_date, end_date, today=None):
         """Record a suspension span anywhere in time (past, present or future).
@@ -1294,19 +1585,10 @@ class DatabaseManager:
             today = datetime.now().strftime("%Y-%m-%d")
 
         if end_date and end_date <= today:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT ref, individual_id FROM loans WHERE id=?", (loan_id,))
-            row = cursor.fetchone()
-            loan_ref = row[0] if row else None
-            individual_id = row[1] if row else None
-            cursor.execute(
-                """INSERT INTO loan_suspensions
-                       (loan_id, individual_id, loan_ref, start_date, suspend_until, resumed_date, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'resumed', ?)""",
-                (loan_id, individual_id, loan_ref, start_date, end_date, end_date,
-                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            )
-            self.conn.commit()
+            with self.transaction():
+                loan_ref, individual_id = self.loans.identity(loan_id)
+                self.loans.add_suspension(loan_id, individual_id, loan_ref, start_date,
+                                          end_date, resumed_date=end_date, status='resumed')
             return 'historical'
 
         self.suspend_loan(loan_id, until_date=end_date, start_date=start_date)
@@ -1319,53 +1601,90 @@ class DatabaseManager:
         Used to warn before recording a 'no-deductions' suspension over a window
         that already has deductions (which would contradict the statement).
         """
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM ledger WHERE individual_id=? AND loan_id=? "
-            "AND event_type IN ('Repayment', 'Loan Buyoff') "
-            "AND date >= ? AND date <= ?",
-            (individual_id, loan_ref, start_date, end_date),
-        )
-        return cursor.fetchone()[0]
+        return self.ledger.count_events(individual_id, loan_ref,
+                                       ("Repayment", "Loan Buyoff"), start_date, end_date)
 
     # ========== RETIREMENT OPERATIONS ==========
 
+    def set_membership_status(self, ind_id, status, effective_date=None):
+        """Record that a member has left the SACCO — or come back.
+
+        The one supported way to change membership, because three columns have
+        to move together: `employment_status` (what the policy rules read),
+        `is_retired` (what the reports still read) and `retired_date`. Migration
+        004 constrains the last two to agree, and that CHECK is evaluated before
+        any AFTER trigger can mirror a value, so a bare UPDATE of one column is
+        rejected rather than quietly half-applied.
+
+        Args:
+            ind_id: the member.
+            status: one of :data:`src.services.policy.MEMBERSHIP_STATUSES`.
+            effective_date: when it took effect, ``YYYY-MM-DD``. Required for
+                every status except Active; defaults to today.
+        """
+        from src.services.policy import ACTIVE, MEMBERSHIP_STATUSES
+        if status not in MEMBERSHIP_STATUSES:
+            raise ValueError(f"{status!r} is not a membership status "
+                             f"({', '.join(MEMBERSHIP_STATUSES)})")
+        if status == ACTIVE:
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE individuals SET employment_status=?, is_retired=0, "
+                    "retired_date=NULL WHERE id=?", (ACTIVE, ind_id))
+            return
+        when = effective_date or datetime.now().strftime("%Y-%m-%d")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE individuals SET employment_status=?, is_retired=1, "
+                "retired_date=? WHERE id=?", (status, when, ind_id))
+
+    def membership_status(self, ind_id):
+        """``(status, effective_date)``; status is 'Active' when nothing is set."""
+        from src.services.policy import ACTIVE, RETIRED
+        row = self.conn.execute(
+            "SELECT employment_status, is_retired, retired_date FROM individuals "
+            "WHERE id=?", (ind_id,)).fetchone()
+        if row is None:
+            return (None, None)
+        status, is_retired, when = row
+        return (status or (RETIRED if is_retired else ACTIVE), when)
+
     def retire_individual(self, ind_id, date_str):
         """Mark an individual as retired.
-        
+
+        Kept for existing callers; delegates to set_membership_status so the
+        three columns cannot drift apart.
+
         Args:
             ind_id: The individual's ID.
             date_str: Retirement date in YYYY-MM-DD format.
         """
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET is_retired=1, retired_date=?, "
-                       "employment_status='Retired' WHERE id=?", (date_str, ind_id))
-        self.conn.commit()
+        from src.services.policy import RETIRED
+        self.set_membership_status(ind_id, RETIRED, date_str)
 
     def reinstate_individual(self, ind_id):
-        """Clear retirement flag for an individual."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE individuals SET is_retired=0, retired_date=NULL, "
-                       "employment_status='Active' WHERE id=?", (ind_id,))
-        self.conn.commit()
+        """Return a member to active membership."""
+        from src.services.policy import ACTIVE
+        self.set_membership_status(ind_id, ACTIVE)
+        return
+
+    def _legacy_reinstate(self, ind_id):
+        with self.transaction():
+            self.members.reinstate(ind_id)
 
     def has_outstanding_loans(self, ind_id):
         """Check if an individual has any active (outstanding) loans."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM loans WHERE individual_id=? AND status='Active'", (ind_id,))
-        return cursor.fetchone()[0] > 0
+        return self.loans.has_active(ind_id)
 
     def delete_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from ledger."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM ledger WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.ledger.delete_batch(batch_id)
 
     def delete_savings_batch(self, batch_id):
         """Delete all transactions associated with a batch_id from savings."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM savings WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.delete_batch("savings", batch_id)
 
     # ========== SAVINGS OPERATIONS ==========
     
@@ -1392,418 +1711,283 @@ class DatabaseManager:
         self.conn.commit()
     
     def add_savings_transaction(self, individual_id, date, transaction_type, amount, notes="", batch_id=None):
-        """Add a deposit or withdrawal to savings."""
-        # Ensure table exists
+        """Add a deposit, withdrawal or interest credit to savings.
+
+        Goes through src.services.posting, which is also what the Christmas and
+        Benevolent funds use. This path used to have its own sign rule —
+        anything that was not a 'Deposit' reduced the balance — so an Interest
+        credit subtracted, disagreeing with FundRepository and with the other
+        two funds. Returns the member's new balance.
+        """
         self.create_savings_table()
-        
-        # Get current balance
-        current_balance = self.get_savings_balance(individual_id)
-        
-        if transaction_type == "Deposit":
-            new_balance = current_balance + amount
-        else:  # Withdrawal
-            new_balance = current_balance - amount
-        
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes, batch_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
-        new_id = cursor.lastrowid
-        self.conn.commit()
-        self._fire_post_hook(self.savings_post_hook, [new_id])
-        return new_balance
+        return self._post_fund("savings", individual_id, date, transaction_type,
+                               amount, notes, batch_id)
     
     def get_savings_balance(self, individual_id):
         """Get current savings balance for an individual."""
         self.create_savings_table()
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT balance FROM savings WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1", (individual_id,))
-        row = cursor.fetchone()
-        return row[0] if row else 0.0
+        return self.funds.balance("savings", individual_id)
+
+    def get_total_savings(self):
+        """Portfolio-wide savings balance across every member (one query)."""
+        self.create_savings_table()
+        return self.funds.total("savings")
 
     def recalculate_savings_balance(self, individual_id, cursor=None):
-        """Recalculate running balance for all savings transactions of an individual."""
-        # self.create_savings_table() # Removed to prevent commit during transaction
-        
-        should_commit = False
-        if cursor is None:
-            cursor = self.conn.cursor()
-            should_commit = True
-        
-        # Fetch all transactions ordered by date and then insertion order (id)
-        cursor.execute("SELECT id, transaction_type, amount FROM savings WHERE individual_id=? ORDER BY date ASC, id ASC", (individual_id,))
-        transactions = cursor.fetchall()
-        
-        running_balance = 0.0
-        updates = []
-        
-        for t in transactions:
-            tid, t_type, amount = t
-            if t_type in ["Deposit", "Interest"]:
-                running_balance += amount
-            elif t_type == "Withdrawal":
-                running_balance -= amount
-            
-            updates.append((running_balance, tid))
-            
-        # Bulk update
-        cursor.executemany("UPDATE savings SET balance=? WHERE id=?", updates)
-        
-        if should_commit:
-            self.conn.commit()
-    
+        """Recalculate the stored running balance for a member's savings.
+
+        Delegates to the single implementation in FundRepository. The optional
+        cursor lets the import path fold this into its own transaction — which
+        is why this method does not commit when one is supplied.
+        """
+        if cursor is not None:
+            self.funds.recalculate("savings", individual_id, cursor=cursor)
+            return
+        with self.transaction():
+            self.funds.recalculate("savings", individual_id)
+
+    def _mutate_fund(self, table, trans_id, change):
+        """Apply a change to one fund row, then re-derive that member's balances.
+
+        The `balance` column is a *running total*, so it is a property of the
+        whole ordered series, not of the row holding it. Editing an amount,
+        moving a date, or deleting a row invalidates every row from that point
+        on — and the API used to leave that to the caller ("caller recalculates
+        afterwards"), which meant the column was only correct where somebody had
+        remembered. It was not correct: an edited middle row kept its old total,
+        and a row moved to an earlier date carried its old total to the top of
+        the table.
+
+        Recalculating inside the same transaction makes it structural instead of
+        remembered.
+        """
+        row = self.funds.get(table, trans_id)
+        if row is None:
+            return
+        member_id = row["individual_id"]
+        with self.transaction():
+            change()
+            self.funds.recalculate(table, member_id)
+
+    def _is_back_dated(self, table, individual_id, date):
+        """True when this row is not the member's latest in that fund.
+
+        Cheap enough to ask on every insert: one indexed MAX over one member.
+        """
+        t = self.funds._table(table)
+        latest = self.conn.execute(
+            f"SELECT MAX(date) FROM {t} WHERE individual_id=?", (individual_id,)).fetchone()[0]
+        return latest is not None and str(date) < str(latest)
+
     def get_savings_transactions(self, individual_id, start_date=None, end_date=None):
-        """Get all savings transactions for an individual."""
+        """A member's savings history, in the order it happened.
+
+        Ordered by date rather than by insertion, so a back-dated deposit shows
+        where it belongs instead of at the bottom of the table. `christmas` and
+        `benevolent` already read this way; savings was the outlier.
+        """
         self.create_savings_table()
-        query = "SELECT * FROM savings WHERE individual_id = ?"
-        params = [individual_id]
-        
-        if start_date:
-            query += " AND date >= ?"
-            params.append(start_date)
-        if end_date:
-            query += " AND date <= ?"
-            params.append(end_date)
-            
-        query += " ORDER BY id"
-        return pd.read_sql_query(query, self.conn, params=tuple(params))
-    
+        return self.funds.transactions("savings", individual_id, start_date, end_date,
+                                       order="date, id")
+
     def delete_savings_transaction(self, trans_id):
-        """Delete a savings transaction and recalculate balances."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM savings WHERE id=?", (trans_id,))
-        self.conn.commit()
+        """Delete a savings transaction and re-derive the running balances."""
+        self._mutate_fund("savings", trans_id,
+                          lambda: self.funds.delete("savings", trans_id))
 
     def update_savings_transaction(self, trans_id, new_date, new_amount, new_notes):
-        """Update a savings transaction."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE savings SET date=?, amount=?, notes=? WHERE id=?", 
-                       (new_date, new_amount, new_notes, trans_id))
-        self.conn.commit()
-    
-    def recalculate_savings_balances(self, individual_id):
-        """Recalculate running balances for savings."""
-        self.create_savings_table()
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, transaction_type, amount FROM savings WHERE individual_id=? ORDER BY id", (individual_id,))
-        rows = cursor.fetchall()
-        
-        running_balance = 0.0
-        for row in rows:
-            trans_id, trans_type, amount = row
-            if trans_type == "Deposit":
-                running_balance += amount
-            else:
-                running_balance -= amount
-            cursor.execute("UPDATE savings SET balance=? WHERE id=?", (running_balance, trans_id))
-        self.conn.commit()
+        """Edit a savings transaction and re-derive the running balances."""
+        self._mutate_fund("savings", trans_id,
+                          lambda: self.funds.update("savings", trans_id, new_date,
+                                                    new_amount, new_notes))
 
-    # ========== GENERIC FUND LEDGER (Christmas / Benevolent) ==========
-    # A savings-style ledger reused by the Christmas and Benevolent funds.
-    # Table is whitelisted (never user input) so the f-string is injection-safe.
+    def recalculate_savings_balances(self, individual_id):
+        """Recalculate running balances for savings.
+
+        Retained as the name the ledger view calls; identical to
+        recalculate_savings_balance since Phase 3 collapsed the two. It used to
+        order by id alone and treat any non-Deposit row as a decrease, which is
+        what corrupted two members' balances (finding D1).
+        """
+        self.create_savings_table()
+        with self.transaction():
+            self.funds.recalculate("savings", individual_id)
+
+    # ========== GENERIC FUND LEDGER (Savings / Christmas / Benevolent) ==========
+    # Delegated to FundRepository, which whitelists the table name.
     _FUND_TABLES = ("christmas_savings", "benevolent_ledger")
 
-    def _fund_table(self, table):
-        if table not in self._FUND_TABLES:
-            raise ValueError(f"Unknown fund table: {table}")
-        return table
-
     def fund_balance(self, table, individual_id):
-        t = self._fund_table(table)
-        cur = self.conn.cursor()
-        cur.execute(f"SELECT balance FROM {t} WHERE individual_id=? ORDER BY date DESC, id DESC LIMIT 1",
-                    (individual_id,))
-        row = cur.fetchone()
-        return row[0] if row else 0.0
+        return self.funds.balance(table, individual_id)
 
     def fund_add_transaction(self, table, individual_id, date, transaction_type, amount,
                              notes="", batch_id=None):
-        """Append a fund transaction with a running balance. Withdrawals reduce
-        the balance; everything else (Deposit/Contribution/Interest) increases it."""
-        t = self._fund_table(table)
-        current = self.fund_balance(table, individual_id)
-        new_balance = round(current - amount, 2) if transaction_type == "Withdrawal" \
-            else round(current + amount, 2)
-        cur = self.conn.cursor()
-        cur.execute(
-            f"INSERT INTO {t} (individual_id, date, transaction_type, amount, balance, notes, batch_id) "
-            f"VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (individual_id, date, transaction_type, amount, new_balance, notes, batch_id))
-        self.conn.commit()
-        return new_balance
+        """Append a fund transaction. Withdrawals reduce the balance; everything
+        else (Deposit/Contribution/Interest) increases it.
+
+        Returns the member's new balance.
+        """
+        return self._post_fund(table, individual_id, date, transaction_type,
+                               amount, notes, batch_id)
+
+    def _post_fund(self, table, individual_id, date, transaction_type, amount,
+                   notes="", batch_id=None):
+        """The one write path for all three funds.
+
+        Normalise, validate, check membership, insert, re-derive the running
+        totals — see src/services/posting.py for why each stage is there.
+        """
+        from src.services.posting import Posting, post
+        return post(self, Posting(table=table, member_id=individual_id, date=date,
+                                  kind=transaction_type, amount=amount,
+                                  notes=notes, batch_id=batch_id))
 
     def fund_transactions(self, table, individual_id):
-        t = self._fund_table(table)
-        return pd.read_sql_query(
-            f"SELECT * FROM {t} WHERE individual_id=? ORDER BY date, id",
-            self.conn, params=(individual_id,))
+        return self.funds.transactions(table, individual_id)
 
     def fund_recalculate(self, table, individual_id):
-        t = self._fund_table(table)
-        cur = self.conn.cursor()
-        cur.execute(f"SELECT id, transaction_type, amount FROM {t} WHERE individual_id=? ORDER BY date ASC, id ASC",
-                    (individual_id,))
-        running = 0.0
-        for tid, ttype, amount in cur.fetchall():
-            running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
-            cur.execute(f"UPDATE {t} SET balance=? WHERE id=?", (running, tid))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.recalculate(table, individual_id)
 
     def fund_delete_transaction(self, table, trans_id):
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"DELETE FROM {t} WHERE id=?", (trans_id,))
-        self.conn.commit()
+        """Delete a fund transaction and re-derive the running balances."""
+        self._mutate_fund(table, trans_id, lambda: self.funds.delete(table, trans_id))
 
     def fund_delete_batch(self, table, batch_id):
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"DELETE FROM {t} WHERE batch_id=?", (batch_id,))
-        self.conn.commit()
+        """Delete a whole batch and re-derive every affected member's balances."""
+        members = self.funds.members_in_batch(table, batch_id)
+        with self.transaction():
+            self.funds.delete_batch(table, batch_id)
+            for member_id in members:
+                self.funds.recalculate(table, member_id)
 
     def fund_delete_all(self, table, individual_id):
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"DELETE FROM {t} WHERE individual_id=?", (individual_id,))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.delete_all_for_member(table, individual_id)
 
     def fund_get_transaction(self, table, trans_id):
-        t = self._fund_table(table)
-        cur = self.conn.cursor()
-        cur.execute(f"SELECT id, individual_id, date, transaction_type, amount, notes FROM {t} WHERE id=?",
-                    (trans_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return dict(zip([d[0] for d in cur.description], row))
+        return self.funds.get(table, trans_id)
 
     def fund_update_transaction(self, table, trans_id, date, amount, notes):
-        """Edit a fund transaction's date/amount/notes (caller should recalc after)."""
-        t = self._fund_table(table)
-        self.conn.cursor().execute(f"UPDATE {t} SET date=?, amount=?, notes=? WHERE id=?",
-                                   (date, amount, notes, trans_id))
-        self.conn.commit()
+        """Edit a fund transaction and re-derive the running balances."""
+        self._mutate_fund(table, trans_id,
+                          lambda: self.funds.update(table, trans_id, date, amount, notes))
 
     # ========== BENEVOLENT ENROLMENT ==========
 
     def get_benevolent_account(self, individual_id):
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, individual_id, monthly_amount, start_date, next_due_date, active "
-                    "FROM benevolent_accounts WHERE individual_id=?", (individual_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return dict(zip([d[0] for d in cur.description], row))
+        return self.funds.get_enrolment(individual_id)
 
     def upsert_benevolent_account(self, individual_id, monthly_amount, start_date, next_due_date):
-        cur = self.conn.cursor()
-        if self.get_benevolent_account(individual_id):
-            cur.execute("UPDATE benevolent_accounts SET monthly_amount=?, start_date=?, "
-                        "next_due_date=?, active=1 WHERE individual_id=?",
-                        (monthly_amount, start_date, next_due_date, individual_id))
-        else:
-            cur.execute("INSERT INTO benevolent_accounts (individual_id, monthly_amount, start_date, "
-                        "next_due_date, active) VALUES (?, ?, ?, ?, 1)",
-                        (individual_id, monthly_amount, start_date, next_due_date))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.upsert_enrolment(individual_id, monthly_amount, start_date, next_due_date)
 
     def set_benevolent_next_due(self, individual_id, next_due_date):
-        self.conn.cursor().execute("UPDATE benevolent_accounts SET next_due_date=? WHERE individual_id=?",
-                                   (next_due_date, individual_id))
-        self.conn.commit()
+        with self.transaction():
+            self.funds.set_next_due(individual_id, next_due_date)
 
     def get_setting(self, key, default=None):
-        """Get a setting value."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key=?", (key,))
-        res = cursor.fetchone()
-        return res[0] if res else default
+        """Get a setting value (delegates to SettingsRepository).
+
+        Retained as the public API every caller already uses; prefer the typed
+        accessors on ``db.settings`` in new code.
+        """
+        return self.settings.get(key, default)
 
     def set_setting(self, key, value):
-        """Set a setting value."""
-        cursor = self.conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-        self.conn.commit()
+        """Set a setting value (delegates to SettingsRepository)."""
+        with self.transaction():
+            self.settings.set(key, value)
 
     def import_individuals_from_external_db(self, source_db_path):
         """
         Import individuals (empty shells) from another SQLite database.
         Skips individuals that already exist (by Name).
-        Returns the number of imported records.
+        Returns the number of imported records, or -1 when the source has no
+        usable individuals table.
         """
         try:
-            # Connect to Source
-            import sqlite3
-            src_conn = sqlite3.connect(source_db_path)
-            src_cursor = src_conn.cursor()
-            
-            # Check source table exists
-            try:
-                src_cursor.execute("SELECT name, phone, email, default_deduction FROM individuals")
-                rows = src_cursor.fetchall()
-            except sqlite3.OperationalError:
-                src_conn.close()
-                return -1 # Error: No individuals table
-            
-            src_conn.close()
-            
-            # Get Current Individuals (to Check Duplicates)
-            current_names = set()
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT name FROM individuals")
-            for r in cursor.fetchall():
-                current_names.add(r[0])
-            
-            imported_count = 0
-            
-            for row in rows:
-                name, phone, email, def_ded = row
-                if name not in current_names:
-                    # Insert
-                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Handle None/Null values
-                    phone = phone if phone else ""
-                    email = email if email else ""
-                    def_ded = def_ded if def_ded else 0
-                    
-                    cursor.execute("""
-                        INSERT INTO individuals (name, phone, email, default_deduction, created_at)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, (name, phone, email, def_ded, created_at))
-                    imported_count += 1
-            
-            self.conn.commit()
-            return imported_count
-            
+            with SourceJournal(source_db_path) as src:
+                try:
+                    rows = src.basic_members()
+                except sqlite3.OperationalError:
+                    return -1
 
+            existing = set(self.members.names_to_ids())
+            imported = 0
+            with self.transaction():
+                for row in rows:
+                    name = row["name"]
+                    if name in existing:
+                        continue
+                    self.members.add(name, row["phone"] or "", row["email"] or "",
+                                     row["default_deduction"] or 0)
+                    existing.add(name)
+                    imported += 1
+            return imported
         except Exception:
             logger.exception("Import error")
             return 0
-
 
     def get_import_preview(self, source_db_path):
         """
         Connect to source DB and return list of individuals for preview.
         Returns: list of dicts [{'id': 1, 'name': '...', 'phone': '...', 'email': '...'}]
         """
-        import sqlite3
         try:
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            try:
-                src_cur.execute("SELECT id, name, phone, email FROM individuals ORDER BY name")
-                rows = src_cur.fetchall()
-                result = [dict(row) for row in rows]
-                src_conn.close()
-                return result
-            except sqlite3.OperationalError:
-                src_conn.close()
-                return None
+            with SourceJournal(source_db_path) as src:
+                return src.member_summaries()
         except Exception:
             return None
+
     def check_import_conflicts(self, source_db_path, selected_ids):
         """
         Check for potential duplicates between source and destination DBs.
-        
+
         Args:
             source_db_path: Path to source DB.
             selected_ids: List of source individual IDs to check.
-            
+
         Returns:
             List of conflict dicts:
             [
                 {
                     "src": {"id": 1, "name": "John", "phone": "123", "email": "a@b.com"},
                     "matches": [
-                        {"id": 5, "name": "john", "phone": "123", "email": "a@b.com", "reasons": ["Name", "Phone"]}
+                        {"id": 5, "name": "john", "phone": "123", "email": "a@b.com", "reason": "..."}
                     ]
                 }, ...
             ]
         """
-        import sqlite3
         conflicts = []
-        
         try:
-            # 1. Get Source Data
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            placeholders = ','.join(['?'] * len(selected_ids))
-            query = f"SELECT id, name, phone, email FROM individuals WHERE id IN ({placeholders})"
-            src_cur.execute(query, selected_ids)
-            src_inds = src_cur.fetchall()
-            src_conn.close()
-            
-            if not src_inds:
-                return []
-
-            # 2. Get Dest Data
-            # Use a local connection to ensure row_factory is set without affecting global state
-            dest_conn = sqlite3.connect(self.db_name)
-            dest_conn.row_factory = sqlite3.Row
-            dest_cur = dest_conn.cursor()
-            
-            try:
-                for src_ind in src_inds:
+            with SourceJournal(source_db_path) as src:
+                for src_ind in src.member_summaries(selected_ids):
                     matches = []
-                    
-                    # Check Name (Case-insensitive)
-                    dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE name LIKE ?", (src_ind['name'],))
-                    name_matches = dest_cur.fetchall()
-                    
-                    for m in name_matches:
-                        matches.append({
-                            "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
-                            "reason": "Name (Case-insensitive)"
-                        })
+                    seen = {}
 
-                    # Check Phone (if exists)
-                    if src_ind['phone']:
-                        # Simple check: exact string match
-                        dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE phone = ?", (src_ind['phone'],))
-                        phone_matches = dest_cur.fetchall()
-                        for m in phone_matches:
-                            # Avoid duplicates in matches list
-                            if not any(x['id'] == m['id'] for x in matches):
-                                matches.append({
-                                    "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
-                                    "reason": "Phone Match"
-                                })
-                            else:
-                                # Update reason if already matched by name
-                                for x in matches:
-                                    if x['id'] == m['id'] and "Phone" not in x['reason']:
-                                        x['reason'] += ", Phone Match"
+                    def note(candidates, reason, matches=matches, seen=seen):
+                        for m in candidates:
+                            if m["id"] in seen:
+                                if reason not in seen[m["id"]]["reason"]:
+                                    seen[m["id"]]["reason"] += f", {reason}"
+                                continue
+                            entry = {**m, "reason": reason}
+                            seen[m["id"]] = entry
+                            matches.append(entry)
 
-                    # Check Email (if exists)
-                    if src_ind['email']:
-                         dest_cur.execute("SELECT id, name, phone, email FROM individuals WHERE email LIKE ?", (src_ind['email'],))
-                         email_matches = dest_cur.fetchall()
-                         for m in email_matches:
-                            if not any(x['id'] == m['id'] for x in matches):
-                                matches.append({
-                                    "id": m['id'], "name": m['name'], "phone": m['phone'], "email": m['email'], 
-                                    "reason": "Email Match"
-                                })
-                            else:
-                                 for x in matches:
-                                    if x['id'] == m['id'] and "Email" not in x['reason']:
-                                        x['reason'] += ", Email Match"
-                    
+                    note(self.members.match_by_name(src_ind["name"]),
+                         "Name (Case-insensitive)")
+                    if src_ind["phone"]:
+                        note(self.members.match_by_phone(src_ind["phone"]), "Phone Match")
+                    if src_ind["email"]:
+                        note(self.members.match_by_email(src_ind["email"]), "Email Match")
+
                     if matches:
-                        conflicts.append({
-                            "src": {"id": src_ind['id'], "name": src_ind['name'], "phone": src_ind['phone'], "email": src_ind['email']},
-                            "matches": matches
-                        })
-            finally:
-                dest_conn.close()
-                    
+                        conflicts.append({"src": src_ind, "matches": matches})
         except Exception:
             logger.exception("Error checking import conflicts")
             return []
-            
         return conflicts
 
     def generate_import_preview(self, source_db_path, selected_ids, options):
@@ -1854,58 +2038,30 @@ class DatabaseManager:
             # IDs that are either real conflicts OR auto-merged
             processed_ids = {c['src']['id'] for c in real_conflicts}.union(auto_merged_ids)
             
-            # 3. Connect Dest to get existing LOAN REFS for collision detection
-            dest_conn = sqlite3.connect(self.db_name)
-            dest_conn.row_factory = sqlite3.Row
-            dest_cur = dest_conn.cursor()
-            dest_cur.execute("SELECT ref FROM loans")
-            existing_loan_refs = {row['ref'] for row in dest_cur.fetchall()}
-            dest_conn.close()
+            # 3. Existing loan refs, for collision detection
+            existing_loan_refs = self.loans.all_refs()
 
-            # 4. Connect Source to get details for remaining New Individuals AND Loans
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            # Get all selected source individuals to check against processed_ids
-            placeholders = ','.join(['?'] * len(selected_ids))
-            src_cur.execute(f"SELECT id, name FROM individuals WHERE id IN ({placeholders})", selected_ids)
-            src_inds = src_cur.fetchall()
-            
-            for src_ind in src_inds:
-                sid = src_ind['id']
-                name = src_ind['name']
-                
-                # Count Related Data (Loans/Ledger/Savings) for ALL selected
-                if options.get("import_loans"):
-                    # Check for collisions while counting
-                    src_cur.execute("SELECT ref FROM loans WHERE individual_id=?", (sid,))
-                    loans = src_cur.fetchall()
-                    preview["summary"]["loans"] += len(loans)
-                    
-                    for loan in loans:
-                        if loan['ref'] in existing_loan_refs:
-                            preview["summary"]["loans_renamed"] += 1
-                            if len(preview["details"]["loan_renames"]) < 10: # Limit detail list
-                                preview["details"]["loan_renames"].append(loan['ref'])
+            # 4. Source details for the remaining new individuals and their loans
+            with SourceJournal(source_db_path) as src:
+                for sid, name in src.member_names(selected_ids):
+                    # Count related data for every selected member
+                    if options.get("import_loans"):
+                        refs = src.loan_refs(sid)
+                        preview["summary"]["loans"] += len(refs)
+                        for ref in refs:
+                            if ref in existing_loan_refs:
+                                preview["summary"]["loans_renamed"] += 1
+                                if len(preview["details"]["loan_renames"]) < 10:
+                                    preview["details"]["loan_renames"].append(ref)
+                        preview["summary"]["ledger"] += src.count("ledger", sid)
 
-                    src_cur.execute("SELECT count(*) FROM ledger WHERE individual_id=?", (sid,))
-                    preview["summary"]["ledger"] += src_cur.fetchone()[0]
-                    
-                if options.get("import_savings"):
-                     try:
-                         src_cur.execute("SELECT count(*) FROM savings WHERE individual_id=?", (sid,))
-                         preview["summary"]["savings"] += src_cur.fetchone()[0]
-                     except sqlite3.OperationalError:
-                         pass
+                    if options.get("import_savings"):
+                        preview["summary"]["savings"] += src.count("savings", sid)
 
-                # Categorize as New if not processed
-                if sid not in processed_ids:
-                    preview["summary"]["individuals_new"] += 1
-                    preview["details"]["new_names"].append(name)
-            
-            src_conn.close()
-            # Dest conn closed above
+                    # Categorize as New if not processed
+                    if sid not in processed_ids:
+                        preview["summary"]["individuals_new"] += 1
+                        preview["details"]["new_names"].append(name)
             
         except Exception:
             logger.exception("Import preview error")
@@ -1913,233 +2069,184 @@ class DatabaseManager:
             
         return preview
 
-    def _import_aux_tables(self, src_cur, dest_cur, id_map, loan_id_map, import_id, options):
+    def _import_aux_tables(self, src, id_map, loan_id_map, options):
         """Import Christmas/Benevolent funds and loan suspensions for the members
-        already mapped in id_map. Uses dest_cur only (no commit), so it composes
-        with the caller's manual import transaction. Returns a stats dict.
+        already mapped in id_map. Writes through the repositories on the shared
+        connection and never commits, so it composes with the caller's manual
+        import transaction. Returns a stats dict.
         """
         stats = {"christmas": 0, "benevolent": 0, "benevolent_accounts": 0, "suspensions": 0}
         if not id_map:
             return stats
 
-        def has(name):
-            src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
-            return src_cur.fetchone() is not None
-
-        def recalc(table, ind):
-            running = 0.0
-            for rid, ttype, amount in dest_cur.execute(
-                    f"SELECT id, transaction_type, amount FROM {table} WHERE individual_id=? "
-                    f"ORDER BY date, id", (ind,)).fetchall():
-                running = round(running - amount if ttype == "Withdrawal" else running + amount, 2)
-                dest_cur.execute(f"UPDATE {table} SET balance=? WHERE id=?", (running, rid))
-
         if options.get("import_funds", False):
-            for table, key in (("christmas_savings", "christmas"), ("benevolent_ledger", "benevolent")):
-                if not has(table):
+            for table, key in (("christmas_savings", "christmas"),
+                               ("benevolent_ledger", "benevolent")):
+                if not src.has_table(table):
                     continue
-                src_cur.execute(f"SELECT * FROM {table}")
-                cols = [d[0] for d in src_cur.description]
+                cols, rows = src.all_rows(table)
                 affected = set()
-                for tup in src_cur.fetchall():
+                for tup in rows:
                     row = dict(zip(cols, tup))
-                    new = id_map.get(row.get('individual_id'))
-                    if new is None:
+                    new_id = id_map.get(row.get('individual_id'))
+                    if new_id is None:
                         continue
-                    dest_cur.execute(
-                        f"INSERT INTO {table} (individual_id, date, transaction_type, amount, "
-                        f"balance, notes, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (new, row.get('date'), row.get('transaction_type'), row.get('amount'),
-                         row.get('balance'), row.get('notes'), row.get('batch_id')))
-                    affected.add(new)
+                    self.funds.add_imported(
+                        table, new_id, row.get('date'), row.get('transaction_type'),
+                        row.get('amount'), row.get('balance'), row.get('notes'),
+                        row.get('batch_id'))
+                    affected.add(new_id)
                     stats[key] += 1
-                for ind in affected:
-                    recalc(table, ind)
+                for member_id in affected:
+                    self.funds.recalculate(table, member_id)
 
-            if has("benevolent_accounts"):
-                src_cur.execute("SELECT * FROM benevolent_accounts")
-                cols = [d[0] for d in src_cur.description]
-                for tup in src_cur.fetchall():
+            if src.has_table("benevolent_accounts"):
+                cols, rows = src.all_rows("benevolent_accounts")
+                for tup in rows:
                     row = dict(zip(cols, tup))
-                    new = id_map.get(row.get('individual_id'))
-                    if new is None:
+                    new_id = id_map.get(row.get('individual_id'))
+                    if new_id is None:
                         continue
-                    dest_cur.execute(
-                        "INSERT OR REPLACE INTO benevolent_accounts "
-                        "(individual_id, monthly_amount, start_date, next_due_date, active) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (new, row.get('monthly_amount', 0) or 0, row.get('start_date'),
-                         row.get('next_due_date'), row.get('active', 1)))
+                    self.funds.replace_enrolment(
+                        new_id, row.get('monthly_amount', 0) or 0, row.get('start_date'),
+                        row.get('next_due_date'), row.get('active', 1))
                     stats["benevolent_accounts"] += 1
 
-        if options.get("import_loans", False) and has("loan_suspensions"):
-            src_cur.execute("SELECT * FROM loan_suspensions")
-            cols = [d[0] for d in src_cur.description]
-            for tup in src_cur.fetchall():
+        if options.get("import_loans", False) and src.has_table("loan_suspensions"):
+            cols, rows = src.all_rows("loan_suspensions")
+            for tup in rows:
                 row = dict(zip(cols, tup))
-                new = id_map.get(row.get('individual_id'))
-                if new is None:
+                new_id = id_map.get(row.get('individual_id'))
+                if new_id is None:
                     continue
                 old_ref = row.get('loan_ref')
                 new_ref = (loan_id_map.get(old_ref, old_ref) if old_ref else old_ref)
-                new_loan_id = None
-                if new_ref:
-                    r = dest_cur.execute("SELECT id FROM loans WHERE individual_id=? AND ref=?",
-                                         (new, new_ref)).fetchone()
-                    new_loan_id = r[0] if r else None
-                dest_cur.execute(
-                    "INSERT INTO loan_suspensions (loan_id, individual_id, loan_ref, start_date, "
-                    "suspend_until, resumed_date, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (new_loan_id, new, new_ref, row.get('start_date'), row.get('suspend_until'),
-                     row.get('resumed_date'), row.get('status', 'active'), row.get('created_at')))
+                new_loan_id = self.loans.id_for_ref(new_id, new_ref) if new_ref else None
+                self.loans.add_suspension(
+                    new_loan_id, new_id, new_ref, row.get('start_date'),
+                    row.get('suspend_until'), row.get('resumed_date'),
+                    row.get('status', 'active'), created_at=row.get('created_at'))
                 stats["suspensions"] += 1
 
         return stats
 
-    def import_selected_data(self, source_db_path, selected_ids, options, progress_callback=None, decision_map=None):
+    def import_selected_data(self, source_db_path, selected_ids, options,
+                             progress_callback=None, decision_map=None):
         """
         Import ONLY selected individuals from external database with granular checkpoints.
-        
+
         Args:
             source_db_path: Path to source DB
             selected_ids: List of individual IDs to import
             options: Dict with import options
             progress_callback: Callable(current, total, message)
             decision_map: Dict {src_id: "new" | "skip" | int(dest_id)}
-            
+
         Returns a dict:
         {
             "status": "success" | "partial" | "failed",
             "stats": { "individuals": 0, "loans": 0, ... },
             "errors": ["Error message 1", ...]
         }
+
+        NOTE ON THE SAVEPOINT POLICY. Each phase takes a savepoint on success,
+        and phase 2 rolls back to ``individuals_imported`` on failure so members
+        survive a loan failure. Phase 3 does **not** roll back: a savings
+        failure leaves whatever rows it managed to write, and relies on the user
+        undoing the whole run instead. That gap is inherited, is documented in
+        the code it replaced, and is preserved here — deciding what a partial
+        savings import should do is a business call, not a refactoring one.
         """
-        import sqlite3
-        
-        # summary stats
-        stats = {"individuals": 0, "loans": 0, "ledger": 0, "savings": 0}
+        stats = {"individuals": 0, "loans": 0, "ledger": 0, "savings": 0, "rejected": 0}
         errors = []
         status = "success"
-        src_conn = None
-        
+        # Bound before the try: the original assigned it *inside*, so a failure
+        # while opening the source raised NameError from the handler and masked
+        # the real error.
+        original_isolation = self.conn.isolation_level
+        src = None
+
         try:
-            # Connect to Source
-            src_conn = sqlite3.connect(source_db_path)
-            src_conn.row_factory = sqlite3.Row
-            src_cur = src_conn.cursor()
-            
-            # Pre-check tables existence/creation to avoid DDL inside transaction
+            src = SourceJournal(source_db_path)
+
+            # Pre-check table creation to avoid DDL inside the transaction
             if options.get("import_savings", False):
                 self.create_savings_table()
 
             # --- PHASE 1: INDIVIDUALS ---
+            if not selected_ids:
+                return {"status": "success", "stats": stats, "errors": []}
             try:
-                # Filter by selected_ids
-                if not selected_ids:
-                    return {"status": "success", "stats": stats, "errors": []}
-                    
-                placeholders = ','.join(['?'] * len(selected_ids))
-                query = f"SELECT * FROM individuals WHERE id IN ({placeholders})"
-                src_cur.execute(query, selected_ids)
-                src_inds = src_cur.fetchall()
+                src_inds = src.members(selected_ids)
             except sqlite3.OperationalError as e:
-                if src_conn: src_conn.close()
+                src.close()
                 return {"status": "failed", "stats": stats, "errors": [f"Source DB Error: {e}"]}
-            
-            # Start Manual Transaction
-            original_isolation = self.conn.isolation_level
-            self.conn.isolation_level = None 
-            
-            dest_cur = self.conn.cursor()
-            dest_cur.execute("BEGIN") # Start transaction explicitly
-            dest_cur.execute("SAVEPOINT import_start")
-            
-            # Create Import History Record
-            import_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            dest_cur.execute("INSERT INTO import_history (timestamp, source_file, details, item_count) VALUES (?, ?, ?, ?)",
-                             (import_timestamp, source_db_path, "Started", 0))
-            import_id = dest_cur.lastrowid
-            
-            # Map Source ID -> Dest ID
-            id_map = {}
-            loan_id_map = {}  # Source Loan Ref -> Dest Loan Ref (set in the loans phase)
-            
-            # Get current individuals for fallback matching
-            dest_cur.execute("SELECT name, id FROM individuals")
-            existing_inds = {row[0]: row[1] for row in dest_cur.fetchall()}
 
+            # Start Manual Transaction
+            self.conn.isolation_level = None
+            dest_cur = self.conn.cursor()
+            dest_cur.execute("BEGIN")
+            dest_cur.execute("SAVEPOINT import_start")
+
+            import_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            import_id = self.imports.start(import_timestamp, source_db_path)
+
+            id_map = {}        # Source member id -> destination member id
+            loan_id_map = {}   # Source loan ref  -> destination loan ref
+
+            existing_inds = self.members.names_to_ids()
             # Track PF/ID numbers already in use so an imported member with a
             # colliding number doesn't violate the unique indexes (we drop the
             # clashing field for that member instead of failing the whole import).
-            dest_cur.execute("SELECT pf_no FROM individuals WHERE pf_no IS NOT NULL AND pf_no != ''")
-            existing_pf = {r[0] for r in dest_cur.fetchall()}
-            dest_cur.execute("SELECT id_no FROM individuals WHERE id_no IS NOT NULL AND id_no != ''")
-            existing_id = {r[0] for r in dest_cur.fetchall()}
-            
-            # Estimate Total Steps
-            
-            # Let's query counts first for better progress bar
-            loan_count = 0
-            ledger_count = 0
-            savings_count = 0
-            
+            existing_pf = self.members.used_pf_numbers()
+            existing_id = self.members.used_id_numbers()
+
+            # Estimate total steps for the progress bar
+            loan_count = ledger_count = savings_count = 0
             if options.get("import_loans", False):
-                try:
-                    src_cur.execute("SELECT COUNT(*) FROM loans")
-                    loan_count = src_cur.fetchone()[0]
-                    src_cur.execute("SELECT COUNT(*) FROM ledger")
-                    ledger_count = src_cur.fetchone()[0]
-                except Exception: pass
-            
+                loan_count = src.count("loans")
+                ledger_count = src.count("ledger")
             if options.get("import_savings", False):
-                 try:
-                    src_cur.execute("SELECT COUNT(*) FROM savings")
-                    savings_count = src_cur.fetchone()[0]
-                 except Exception: pass
+                savings_count = src.count("savings")
 
             total_operations = len(src_inds) + loan_count + ledger_count + savings_count
             current_op = 0
-            
+
             try:
-                for i, src_ind in enumerate(src_inds):
+                for src_ind in src_inds:
                     if progress_callback:
-                        progress_callback(current_op, total_operations, f"Importing Individual: {src_ind['name']}")
-                    
+                        progress_callback(current_op, total_operations,
+                                          f"Importing Individual: {src_ind['name']}")
+
                     name = src_ind['name']
                     src_id = src_ind['id']
-                    
+
                     # Determine Action
                     action = "new"
                     if decision_map and src_id in decision_map:
                         action = decision_map[src_id]
                     elif name in existing_inds:
-                        # Fallback: Merge by exact name
-                        action = existing_inds[name]
-                    
+                        action = existing_inds[name]        # merge by exact name
+
                     if action == "skip":
                         current_op += 1
                         continue
-                        
-                    if isinstance(action, int):
-                        # Merge with existing
-                        id_map[src_id] = action
-                        # stats["individuals"] += 1 # Count merged as imported? Maybe no.
-                    else:
-                        # Create new
-                        phone = src_ind['phone'] if src_ind['phone'] else ""
-                        email = src_ind['email'] if src_ind['email'] else ""
-                        keys = src_ind.keys()
-                        def sval(col, default='', src_ind=src_ind, keys=keys):
-                            return src_ind[col] if col in keys and src_ind[col] is not None else default
-                        def_ded = src_ind['default_deduction'] if 'default_deduction' in keys and src_ind['default_deduction'] else 0
-                        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                        # New individual fields (graceful if the source is an older schema)
-                        emp_status = (sval('employment_status', 'Active') or 'Active')
-                        pf_no = (sval('pf_no', '') or '').strip()
-                        id_no = (sval('id_no', '') or '').strip()
-                        is_retired = 1 if sval('is_retired', 0) else 0
-                        retired_date = sval('retired_date', None) or None
+                    if isinstance(action, int):
+                        id_map[src_id] = action             # merge with existing
+                    else:
+                        keys = src_ind.keys()
+                        norm = import_rules.normalise_member(
+                            {k: src_ind[k] for k in keys})
+                        errors.extend(norm.warnings)
+                        if norm.rejected:
+                            errors.append(f"Skipped a member: {norm.reason}")
+                            stats["rejected"] += 1
+                            current_op += 1
+                            continue
+                        v = norm.values
+                        name = v["name"]
+                        pf_no, id_no = v["pf_no"], v["id_no"]
 
                         # Drop a colliding PF/ID rather than fail the import.
                         if pf_no and pf_no in existing_pf:
@@ -2149,47 +2256,33 @@ class DatabaseManager:
                             errors.append(f"ID '{id_no}' ({name}) already in use — imported without ID No.")
                             id_no = ''
 
-                        dest_cur.execute("""
-                            INSERT INTO individuals (name, phone, email, default_deduction, created_at,
-                                                     employment_status, pf_no, id_no, is_retired, retired_date, import_id)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (name, phone, email, def_ded, created_at,
-                              emp_status, pf_no, id_no, is_retired, retired_date, import_id))
-                        new_id = dest_cur.lastrowid
+                        new_id = self.members.add_imported(
+                            name, v["phone"], v["email"], v["default_deduction"],
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            v["employment_status"], pf_no, id_no,
+                            v["is_retired"], v["retired_date"], import_id)
                         id_map[src_id] = new_id
                         if pf_no:
                             existing_pf.add(pf_no)
                         if id_no:
                             existing_id.add(id_no)
                         stats["individuals"] += 1
-                    
+
                     current_op += 1
-                
-                # Checkpoint: Individuals Imported Successfully
+
                 dest_cur.execute("SAVEPOINT individuals_imported")
-                
+
             except Exception:
                 dest_cur.execute("ROLLBACK TO import_start")
-                self.conn.commit() # Nothing happened effectively
+                self.conn.commit()      # Nothing happened effectively
+
             # --- PHASE 2: LOANS & LEDGER ---
             if options.get("import_loans", False):
                 try:
-                    loan_id_map = {} # Source Loan Ref -> Dest Loan Ref (Used for Ledger linking)
-                    
-                    # Get existing loan refs to prevent collision
-                    dest_cur.execute("SELECT ref FROM loans")
-                    existing_loan_refs = {row[0] for row in dest_cur.fetchall()}
-                    
-                    # --- Loans ---
-                    # Only import loans for individuals we are importing/merging
-                    placeholders = ','.join(['?'] * len(id_map))
-                    if id_map:
-                        src_cur.execute(f"SELECT * FROM loans WHERE individual_id IN ({placeholders})", list(id_map.keys()))
-                        src_loans = src_cur.fetchall()
-                    else:
-                        src_loans = []
-                    
-                    for ln in src_loans:
+                    loan_id_map = {}
+                    existing_loan_refs = self.loans.all_refs()
+
+                    for ln in src.loans(list(id_map.keys())):
                         if progress_callback:
                             current_op += 1
                             if current_op % 5 == 0:
@@ -2197,125 +2290,86 @@ class DatabaseManager:
 
                         src_ind_id = ln['individual_id']
                         if src_ind_id not in id_map:
-                            continue # Should match query, but safety check
-                            
+                            continue
                         dest_ind_id = id_map[src_ind_id]
-                        
-                        # Handle Ref Collision
+
+                        # Handle ref collision by auto-renaming
                         original_ref = ln['ref']
                         new_ref = original_ref
-                        
                         if new_ref in existing_loan_refs:
-                            # Collision detected - Auto-rename
                             suffix_idx = 0
                             base_suffix = "-Import"
                             while new_ref in existing_loan_refs:
                                 suffix = base_suffix if suffix_idx == 0 else f"{base_suffix}-{suffix_idx}"
                                 new_ref = f"{original_ref}{suffix}"
                                 suffix_idx += 1
-                        
-                        existing_loan_refs.add(new_ref) # Mark as used
+                        existing_loan_refs.add(new_ref)
                         loan_id_map[original_ref] = new_ref
 
-                        # Insert Loan with new_ref
-                        keys = ln.keys()
-                        # Default values for missing cols
-                        monthly_int = ln['monthly_interest'] if 'monthly_interest' in keys and ln['monthly_interest'] else 0
-                        unearned_int = ln['unearned_interest'] if 'unearned_interest' in keys and ln['unearned_interest'] else 0
-                        int_bal = ln['interest_balance'] if 'interest_balance' in keys and ln['interest_balance'] else 0
-                        
-                        dest_cur.execute("""
-                            INSERT INTO loans (
-                                individual_id, ref, principal, total_amount, balance, installment, 
-                                start_date, next_due_date, status, monthly_interest, 
-                                unearned_interest, interest_balance, import_id
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            dest_ind_id, new_ref, ln['principal'], ln['total_amount'], ln['balance'], 
-                            ln['installment'], ln['start_date'], ln['next_due_date'], ln['status'], 
-                            monthly_int, unearned_int, int_bal, import_id
-                        ))
+                        norm = import_rules.normalise_loan(
+                            {k: ln[k] for k in ln.keys()},
+                            fallback_start=src.min_ledger_date(src_ind_id, original_ref))
+                        errors.extend(norm.warnings)
+                        if norm.rejected:
+                            errors.append(f"Skipped a loan: {norm.reason}")
+                            stats["rejected"] += 1
+                            existing_loan_refs.discard(new_ref)
+                            loan_id_map.pop(original_ref, None)
+                            continue
+                        v = norm.values
+                        self.loans.add_imported(
+                            dest_ind_id, new_ref, v['principal'], v['total_amount'],
+                            v['balance'], v['installment'], v['start_date'],
+                            v['next_due_date'], v['status'], v['monthly_interest'],
+                            v['unearned_interest'], v['interest_balance'], import_id)
                         stats["loans"] += 1
-                        
+
                     # --- Ledger ---
                     try:
-                        # Fetch source ledger entries for selected individuals
-                        placeholders = ','.join(['?'] * len(id_map))
-                        if id_map:
-                            params = list(id_map.keys())
-                            date_filter_clause = ""
-                            if options.get("date_range"):
-                                start_date, end_date = options["date_range"]
-                                date_filter_clause = " AND date >= ? AND date <= ?"
-                                params.extend([start_date, end_date])
-                                
-                            src_cur.execute(f"SELECT * FROM ledger WHERE individual_id IN ({placeholders}){date_filter_clause}", params)
-                            src_entries = src_cur.fetchall()
-                        else:
-                            src_entries = []
-                        
-                        cols = [d[0] for d in src_cur.description]
-                        
+                        cols, src_entries = src.ledger(list(id_map.keys()),
+                                                       options.get("date_range"))
                         for entry_tuple in src_entries:
                             if progress_callback:
                                 current_op += 1
                                 if current_op % 10 == 0:
-                                     progress_callback(current_op, total_operations, "Importing Ledger...")
-                                     
-                            # Convert tuple to dict for safe access
+                                    progress_callback(current_op, total_operations, "Importing Ledger...")
+
                             entry = dict(zip(cols, entry_tuple))
-                                 
                             src_ind_id = entry['individual_id']
                             if src_ind_id not in id_map:
                                 continue
-                            
                             dest_ind_id = id_map[src_ind_id]
-                            
-                            # Handle Loan Ref mapping
-                            # Ledger 'loan_id' column actually stores the Loan Reference string
-                            old_ref = entry['loan_id']
-                            new_ref = old_ref
-                            
-                            if old_ref and old_ref in loan_id_map:
-                                new_ref = loan_id_map[old_ref]
-                            
-                            # Safe Getters
-                            inst_amt = entry.get('installment_amount', 0) or 0
-                            batch_id = entry.get('batch_id')
-                            int_amt = entry.get('interest_amount', 0) or 0
-                            p_bal = entry.get('principal_balance', 0) or 0
-                            i_bal = entry.get('interest_balance', 0) or 0
-                            p_port = entry.get('principal_portion', 0) or 0
-                            i_port = entry.get('interest_portion', 0) or 0
-                            prev_state = entry.get('previous_state')
-                            is_edited = entry.get('is_edited', 0) or 0
-                            
-                            dest_cur.execute("""
-                                INSERT INTO ledger (
-                                    individual_id, date, event_type, loan_id, added, deducted, balance, notes,
-                                    installment_amount, batch_id, interest_amount,
-                                    principal_balance, interest_balance, principal_portion, interest_portion, 
-                                    previous_state, is_edited, import_id
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                dest_ind_id, entry['date'], entry['event_type'], new_ref, 
-                                entry['added'], entry['deducted'], entry['balance'], entry['notes'],
-                                inst_amt, batch_id, int_amt,
-                                p_bal, i_bal, p_port, i_port, 
-                                prev_state, is_edited, import_id
-                            ))
+
+                            norm = import_rules.normalise_ledger(entry)
+                            errors.extend(norm.warnings)
+                            if norm.rejected:
+                                errors.append(f"Skipped a transaction: {norm.reason}")
+                                stats["rejected"] += 1
+                                continue
+                            v = norm.values
+
+                            # `loan_id` holds the loan REFERENCE string, so it is
+                            # remapped alongside any rename above.
+                            old_ref = v['loan_id']
+                            new_ref = loan_id_map.get(old_ref, old_ref) if old_ref else old_ref
+
+                            self.ledger.add_imported((
+                                dest_ind_id, v['date'], v['event_type'], new_ref,
+                                v['added'], v['deducted'], v['balance'], v['notes'],
+                                v['installment_amount'], v['batch_id'], v['interest_amount'],
+                                v['principal_balance'], v['interest_balance'],
+                                v['principal_portion'], v['interest_portion'],
+                                v['previous_state'], v['is_edited'], import_id))
                             stats["ledger"] += 1
 
                     except sqlite3.OperationalError:
-                        pass # Ledger might be missing or different schema in very old backups
+                        pass    # Ledger may be missing or differently shaped in very old backups
 
-                    # Checkpoint: Loans & Ledger Imported
                     dest_cur.execute("SAVEPOINT loans_imported")
-                        
+
                 except Exception as e:
-                    # Partial Failure: Rollback loans but KEEP individuals
-                    dest_cur.execute("ROLLBACK TO individuals_imported") 
+                    # Partial failure: roll back loans but KEEP individuals
+                    dest_cur.execute("ROLLBACK TO individuals_imported")
                     status = "partial"
                     errors.append(f"Failed to import loans/ledger: {e}")
                     stats["loans"] = 0
@@ -2324,124 +2378,79 @@ class DatabaseManager:
 
             # --- PHASE 3: SAVINGS ---
             if options.get("import_savings", False):
-                # self.create_savings_table() # MOVED TO START
                 try:
                     savings_affected_ids = set()
-                    
-                    # Check for savings table
-                    src_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='savings'")
-                    if src_cur.fetchone():
-                        # Get column names to safely access data
-                        src_cur.execute("SELECT * FROM savings LIMIT 0")
-                        cols = [d[0] for d in src_cur.description]
-                        
-                        date_filter_clause = ""
-                        params = []
-                        if options.get("date_range"):
-                            start_date, end_date = options["date_range"]
-                            date_filter_clause = " WHERE date >= ? AND date <= ?"
-                            params = [start_date, end_date]
-                        
-                        src_cur.execute(f"SELECT * FROM savings{date_filter_clause}", params)
-                        src_savings = src_cur.fetchall()
-                        
+                    if src.has_table("savings"):
+                        cols, src_savings = src.savings(options.get("date_range"))
                         for sav_tuple in src_savings:
                             if progress_callback:
                                 current_op += 1
                                 if current_op % 5 == 0:
-                                     progress_callback(current_op, total_operations, "Importing Savings...")
-                            
+                                    progress_callback(current_op, total_operations, "Importing Savings...")
+
                             sav = dict(zip(cols, sav_tuple))
-                                 
                             old_ind_id = sav['individual_id']
                             if old_ind_id not in id_map:
                                 continue
                             new_ind_id = id_map[old_ind_id]
-                            
-                            dest_cur.execute("""
-                                INSERT INTO savings (individual_id, date, transaction_type, amount, balance, notes, import_id)
-                                VALUES (?, ?, ?, ?, ?, ?, ?)
-                            """, (new_ind_id, sav['date'], sav['transaction_type'], sav['amount'], sav['balance'], sav['notes'], import_id))
-                            
+
+                            norm = import_rules.normalise_fund_row(sav)
+                            errors.extend(norm.warnings)
+                            if norm.rejected:
+                                errors.append(f"Skipped a savings row: {norm.reason}")
+                                stats["rejected"] += 1
+                                continue
+                            v = norm.values
+
+                            self.funds.add_imported_savings(
+                                new_ind_id, v['date'], v['transaction_type'],
+                                v['amount'], v['balance'], v['notes'], import_id)
                             savings_affected_ids.add(new_ind_id)
                             stats["savings"] += 1
-                        
-                        # Recalculate Balances for affected individuals
+
                         if savings_affected_ids:
-                             if progress_callback:
-                                 progress_callback(current_op, total_operations, "Recalculating Savings Balances...")
-                             
-                             # We need to COMMIT or at least ensure data is visible to recalculate_savings_balance
-                             # recalculate_savings_balance uses a separate cursor on the SAME connection (self.conn).
-                             # Since we are in a transaction (isolation_level=None + manually managed), 
-                             # `self.conn.cursor()` should see the uncommitted changes from `dest_cur`.
-                             
-                             for ind_id in savings_affected_ids:
-                                 self.recalculate_savings_balance(ind_id, cursor=dest_cur)
-                        
-                        # Checkpoint: Savings Imported
+                            if progress_callback:
+                                progress_callback(current_op, total_operations,
+                                                  "Recalculating Savings Balances...")
+                            # Same connection, so the recalculation sees the rows
+                            # written above even though nothing is committed yet.
+                            for ind_id in savings_affected_ids:
+                                self.recalculate_savings_balance(ind_id, cursor=dest_cur)
 
                         dest_cur.execute("SAVEPOINT savings_imported")
-                        
+
                 except Exception as e:
-                    # Partial Failure for Savings
-                    # If we fail here, and loans were imported (or not requested), we retain what we have.
-                    # If loans were imported, we have 'loans_imported' savepoint.
-                    # If loans were NOT imported, we have 'individuals_imported'.
-                    # Let's just rollback to previous stable point.
-                    
-                    # Logic: 
-                    # If loans success -> rollback to loans_imported.
-                    # If loans skipped -> rollback to individuals_imported.
-                    # Actually, we can just catch, log, and NOT rollback everything?
-                    # But we want atomic savings import?
-                    # Let's say: rollback to 'loans_imported' if it exists, else 'individuals_imported'.
-                    
-                    # Simpler: Just log error and set status partial. The partial data (loans/inds) is already safe?
-                    # Wait, if we are in this block, we haven't committed yet.
-                    # We need to explicitly ROLLBACK TO the last good savepoint.
-                    
-                    # For now, let's assume we rollback to 'loans_imported' if we passed it.
-                    # But if we didn't import loans...
-                    # This is tricky without explicit savepoint management for valid previous state.
-                    # Let's skip complex rollback logic for this specific syntax fix and rely on the fact that 
-                    # users can now UNDO imports if they act weird.
+                    # No rollback here — see the savepoint-policy note in the
+                    # docstring. Whatever was written stays, and the user is
+                    # expected to undo the whole run if the result looks wrong.
                     status = "partial"
                     errors.append(f"Failed to import savings: {e}")
                     stats["savings"] = 0
                     logger.exception("Import error (savings)")
-                    pass
 
             # --- PHASE 4: FUNDS & SUSPENSIONS (best-effort) ---
             try:
                 if progress_callback:
                     progress_callback(current_op, total_operations, "Importing funds & suspensions...")
-                aux = self._import_aux_tables(src_cur, dest_cur, id_map, loan_id_map, import_id, options)
-                stats.update(aux)
+                stats.update(self._import_aux_tables(src, id_map, loan_id_map, options))
                 dest_cur.execute("SAVEPOINT aux_imported")
             except Exception as e:
                 status = "partial"
                 errors.append(f"Failed to import funds/suspensions: {e}")
                 logger.exception("Import error (aux tables)")
 
-            # Update Import History with final stats
-            import_details = json.dumps(stats)
-            dest_cur.execute("UPDATE import_history SET details = ?, item_count = ? WHERE id = ?", 
-                             (import_details, total_operations, import_id))
-            
-            # Final Commit - Release the initial savepoint and commit the transaction
+            self.imports.finish(import_id, json.dumps(stats), total_operations)
+
+            # Final commit — release the initial savepoint and commit
             dest_cur.execute("RELEASE import_start")
             self.conn.commit()
-            
-            if src_conn:
-                src_conn.close()
-            # Restore isolation level
+            src.close()
             self.conn.isolation_level = original_isolation
-            
+
         except Exception as e:
-            if src_conn:
-                src_conn.close()
-            self.conn.rollback() # Rollback everything if critical error
+            if src:
+                src.close()
+            self.conn.rollback()
             self.conn.isolation_level = original_isolation
             logger.exception("Critical import error")
             return {"status": "failed", "stats": stats, "errors": [str(e)]}
@@ -2455,52 +2464,28 @@ class DatabaseManager:
 
     def get_import_history(self):
         """Fetch all import history records."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, timestamp, source_file, details, item_count FROM import_history ORDER BY id DESC")
-        return [dict(zip(['id', 'timestamp', 'source_file', 'details', 'item_count'], row)) for row in cursor.fetchall()]
+        return self.imports.all()
 
     def undo_import(self, import_id):
         """
         Revert an import operation by deleting all records associated with the given import_id.
-        
+
+        Only rows the import *created* carry an import_id, so a member who
+        already existed and was merged into is never removed.
+
         Args:
             import_id (int): ID of the import batch to undo.
-            
+
         Returns:
             bool: True if successful, False otherwise.
         """
         if not import_id:
             return False
-            
         try:
-            cur = self.conn.cursor()
-            cur.execute("BEGIN")
-            
-            # Delete in reverse order of dependency
-            
-            # 1. Savings
-            cur.execute("DELETE FROM savings WHERE import_id = ?", (import_id,))
-            
-            # 2. Ledger
-            cur.execute("DELETE FROM ledger WHERE import_id = ?", (import_id,))
-            
-            # 3. Loans
-            cur.execute("DELETE FROM loans WHERE import_id = ?", (import_id,))
-            
-            # 4. Individuals
-            # Only delete individuals that were CREATED by this import (have import_id).
-            # Merged individuals will NOT be deleted (as they don't have this import_id, or we need to check).
-            # Note: We only set import_id on INSERT. So this is safe.
-            cur.execute("DELETE FROM individuals WHERE import_id = ?", (import_id,))
-            
-            # 5. Import History
-            cur.execute("DELETE FROM import_history WHERE id = ?", (import_id,))
-            
-            self.conn.commit()
+            with self.transaction():
+                self.imports.undo(import_id)
             return True
-            
         except Exception:
-            self.conn.rollback()
             logger.exception("Undo import error")
             return False
 
@@ -2509,49 +2494,5 @@ class DatabaseManager:
         Validates that the source file is a valid SQLite database and has the required schema.
         Returns: (is_valid, error_message)
         """
-        import os
-        if not os.path.exists(source_path):
-             return False, "File does not exist."
-             
-        # basic check for file size
-        if os.path.getsize(source_path) == 0:
-             return False, "File is empty."
+        return SourceJournal.validate(source_path)
 
-        conn = None
-        try:
-            conn = sqlite3.connect(source_path)
-            cursor = conn.cursor()
-            
-            # 1. Check if it's a valid SQLite DB (PRAGMA integrity_check is too slow, just try simple query)
-            try:
-                cursor.execute("SELECT name FROM sqlite_master LIMIT 1")
-            except sqlite3.DatabaseError:
-                return False, "File is not a valid SQLite database or is encrypted."
-                
-            # 2. Check for 'individuals' table (Critical)
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='individuals'")
-            if not cursor.fetchone():
-                return False, "Missing required table: 'individuals'."
-                
-            # 3. Check for 'name' column in individuals (Critical)
-            cursor.execute("PRAGMA table_info(individuals)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if 'name' not in columns:
-                return False, "Table 'individuals' missing required column: 'name'."
-                
-            return True, ""
-            
-        except Exception as e:
-            return False, f"Validation Error: {str(e)}"
-        finally:
-            if conn:
-                conn.close()
-
-    # ==========================================
-    # Treasury / General Ledger
-    # ==========================================
-    # The single-entry general_ledger API (add/get/delete) has been retired in
-    # favour of the double-entry ledger (see GLService). The general_ledger
-    # table is kept read-only as a historical source that GLService.migrate_
-    # legacy_gl converts into balanced journals; new treasury activity is posted
-    # as journal entries through the Treasury dialog.

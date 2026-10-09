@@ -1,0 +1,200 @@
+"""Replay every loan from asserted events and diff against what is stored.
+
+Read-only. Opens the journal with ``mode=ro``, writes nothing, and changes
+nothing. The point is to answer one question before any migration is
+contemplated:
+
+    if loans were stored as asserted events and everything else derived,
+    would we get back the numbers we already have?
+
+Where it agrees, the event model is sound for that loan. Where it disagrees,
+either the derivation is wrong or the loan's history genuinely does not add up
+— and both are worth knowing. That second case is how loan 483 surfaced.
+
+    python -m tools.replay_loans loan_master.db
+    python -m tools.replay_loans loan_master.db --verbose --limit 20
+
+Events are reconstructed from what exists today:
+
+    Loan Issued / Loan Top-Up rows -> Disbursed / ToppedUp
+    Repayment / Loan Buyoff rows   -> PaymentReceived (the amount, asserted)
+    loan_suspensions rows          -> Suspended
+
+Interest accrual is deliberately *not* reconstructed as an event. It is the
+thing being derived — if replay reproduces the stored accruals, the model holds.
+
+Terms are inferred from the accruals themselves, since a change in the amount
+accrued *is* a change in the terms (see src.services.loan_events). With that,
+112 of the production journal's 113 loans reproduce exactly.
+"""
+import argparse
+import os
+import sqlite3
+import sys
+from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.services.loan_derivation import derive
+
+TOLERANCE = 0.51        # money is float with ceil rounding in places
+
+
+def load_loans(conn):
+    return conn.execute(
+        "SELECT l.id, l.individual_id, l.ref, i.name, l.status, l.principal, "
+        "       l.balance, l.installment, l.monthly_interest, l.unearned_interest, "
+        "       l.interest_balance, l.next_due_date "
+        "FROM loans l JOIN individuals i ON i.id = l.individual_id "
+        "ORDER BY l.id").fetchall()
+
+
+def events_for(conn, loan):
+    """Reconstruct one loan's asserted events, and return them with its rows.
+
+    The reconstruction itself lives in src.services.loan_events so that this
+    tool and the integrity check cannot disagree about what a loan's history
+    was — a harness that reports success against a different reconstruction
+    from the one shipped would be worse than no harness.
+    """
+    from src.services.loan_events import reconstruct
+
+    _lid, ind, ref = loan[0], loan[1], loan[2]
+    rows = conn.execute(
+        "SELECT id, date, event_type, added, deducted, principal_portion, "
+        "       interest_portion FROM ledger WHERE individual_id=? AND loan_id=? "
+        "ORDER BY date, id", (ind, ref)).fetchall()
+    suspensions = conn.execute(
+        "SELECT start_date, suspend_until FROM loan_suspensions "
+        "WHERE individual_id=? AND loan_ref=? ORDER BY start_date", (ind, ref)).fetchall()
+    return reconstruct(rows, suspensions), rows
+
+
+def compare(loan, derived, rows):
+    """Diff a replay against the stored ledger. Returns a list of findings."""
+    (_lid, _ind, _ref, _name, status, _principal, balance, _inst,
+     _mi, _un, _ibal, _ndd) = loan
+    findings = []
+
+    if abs((derived.principal_balance or 0) - (balance or 0)) > TOLERANCE:
+        findings.append(("balance", f"derived {derived.principal_balance:,.2f} "
+                                    f"vs stored {balance or 0:,.2f}"))
+
+    stored_accruals = [r for r in rows if r[2] == "Interest Earned"]
+    derived_accruals = [p for p in derived.postings if p.kind == "Interest Earned"]
+    if len(stored_accruals) != len(derived_accruals):
+        findings.append(("accrual count",
+                         f"derived {len(derived_accruals)} vs stored {len(stored_accruals)}"))
+    else:
+        stored_total = round(sum(r[3] or 0 for r in stored_accruals), 2)
+        if abs(derived.total_accrued - stored_total) > TOLERANCE:
+            findings.append(("accrual total",
+                             f"derived {derived.total_accrued:,.2f} vs "
+                             f"stored {stored_total:,.2f}"))
+
+    if status == "Paid" and abs(derived.principal_balance) > TOLERANCE:
+        findings.append(("settled", f"marked Paid but replay leaves "
+                                    f"{derived.principal_balance:,.2f}"))
+    return findings
+
+
+def deduction_gaps(rows):
+    """Months between deductions where none was taken. Returns the count.
+
+    A gap means the loan sat outstanding with nothing collected — and, because
+    accrual happens inside the deduction loop, no interest was charged either.
+    """
+    from datetime import datetime as _dt
+
+    months = [r[1][:7] for r in rows if r[2] in ("Repayment", "Loan Buyoff")]
+    missed = 0
+    for a, b in zip(months, months[1:]):
+        da, db = _dt.strptime(a, "%Y-%m"), _dt.strptime(b, "%Y-%m")
+        missed += max(0, (db.year - da.year) * 12 + db.month - da.month - 1)
+    return missed
+
+
+def classify(loan, rows, findings):
+    """Why a loan diverged, judged from the evidence rather than the event type.
+
+    An earlier version classified by which event kinds were present, which put
+    top-ups and buy-offs in separate buckets. They are the same finding: both
+    rewrite the loan's terms, and the terms are stored without history, so a
+    replay reading the *current* values applies them to months they never
+    governed. The give-away is accruals of several different amounts within one
+    loan — a single monthly_interest cannot have produced them.
+    """
+    kinds = {r[2] for r in rows}
+    if not any(k in kinds for k in ("Loan Issued", "Loan Top-Up")):
+        return "no disbursement recorded"
+
+    accruals = {round(r[3] or 0, 2) for r in rows if r[2] == "Interest Earned"}
+    stored_mi = loan[8] or 0
+    if len(accruals) > 1 or (accruals and round(stored_mi, 2) not in accruals):
+        return "terms changed mid-life (no history stored)"
+
+    if deduction_gaps(rows):
+        return "gap in deductions (no interest charged for those months)"
+    if any(r[7] for r in rows):
+        return "has a manually edited entry"
+    return "other"
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("journal")
+    ap.add_argument("--verbose", action="store_true", help="list every divergence")
+    ap.add_argument("--limit", type=int, default=12, help="divergences to show")
+    args = ap.parse_args(argv)
+
+    if not os.path.exists(args.journal):
+        print(f"Cannot open {args.journal}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(f"file:{args.journal}?mode=ro", uri=True)
+
+    loans = load_loans(conn)
+    exact, diverged, empty = [], [], []
+    reasons = Counter()
+
+    for loan in loans:
+        events, rows = events_for(conn, loan)
+        if not events:
+            empty.append(loan)
+            continue
+        derived = derive(events)
+        findings = compare(loan, derived, rows)
+        if findings:
+            reason = classify(loan, rows, findings)
+            reasons[reason] += 1
+            diverged.append((loan, findings, reason))
+        else:
+            exact.append(loan)
+
+    total = len(loans)
+    print(f"Replaying {total} loan(s) in {args.journal}\n")
+    print(f"  reproduced exactly : {len(exact):>4}"
+          f"   ({len(exact) / total * 100:.0f}%)" if total else "")
+    print(f"  diverged           : {len(diverged):>4}")
+    print(f"  no events to replay: {len(empty):>4}")
+
+    if reasons:
+        print("\nwhy they diverged:")
+        for reason, n in reasons.most_common():
+            print(f"  {n:>4}  {reason}")
+
+    if diverged:
+        print(f"\nfirst {min(args.limit, len(diverged))} divergence(s):")
+        for loan, findings, reason in diverged[:args.limit]:
+            print(f"  loan {loan[0]:<5} {loan[2]:<7} {loan[3][:26]:<28} {loan[4]:<7} {reason}")
+            for what, detail in findings:
+                print(f"        {what}: {detail}")
+
+    if args.verbose and empty:
+        print("\nloans with nothing to replay:")
+        for loan in empty:
+            print(f"  loan {loan[0]:<5} {loan[2]:<7} {loan[3][:26]}")
+
+    conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -87,6 +87,19 @@ def install_crash_handler() -> None:
         if issubclass(exc_type, KeyboardInterrupt):
             sys.__excepthook__(exc_type, exc_value, exc_tb)
             return
+        # A refusal is not a crash. PostingError, OperationNotAllowed and their
+        # siblings are the software declining on purpose, with a message written
+        # for the person reading it; showing them a crash dialog throws that
+        # message away and implies the application broke.
+        try:
+            from src.exceptions import LoanMasterError
+            from src.views.error_handling import report
+            if isinstance(exc_value, LoanMasterError):
+                report(exc_value)
+                return
+        except Exception:                       # noqa: BLE001 - fall through to the crash path
+            logger.debug("Could not report as a refusal", exc_info=True)
+
         logger.critical(
             "Uncaught exception",
             exc_info=(exc_type, exc_value, exc_tb),

@@ -9,6 +9,7 @@ Deduct, mirroring the loan deduction mechanics.
 import uuid
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+from src.services.policy import Operation, default_policy
 
 _TABLE = "benevolent_ledger"
 
@@ -70,6 +71,8 @@ class BenevolentService:
 
     def deduct_single(self, individual_id, batch_id=None):
         """Take one contribution at the next due date and advance the schedule."""
+        default_policy.enforce(self.db, Operation("benevolent.contribute",
+                                                  member_id=individual_id))
         acc = self.get_account(individual_id)
         if not acc or not acc.get('active'):
             return 0
@@ -88,6 +91,8 @@ class BenevolentService:
 
         Returns the number of contributions added.
         """
+        default_policy.enforce(self.db, Operation("benevolent.catch_up",
+                                                  member_id=individual_id))
         acc = self.get_account(individual_id)
         if not acc or not acc.get('active'):
             return 0
@@ -136,11 +141,8 @@ class BenevolentService:
         next-due to the batch's earliest date, and recalc the running total."""
         if not batch_id:
             return False
-        cur = self.db.conn.cursor()
         # earliest contribution per member == that member's next_due before the run
-        cur.execute(f"SELECT individual_id, MIN(date) FROM {_TABLE} WHERE batch_id=? "
-                    f"GROUP BY individual_id", (batch_id,))
-        rows = cur.fetchall()
+        rows = self.db.funds.earliest_date_per_member_in_batch(_TABLE, batch_id)
         self.db.fund_delete_batch(_TABLE, batch_id)
         for ind, earliest in rows:
             self.db.set_benevolent_next_due(ind, earliest)

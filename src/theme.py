@@ -68,7 +68,7 @@ class Theme:
 class ThemeManager:
     def __init__(self, db_manager):
         self.db = db_manager
-        self.current_theme_name = self.db.get_setting("app_theme", "Light") # Default to Light
+        self.current_theme_name = self.db.settings.app_theme
         self.colors = Theme.LIGHT if self.current_theme_name == "Light" else Theme.DARK
 
     def set_theme(self, theme_name):
@@ -120,12 +120,19 @@ class ThemeManager:
         )
 
     def outline_button_css(self, role="accent", padding="4px"):
-        """Bordered, transparent-background button for low-emphasis actions."""
+        """Bordered, transparent-background button for low-emphasis actions.
+
+        The disabled rule matters: without it an outline button keeps its full
+        colour when switched off, so a greyed-out action looks available and
+        only reveals itself by not responding.
+        """
         color = self.get_color(role)
         return (
             f"QPushButton {{ color: {color}; border: 1px solid {color}; "
             f"padding: {padding}; border-radius: 4px; background: transparent; }} "
-            f"QPushButton:hover {{ background-color: {self.get_color('card_selected_bg')}; }}"
+            f"QPushButton:hover {{ background-color: {self.get_color('card_selected_bg')}; }} "
+            f"QPushButton:disabled {{ color: {self.get_color('text_secondary')}; "
+            f"border-color: {self.get_color('border')}; }}"
         )
 
     def hint_css(self, size=11):
@@ -135,3 +142,109 @@ class ThemeManager:
     def status_label_css(self, role, size=13):
         """Bold status text colored by a semantic role (success/danger/…)."""
         return f"font-size: {size}px; font-weight: bold; color: {self.get_color(role)};"
+
+    def menu_css(self):
+        """Menus and the menu bar, in the theme's colours.
+
+        Nothing in the application styled a QMenu, so every one of them —
+        the member right-click, the ledger's context menus, the window menu
+        bar — took its colours from the platform style. Whether that reads
+        correctly is then an accident of the desktop the app happens to run on:
+        it rendered white-on-light in light mode, which is the same failure the
+        alternating table rows had, for the same reason.
+        """
+        c = self.get_color
+        return f"""
+        QMenu {{
+            background-color: {c('bg_secondary')};
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+            padding: 4px;
+        }}
+        QMenu::item {{
+            background-color: transparent;
+            color: {c('text_primary')};
+            padding: 6px 24px 6px 12px;
+            border-radius: 4px;
+        }}
+        QMenu::item:selected {{
+            background-color: {c('accent')};
+            color: {self._text_on(c('accent'))};
+        }}
+        QMenu::item:disabled {{ color: {c('text_secondary')}; }}
+        QMenu::separator {{
+            height: 1px;
+            background-color: {c('border')};
+            margin: 4px 8px;
+        }}
+        QMenuBar {{
+            background-color: {c('bg_secondary')};
+            color: {c('text_primary')};
+        }}
+        QMenuBar::item {{ background: transparent; padding: 4px 10px; }}
+        QMenuBar::item:selected {{
+            background-color: {c('accent')};
+            color: {self._text_on(c('accent'))};
+        }}
+        """
+
+    def dialog_stylesheet(self):
+        """App-level stylesheet that themes dialogs, scoped under ``QDialog``.
+
+        Dialogs were never handed a ThemeManager, so in dark mode they rendered
+        with the OS default (light) palette — inconsistent with the dark main
+        window, and with a few hardcoded labels going unreadable. Setting this on
+        the QApplication makes every QDialog/QMessageBox track the theme.
+
+        The scoping matters: every selector is under ``QDialog``, so the main
+        views — which style themselves per-widget — are left completely alone,
+        keeping the regression surface to dialog contents only.
+        """
+        c = self.get_color
+        return f"""
+        QDialog, QMessageBox {{ background-color: {c('bg_secondary')}; }}
+        QDialog QLabel, QMessageBox QLabel {{
+            color: {c('text_primary')};
+            background: transparent;
+        }}
+        QDialog QLineEdit, QDialog QComboBox, QDialog QSpinBox,
+        QDialog QDoubleSpinBox, QDialog QDateEdit, QDialog QPlainTextEdit,
+        QDialog QTextEdit {{
+            background-color: {c('input_bg')};
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+            border-radius: 4px;
+            padding: 3px;
+        }}
+        QDialog QCheckBox, QDialog QRadioButton {{ color: {c('text_primary')}; }}
+        QDialog QGroupBox {{
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+            border-radius: 4px;
+            margin-top: 8px;
+        }}
+        QDialog QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 8px;
+            padding: 0 3px;
+        }}
+        QDialog QListWidget, QDialog QTableWidget, QDialog QTableView,
+        QDialog QAbstractItemView {{
+            background-color: {c('bg_secondary')};
+            color: {c('text_primary')};
+            border: 1px solid {c('border')};
+            /* Without this, a table with alternating rows takes its stripe from
+               the OS palette rather than the theme — which in dark mode paints
+               every other row near-white and leaves the text unreadable. */
+            alternate-background-color: {c('bg_primary')};
+            gridline-color: {c('border')};
+            selection-background-color: {c('accent')};
+            selection-color: {self._text_on(c('accent'))};
+        }}
+        QDialog QHeaderView::section {{
+            background-color: {c('bg_primary')};
+            color: {c('text_primary')};
+            border: none;
+            padding: 4px;
+        }}
+        """

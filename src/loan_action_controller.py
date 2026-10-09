@@ -3,9 +3,12 @@
 This module provides a controller for loan-related actions in the Dashboard,
 extracted for better separation of concerns.
 """
+import logging
 from typing import Callable, Optional, Tuple
 
 from PyQt6.QtWidgets import QMessageBox, QDialog, QFileDialog
+
+logger = logging.getLogger(__name__)
 
 
 class LoanActionController:
@@ -163,17 +166,41 @@ class LoanActionController:
         ind_id = self.ui_state.get_selected_id()
         name = self.ui_state.get_selected_name()
         
+        # Deletion cascades since migration 004: the member's ledger, savings,
+        # both funds, enrolments and suspensions go with them. "and all their
+        # records" was accurate and told the user nothing about the scale.
+        counts = self.db.member_record_counts(ind_id)
+        detail = ("\n".join(f"  \u2022 {n} {label}" for label, n in counts.items())
+                  if counts else "  \u2022 no transactions recorded")
+
         confirm = QMessageBox.question(
             self.parent, "Delete Individual",
-            f"Are you sure you want to delete '{name}' and all their records?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            f"Permanently delete '{name}' and everything belonging to them?\n\n"
+            f"{detail}\n\n"
+            f"This cannot be undone. A backup is saved first.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
         )
-        
+
         if confirm == QMessageBox.StandardButton.Yes:
+            try:
+                backup = self.db.snapshot(f"delete-member-{ind_id}")
+            except Exception as e:              # noqa: BLE001 - report, don't crash
+                logger.warning("Could not back up before deleting member %s: %s", ind_id, e)
+                QMessageBox.warning(
+                    self.parent, "Backup Failed",
+                    f"Could not save a backup before deleting '{name}':\n{e}\n\n"
+                    f"Nothing has been deleted. Free some disk space or check "
+                    f"permissions on the 'backups' folder, then try again.")
+                return False
             self.db.delete_individual(ind_id)
             self.ui_state.clear_selection()
             if self.on_refresh:
                 self.on_refresh()
+            if backup:
+                QMessageBox.information(
+                    self.parent, "Deleted",
+                    f"'{name}' has been deleted.\n\nA backup was saved to:\n{backup}")
             return True
         return False
     
