@@ -17,6 +17,7 @@ use crate::Journal;
 use crate::dates;
 use crate::db::loans::OverdueLoan;
 use crate::error::Result;
+use crate::money::{ceil, total};
 
 /// SACCO classification by days in arrears (SASRA): label, first day, last day.
 pub const BANDS: [(&str, i64, Option<i64>); 5] = [
@@ -91,9 +92,9 @@ pub fn build_rows(loans: &[OverdueLoan], as_of: &str) -> Vec<ArrearsRow> {
                 next_due_date: dates::date_part(&loan.next_due_date).to_string(),
                 days,
                 months_missed: missed,
-                installment: loan.installment.ceil(),
-                overdue_amount: overdue.ceil(),
-                balance: loan.balance.ceil(),
+                installment: ceil(loan.installment),
+                overdue_amount: ceil(overdue),
+                balance: ceil(loan.balance),
                 band: classify(days),
                 suspended: loan.is_suspended,
                 suspend_until: loan.suspend_until.clone().unwrap_or_default(),
@@ -125,8 +126,8 @@ pub fn summarize(rows: &[ArrearsRow]) -> Summary {
     Summary {
         loans: rows.len(),
         members: rows.iter().map(|r| r.member_id).collect::<HashSet<_>>().len(),
-        overdue_amount: rows.iter().map(|r| r.overdue_amount).sum(),
-        balance: rows.iter().map(|r| r.balance).sum(),
+        overdue_amount: total(rows.iter().map(|r| r.overdue_amount)),
+        balance: total(rows.iter().map(|r| r.balance)),
         suspended: rows.iter().filter(|r| r.suspended).count(),
         worst_days: rows.iter().map(|r| r.days).max().unwrap_or(0),
     }

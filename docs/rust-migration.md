@@ -35,6 +35,8 @@ The ledger, the loans and the members are then compared column by column.
 | Catch-up of every loan to 2026-10-31 (3,117 ledger rows, 124 loans) | identical |
 | 126 mixed steps: issues, deductions, catch-ups, top-ups, buy-offs | identical figures (notes differ only where the harness passed whole numbers) |
 | 28 Ledger Grid steps: Fill Forward, deleting months (un-run and missed), missed months recorded, `@S`, `@T`, `@B`, corrections, Undo Last Save | identical ledger, loans, members and suspensions |
+| 15 report tables: five quarters of the interest and shares reports, the three fund reports, the members list, arrears | identical, cell by cell |
+| 240 statements: every member, over a financial year and over all time | identical, except the gross figures listed under [Statements](#statements) |
 
 The scenarios stop short of the cases listed below, where 2.0 differs on
 purpose.
@@ -105,3 +107,24 @@ purpose.
   is taken.** In 1.x a later deduction in the same save worked from the balance
   before the correction. This changed the result only when the correction and
   the loan's final month were in the same save.
+
+### Statements
+
+* **The gross figure uses the loan's own rate.** 1.x used the journal's
+  default rate for every loan. On the production journal, a 1,250,000 loan
+  written at 0% showed 187,500 of interest it will never be charged.
+* **The gross figure is kept to the cent.** 1.x added in binary fractions and
+  rounded up, so a loan written at 10% opened one shilling high, and a loan
+  paid off in full could show a gross balance of 1.
+* **Savings balances are summed from the rows.** 1.x printed each row's
+  stored running balance. On the production journal the two agree.
+
+### Reports and documents
+
+* **A quarterly report's period names the quarter's last month.** 1.x printed
+  "Aug 2025 - Nov 2025" for August to October.
+* **PDFs are typeset by the application** (Typst, with Liberation Sans built
+  in), not printed from a web view. A PDF no longer falls back to an HTML file
+  when printing fails.
+* **Money in report PDFs is grouped by thousands** (1,234,567). 1.x printed
+  whole-shilling columns ungrouped.

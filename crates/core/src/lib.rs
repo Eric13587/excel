@@ -13,6 +13,8 @@ pub mod loans;
 pub mod membership;
 pub mod money;
 pub mod policy;
+pub mod reports;
+pub mod statements;
 pub mod undo;
 
 pub use db::{Journal, OpenOptions, OpenReport};

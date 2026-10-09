@@ -33,6 +33,8 @@ pub fn format_money(value: f64, decimals: usize) -> String {
     let value = if value.is_finite() { value } else { 0.0 };
     let text = format!("{value:.decimals$}");
     let (sign, digits) = match text.strip_prefix('-') {
+        // A negative that rounds to zero shows as zero, not "-0".
+        Some(rest) if rest.chars().all(|c| c == '0' || c == '.') => ("", rest),
         Some(rest) => ("-", rest),
         None => ("", text.as_str()),
     };
@@ -51,6 +53,19 @@ pub fn format_money(value: f64, decimals: usize) -> String {
         Some(f) => format!("{sign}{grouped}.{f}"),
         None => format!("{sign}{grouped}"),
     }
+}
+
+/// Rounded up to a whole shilling, as reports and statements show money —
+/// never `-0`: a negative fraction rounds up to plain zero, as Python's
+/// `math.ceil` gives.
+pub fn ceil(value: f64) -> f64 {
+    value.ceil() + 0.0
+}
+
+/// The sum of amounts, starting from `+0` as Python's `sum` does. Rust's own
+/// `f64` sum starts from `-0`, which an empty list would show as "-0".
+pub fn total(values: impl IntoIterator<Item = f64>) -> f64 {
+    values.into_iter().fold(0.0, |sum, v| sum + v)
 }
 
 /// Whole shillings, the way every grid and statement shows them.
@@ -95,5 +110,16 @@ mod tests {
     fn a_figure_reads_back_as_itself() {
         assert_eq!(figure(2000.0), "2,000");
         assert_eq!(figure(1234.5), "1,234.50");
+    }
+
+    #[test]
+    fn zero_never_shows_a_sign() {
+        let empty: [f64; 0] = [];
+        assert_eq!(shillings(empty.iter().sum()), "0"); // Rust's own sum: -0
+        assert_eq!(shillings(total(empty)), "0");
+        assert_eq!(format_money(-0.004, 2), "0.00");
+        assert_eq!(format_money(-0.5, 0), "0"); // half to even
+        assert!(ceil(-0.4).is_sign_positive());
+        assert_eq!(format_money(-1.0, 0), "-1");
     }
 }

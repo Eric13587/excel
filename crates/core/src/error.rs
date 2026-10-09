@@ -47,6 +47,10 @@ pub enum Error {
     /// Input the operation cannot accept, explained.
     #[error("{0}")]
     Invalid(String),
+
+    /// The user stopped a long operation before it finished.
+    #[error("Cancelled")]
+    Cancelled,
 }
 
 fn suspended_message(reference: &str, until: &Option<String>) -> String {
