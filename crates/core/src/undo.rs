@@ -7,19 +7,20 @@
 //! back the top-up and lost the rest.
 
 use crate::Journal;
-use crate::db::ledger::{Snapshot, reinstate_row, snapshot_row};
+use crate::db::ledger::{Snapshot, reinstate_row, snapshot_row, sync_rows, update_row_to};
 use crate::error::Result;
 use crate::loans::edits::delete_entry;
 use crate::loans::projection::project_member;
 use crate::loans::service::recalculate_default_deduction;
 
-/// A loan as it stood: its row and all its entries.
+/// A loan as it stood: its row, all its entries and its suspension spans.
 #[derive(Debug, Clone)]
 pub struct RestorePoint {
     member_id: i64,
     reference: String,
     loan: Option<Snapshot>,
     entries: Vec<Snapshot>,
+    suspensions: Vec<Snapshot>,
 }
 
 impl RestorePoint {
@@ -34,18 +35,60 @@ impl RestorePoint {
                 entries.push(snapshot);
             }
         }
-        Ok(RestorePoint { member_id, reference: reference.to_string(), loan, entries })
+        let mut suspensions = Vec::new();
+        if let Some(loan) = journal.loans().by_ref(member_id, reference)? {
+            for span in journal.loans().suspensions_for_loan(loan.id)? {
+                if let Some(snapshot) = snapshot_row(journal.conn(), "loan_suspensions", span.id)? {
+                    suspensions.push(snapshot);
+                }
+            }
+        }
+        Ok(RestorePoint { member_id, reference: reference.to_string(), loan, entries, suspensions })
     }
 
-    /// Put the loan back exactly as captured.
+    pub fn member_id(&self) -> i64 {
+        self.member_id
+    }
+
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    /// Whether the loan still stands exactly as captured: every entry and
+    /// suspension span, and the loan's row bar its `updated_at` stamp, which
+    /// rewriting unchanged figures moves.
+    pub fn still_current(&self, journal: &Journal) -> Result<bool> {
+        let now = RestorePoint::capture(journal, self.member_id, &self.reference)?;
+        let loan = match (&self.loan, &now.loan) {
+            (Some(was), Some(is)) => was.eq_ignoring(is, &["updated_at"]),
+            (None, None) => true,
+            _ => false,
+        };
+        Ok(loan && self.entries == now.entries && self.suspensions == now.suspensions)
+    }
+
+    /// Put the loan back exactly as captured, touching only what differs, so
+    /// the audit trail records what the undo changed rather than every row
+    /// of the loan being deleted and inserted again.
     pub fn restore(&self, journal: &Journal) -> Result<()> {
         journal.transaction(|| {
-            journal.loans().delete_with_ledger(self.member_id, &self.reference)?;
-            if let Some(loan) = &self.loan {
-                reinstate_row(journal.conn(), "loans", loan)?;
+            let now = RestorePoint::capture(journal, self.member_id, &self.reference)?;
+            let conn = journal.conn();
+            // A loan the change deleted comes back first: its entries refer to it.
+            if let (Some(loan), None) = (&self.loan, &now.loan) {
+                reinstate_row(conn, "loans", loan)?;
             }
-            for entry in &self.entries {
-                reinstate_row(journal.conn(), "ledger", entry)?;
+            sync_rows(conn, "loan_suspensions", &self.suspensions, &now.suspensions)?;
+            sync_rows(conn, "ledger", &self.entries, &now.entries)?;
+            match (&self.loan, &now.loan) {
+                // `updated_at` is stamped by a trigger on any write anyway.
+                (Some(was), Some(is)) => {
+                    update_row_to(conn, "loans", was, is, &["updated_at"])?;
+                }
+                (None, Some(is)) => {
+                    conn.execute("DELETE FROM loans WHERE id=?", [is.id])?;
+                }
+                _ => {}
             }
             project_member(journal, self.member_id)?;
             recalculate_default_deduction(journal, self.member_id)

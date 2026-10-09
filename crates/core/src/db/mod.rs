@@ -19,6 +19,7 @@
 //! over the connection. They never commit: the caller owns the transaction,
 //! through [`Journal::transaction`] and [`Journal::savepoint`].
 
+pub mod backups;
 pub mod funds;
 pub mod history;
 pub mod ledger;

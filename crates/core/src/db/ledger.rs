@@ -73,6 +73,14 @@ impl Snapshot {
             })
             .unwrap_or_default()
     }
+
+    /// Equal in every column but those named.
+    pub fn eq_ignoring(&self, other: &Snapshot, ignored: &[&str]) -> bool {
+        let kept = |s: &Snapshot| -> Vec<(String, rusqlite::types::Value)> {
+            s.columns.iter().filter(|(c, _)| !ignored.contains(&c.as_str())).cloned().collect()
+        };
+        self.id == other.id && kept(self) == kept(other)
+    }
 }
 
 /// Read every column of one row of `table`.
@@ -88,6 +96,44 @@ pub(crate) fn snapshot_row(conn: &Connection, table: &str, id: i64) -> Result<Op
             Ok(Snapshot { id, columns })
         })
         .optional()?)
+}
+
+/// Write back the columns where `current` differs from `target`, bar those
+/// in `skip`. Only differing columns are named, so an audit trigger watching
+/// a column fires only when its value actually changes. Returns whether
+/// anything was written.
+pub(crate) fn update_row_to(conn: &Connection, table: &str, target: &Snapshot, current: &Snapshot, skip: &[&str]) -> Result<bool> {
+    let changed: Vec<&(String, rusqlite::types::Value)> = target
+        .columns
+        .iter()
+        .filter(|(c, v)| c != "id" && !skip.contains(&c.as_str()) && current.columns.iter().find(|(k, _)| k == c).is_none_or(|(_, now)| now != v))
+        .collect();
+    if changed.is_empty() {
+        return Ok(false);
+    }
+    let set = changed.iter().map(|(c, _)| format!("{c}=?")).collect::<Vec<_>>().join(", ");
+    let id = rusqlite::types::Value::Integer(target.id);
+    let values = changed.iter().map(|(_, v)| v).chain(std::iter::once(&id));
+    conn.execute(&format!("UPDATE {table} SET {set} WHERE id=?"), params_from_iter(values))?;
+    Ok(true)
+}
+
+/// Make `table`'s rows among `current` match `target`: rows only in
+/// `current` are deleted, rows only in `target` reinstated, and rows in both
+/// corrected column by column. Rows already equal are not touched.
+pub(crate) fn sync_rows(conn: &Connection, table: &str, target: &[Snapshot], current: &[Snapshot]) -> Result<()> {
+    for row in current.iter().filter(|r| !target.iter().any(|t| t.id == r.id)) {
+        conn.execute(&format!("DELETE FROM {table} WHERE id=?"), [row.id])?;
+    }
+    for row in target {
+        match current.iter().find(|c| c.id == row.id) {
+            Some(now) => {
+                update_row_to(conn, table, row, now, &[])?;
+            }
+            None => reinstate_row(conn, table, row)?,
+        }
+    }
+    Ok(())
 }
 
 /// Insert a [`Snapshot`] back into `table`, original id included.
