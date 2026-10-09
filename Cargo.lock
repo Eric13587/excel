@@ -2841,7 +2841,9 @@ dependencies = [
  "log",
  "open",
  "rfd",
+ "rust_xlsxwriter",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

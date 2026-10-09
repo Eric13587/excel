@@ -128,6 +128,12 @@ impl Dashboard {
                         if widgets::solid(ui, "+ New Member", p.accent).clicked() {
                             actions.push(Action::dialog(MemberForm::add()));
                         }
+                        let import = egui::Button::new(RichText::new("Import Data ⏷").strong().color(egui::Color32::WHITE))
+                            .fill(egui::Color32::from_white_alpha(24))
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(6)
+                            .min_size(egui::vec2(0.0, 28.0));
+                        egui::containers::menu::MenuButton::from_button(import).ui(ui, |ui| crate::dialogs::imports::menu(ui, actions));
                     });
                 });
             });

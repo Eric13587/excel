@@ -12,6 +12,7 @@ pub mod columns;
 pub mod confirm;
 pub mod files;
 pub mod fund;
+pub mod imports;
 pub mod loan;
 pub mod member;
 pub mod reports;
@@ -56,6 +57,9 @@ dialogs! {
     Settings(settings::SettingsForm),
     Activity(activity::ActivityLog),
     Restore(restore::Restore),
+    JournalImport(imports::JournalImport),
+    ExcelImport(imports::ExcelImport),
+    ImportHistory(imports::ImportHistory),
 }
 
 impl Dialog {
@@ -84,13 +88,17 @@ impl Dialog {
             Dialog::Settings(d) => d.show(ctx, actions),
             Dialog::Activity(d) => d.show(ctx, journal, actions),
             Dialog::Restore(d) => d.show(ctx, journal, actions),
+            Dialog::JournalImport(d) => d.show(ctx, journal, actions),
+            Dialog::ExcelImport(d) => d.show(ctx, journal, actions),
+            Dialog::ImportHistory(d) => d.show(ctx, journal, actions),
         }
     }
 }
 
-/// The row of buttons along a dialog's foot, right-aligned.
+/// The row of buttons along a dialog's foot, right-aligned. One row high:
+/// a layout given the rest of the window would centre the buttons in it.
 pub fn footer<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.add_space(8.0);
     ui.separator();
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add).inner
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 0.0), egui::Layout::right_to_left(egui::Align::Center), add).inner
 }

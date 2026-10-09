@@ -505,3 +505,94 @@ fn clicking_a_members_row_selects_them() {
     let peter = member_id(&harness, "PETER MWANGI");
     assert_eq!(harness.state().workspace.as_ref().unwrap().dashboard.selected, Some(peter));
 }
+
+// ---------------------------------------------------------------- imports
+
+fn member_count(harness: &Harness<'_, LoanMasterApp>) -> usize {
+    harness.state().workspace.as_ref().unwrap().journal.members().all().unwrap().len()
+}
+
+#[test]
+fn members_come_in_from_another_journal_and_the_import_can_be_undone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("branch.db");
+    {
+        let branch = Journal::open(&path, loanmaster_core::OpenOptions::default()).unwrap();
+        for name in ["ANN WANJIRU", "Mary Njeri", "ZAWADI ACHIENG"] {
+            let id = membership::add(&branch, &MemberDetails { name: name.into(), ..Default::default() }).unwrap();
+            funds::post(&branch, Posting::new(Fund::Savings, id, "2026-02-05", "Deposit", 1000.0, "")).unwrap();
+        }
+        branch.close();
+    }
+    let mut harness = harness(sample());
+    menu(&mut harness, "File", "Import From Another Journal (.db)…");
+    crate::dialogs::files::ask::answer(&path);
+    harness.get_by_label("Select Database File…").click();
+    harness.run();
+    harness.get_by_label("Savings history").click();
+    harness.run();
+    harness.get_by_label("Choose Members ›").click();
+    harness.run();
+    harness.get_by_label("3 selected");
+    harness.get_by_label("Preview ›").click();
+    harness.run();
+    // Ann's name matches exactly and merges; Mary's differs in case, so the
+    // user is asked; Zawadi is new.
+    harness.get_by_label_contains("1 member(s) resemble someone already on record");
+    shot(&mut harness, "import_preview");
+    harness.get_by_label("Start Import").click();
+    harness.run();
+    harness.get_by_label("Import Complete");
+    assert_eq!(member_count(&harness), 11, "Zawadi is new; Ann and Mary merged");
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 23_500.0);
+
+    harness.get_by_label("OK").click();
+    harness.run();
+    menu(&mut harness, "File", "Import History…");
+    harness.get_by_label("Ind: 1 | Sav: 3").click();
+    harness.run();
+    shot(&mut harness, "import_history");
+    harness.get_by_label("Undo Selected Import").click();
+    harness.run();
+    // The question's heading, then its button.
+    harness.get_all_by_label("Undo Import").last().unwrap().click();
+    harness.run();
+    harness.get_by_label("Import Undone");
+    assert_eq!(member_count(&harness), 10);
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 22_500.0, "the deposit added to Ann went with the import");
+}
+
+#[test]
+fn a_roster_spreadsheet_updates_and_adds_members() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("roster.xlsx");
+    let mut book = rust_xlsxwriter::Workbook::new();
+    let sheet = book.add_worksheet();
+    for (row, cells) in [["Name", "PF No", "Phone"], ["Ann Wanjiru", "PF1001", "0711 000 001"], ["Zuberi Hamisi", "PF2001", "0711 000 002"]].iter().enumerate() {
+        for (col, text) in cells.iter().enumerate() {
+            sheet.write_string(row as u32, col as u16, *text).unwrap();
+        }
+    }
+    book.save(&path).unwrap();
+
+    let mut harness = harness(sample());
+    menu(&mut harness, "File", "Import From Excel (.xlsx)…");
+    crate::dialogs::files::ask::answer(&path);
+    harness.get_by_label("Select Excel File…").click();
+    harness.run();
+    harness.get_by_label_contains("A roster sheet, 2 row(s)");
+    harness.get_by_label("Preview").click();
+    harness.run();
+    harness.get_by_label_contains("2 row(s) — 1 update, 1 new");
+    shot(&mut harness, "excel_import");
+    harness.get_by_label("Import").click();
+    harness.run();
+    harness.get_by_label("Confirm Import");
+    harness.get_all_by_label("Import").last().unwrap().click();
+    harness.run();
+    harness.get_by_label("Import Complete");
+    assert_eq!(member_count(&harness), 11);
+    let ann = member_id(&harness, "ANN WANJIRU");
+    let journal = &harness.state().workspace.as_ref().unwrap().journal;
+    assert_eq!(journal.members().get(ann).unwrap().unwrap().phone, "0711000001");
+}

@@ -178,6 +178,8 @@ impl LoanMasterApp {
         let Some(ws) = &self.workspace else { return };
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                crate::dialogs::imports::menu(ui, actions);
+                ui.separator();
                 if ui.button("Close Journal").clicked() {
                     actions.push(Action::CloseJournal);
                 }
