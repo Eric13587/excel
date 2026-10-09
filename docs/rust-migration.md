@@ -37,6 +37,7 @@ The ledger, the loans and the members are then compared column by column.
 | 28 Ledger Grid steps: Fill Forward, deleting months (un-run and missed), missed months recorded, `@S`, `@T`, `@B`, corrections, Undo Last Save | identical ledger, loans, members and suspensions |
 | 15 report tables: five quarters of the interest and shares reports, the three fund reports, the members list, arrears | identical, cell by cell |
 | 240 statements: every member, over a financial year and over all time | identical, except the gross figures listed under [Statements](#statements) |
+| The whole production journal imported into an empty one | all 120 members, 124 loans and 3,116 ledger entries; every loan balance, due date and fund balance identical |
 
 The scenarios stop short of the cases listed below, where 2.0 differs on
 purpose.
@@ -118,6 +119,47 @@ purpose.
   paid off in full could show a gross balance of 1.
 * **Savings balances are summed from the rows.** 1.x printed each row's
   stored running balance. On the production journal the two agree.
+
+### Importing from another journal
+
+* **An import is one transaction.** It lands completely or not at all. 1.x
+  could stop part-way and report a "partial" import that had to be undone by
+  hand.
+* **A loan reference changes only when the receiving member already holds
+  it**, and then becomes their next free `L-NNN`. 1.x checked references
+  against every member in the journal, so nearly every imported loan was
+  renamed (`L-001-Import`, `L-001-Import-1`, …). It also looked renames up by
+  reference alone, so when two incoming members both had an `L-001`, one
+  member's ledger rows could be filed under the other's renamed loan.
+* **Christmas, benevolent and suspension rows are checked** like every other
+  row. 1.x copied them unchecked. A ledger row whose loan was not imported is
+  left out and counted, not left pointing at nothing.
+* **A loan keeps its rate, term and suspension.** 1.x dropped
+  `interest_rate`, `duration_months`, `is_suspended` and `suspend_until`.
+* **The date filter applies to every kind of transaction.** 1.x applied it
+  to the ledger and savings only.
+* **Undo also removes what was added to merged members**: their Christmas and
+  benevolent rows, suspensions and new benevolent enrolment. The schema has no
+  `import_id` on those tables, so 2.0 lists them in the run's details. A
+  merged member's existing benevolent enrolment is kept, not replaced.
+* **Conflicts compare names and emails exactly, ignoring case.** 1.x used
+  `LIKE`, so `%` and `_` in a name acted as wildcards.
+* **A member who has left with no leaving date is recorded as leaving on the
+  import date**, so their status, retirement flag and date agree. 1.x dropped
+  the flag but kept the status, which made any later status edit fail.
+
+### Importing from a spreadsheet
+
+* **The safety copy is taken with SQLite's backup API, and the import is one
+  transaction.** 1.x copied the database file, which can miss changes still in
+  the write-ahead log, and wrote row by row.
+* **A PF or ID number another member holds is skipped, never cleared.** 1.x
+  wrote the member's own number as blank when the sheet's number clashed.
+* **An employment status is read onto the vocabulary** ("employed" is
+  Active). In 1.x an unrecognised one stopped the import part-way.
+* **A benevolent sheet moves the member's schedule past what it recorded**,
+  as the Ledger Grid does, so the next catch-up does not post those months
+  again.
 
 ### Reports and documents
 

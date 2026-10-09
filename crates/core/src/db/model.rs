@@ -201,7 +201,7 @@ impl FromRow for LedgerRow {
 }
 
 /// The three member funds share one shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Fund {
     Savings,
     Christmas,
