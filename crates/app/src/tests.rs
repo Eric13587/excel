@@ -346,3 +346,82 @@ fn f1_opens_the_help_for_the_tab_shown() {
     harness.get_by_label_contains("Ledger Grid Help — Savings / Shares");
     shot(&mut harness, "grid_help");
 }
+
+// ---------------------------------------------------------------- reports
+
+/// Pick a menu entry the way a person would.
+fn menu(harness: &mut Harness<'_, LoanMasterApp>, menu: &str, item: &str) {
+    harness.get_by_label(menu).click();
+    harness.run();
+    harness.get_by_label(item).click();
+    harness.run();
+}
+
+/// Let the task under way end, drawing frames as the window would. While
+/// one runs, its progress keeps asking for frames, so `run` would not settle.
+fn finish_task(harness: &mut Harness<'_, LoanMasterApp>) {
+    let running = |harness: &Harness<'_, LoanMasterApp>| harness.state().workspace.as_ref().unwrap().task.is_some();
+    for _ in 0..3000 {
+        if !running(harness) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        harness.step();
+    }
+    assert!(!running(harness), "the task ended");
+    harness.run();
+}
+
+#[test]
+fn the_members_list_is_saved_where_asked() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Reports", "Members List (Excel / PDF)…");
+    shot(&mut harness, "members_list");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("members.csv");
+    crate::dialogs::files::ask::answer(&path);
+    harness.get_by_label("Export…").click();
+    harness.step();
+    finish_task(&mut harness);
+    let csv = std::fs::read_to_string(&path).unwrap();
+    assert!(csv.contains("Name,PF No,ID No,Phone,Employment Status"), "{csv}");
+    assert!(csv.contains("ANN WANJIRU,PF1001"), "{csv}");
+}
+
+#[test]
+fn a_savings_quarter_report_is_written() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Reports", "Savings / Shares Report…");
+    shot(&mut harness, "savings_report");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("savings.csv");
+    crate::dialogs::files::ask::answer(&path);
+    harness.get_by_label("Save Report…").click();
+    harness.step();
+    finish_task(&mut harness);
+    let csv = std::fs::read_to_string(&path).unwrap();
+    assert!(csv.contains("Grand Total"), "{csv}");
+    assert!(csv.contains("ANN WANJIRU"), "{csv}");
+}
+
+#[test]
+fn statements_are_written_one_file_per_member() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Reports", "Statements…");
+    harness.get_by_label("ANN WANJIRU | 0722 111 201").click();
+    harness.run();
+    harness.get_by_label("GRACE ACHIENG | 0722 111 203").click();
+    harness.run();
+    harness.get_by_label("2 selected");
+    shot(&mut harness, "statements");
+    let dir = tempfile::tempdir().unwrap();
+    crate::dialogs::files::ask::answer(dir.path());
+    harness.get_by_label("Generate…").click();
+    harness.step();
+    finish_task(&mut harness);
+    harness.get_by_label("Batch complete");
+    let mut written: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    written.sort();
+    assert_eq!(written.len(), 2, "{written:?}");
+    assert!(written[0].starts_with("ANN WANJIRU_statement_") && written[0].ends_with(".pdf"), "{written:?}");
+}

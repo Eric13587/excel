@@ -7,11 +7,14 @@ use loanmaster_core::Journal;
 use crate::app::Action;
 
 pub mod arrears;
+pub mod columns;
 pub mod confirm;
 pub mod files;
 pub mod fund;
 pub mod loan;
 pub mod member;
+pub mod reports;
+pub mod statements;
 
 macro_rules! dialogs {
     ($($variant:ident($ty:ty)),* $(,)?) => {
@@ -43,6 +46,10 @@ dialogs! {
     Movement(fund::Movement),
     EditRow(fund::EditRow),
     Enrol(fund::Enrol),
+    FundReport(reports::FundReport),
+    LoanReport(reports::LoanReport),
+    MembersList(reports::MembersList),
+    Statements(statements::Statements),
 }
 
 impl Dialog {
@@ -64,6 +71,10 @@ impl Dialog {
             Dialog::Movement(d) => d.show(ctx, actions),
             Dialog::EditRow(d) => d.show(ctx, actions),
             Dialog::Enrol(d) => d.show(ctx, actions),
+            Dialog::FundReport(d) => d.show(ctx, journal, actions),
+            Dialog::LoanReport(d) => d.show(ctx, journal, actions),
+            Dialog::MembersList(d) => d.show(ctx, journal, actions),
+            Dialog::Statements(d) => d.show(ctx, journal, actions),
         }
     }
 }

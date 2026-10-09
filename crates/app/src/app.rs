@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use loanmaster_core::Error;
+use loanmaster_core::db::model::Fund;
 
 use crate::dialogs::Dialog;
+use crate::dialogs::arrears::Arrears;
+use crate::dialogs::reports::{FundReport, LoanReport, MembersList};
+use crate::dialogs::statements::Statements;
 use crate::screens::{self, startup};
+use crate::task::Task;
 use crate::theme;
 use crate::workspace::{Screen, Workspace};
 
@@ -100,6 +105,8 @@ pub enum Action {
     /// The journal changed: every screen re-reads it.
     Changed,
     Run(Job),
+    /// Long work to watch: shown with its progress until it ends.
+    Task(Box<Task>),
     Undo,
     Redo,
     Quit,
@@ -183,6 +190,27 @@ impl LoanMasterApp {
                 let redo = ws.undo.redo_description().map(|d| format!("Redo {d}")).unwrap_or_else(|| "Redo".into());
                 if ui.add_enabled(ws.undo.can_redo(), egui::Button::new(redo).shortcut_text("Ctrl+Alt+Y")).clicked() {
                     actions.push(Action::Redo);
+                }
+            });
+            ui.menu_button("Reports", |ui| {
+                let journal = &ws.journal;
+                if ui.button("Loan (Quarterly) Report…").clicked() {
+                    actions.push(Action::dialog(LoanReport::new(journal)));
+                }
+                for fund in Fund::ALL {
+                    if ui.button(format!("{} Report…", fund.label())).clicked() {
+                        actions.push(Action::dialog(FundReport::new(journal, fund)));
+                    }
+                }
+                ui.separator();
+                if ui.button("Loans in Arrears…").on_hover_text("Who is behind on a loan, and by how much — with a printable list").clicked() {
+                    actions.push(Action::dialog(Arrears::default()));
+                }
+                if ui.button("Members List (Excel / PDF)…").clicked() {
+                    actions.push(Action::dialog(MembersList::default()));
+                }
+                if ui.button("Statements…").on_hover_text("Generate member statements as PDF or Excel").clicked() {
+                    actions.push(Action::dialog(Statements::new(journal)));
                 }
             });
             ui.menu_button("Operations", |ui| {
@@ -342,6 +370,11 @@ impl LoanMasterApp {
                     Action::Status(text) => ws.status = Some(text),
                     Action::Changed => ws.changed(),
                     Action::Run(job) => job(ws, &mut follow),
+                    Action::Task(task) if ws.task.is_some() => {
+                        drop(task);
+                        follow.push(Action::Status("Another task is still running; try again when it ends.".into()));
+                    }
+                    Action::Task(task) => ws.task = Some(*task),
                     Action::Undo => ws.undo(&mut follow),
                     Action::Redo => ws.redo(&mut follow),
                     _ => {}

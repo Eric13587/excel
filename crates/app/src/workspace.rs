@@ -11,6 +11,7 @@ use crate::dialogs::Dialog;
 use crate::screens::dashboard::Dashboard;
 use crate::screens::grid::GridScreen;
 use crate::screens::member::MemberScreen;
+use crate::task::Task;
 
 pub enum Screen {
     Dashboard,
@@ -33,6 +34,8 @@ pub struct Workspace {
     pub dark: bool,
     /// The date last used in a dialog, offered again in the next one.
     pub last_date: chrono::NaiveDate,
+    /// Long work under way, shown with its progress.
+    pub task: Option<Task>,
 }
 
 impl Workspace {
@@ -51,6 +54,7 @@ impl Workspace {
             org_name,
             dark,
             last_date: chrono::Local::now().date_naive(),
+            task: None,
         }
     }
 
@@ -64,7 +68,7 @@ impl Workspace {
             notices.push(Notice::warning(
                 "This journal file is damaged",
                 "SQLite's check of this journal reported damage. The journal was opened so you can export your \
-                 data, but restore a recent backup (Tools → Restore From Backup) as soon as possible.",
+                 data, but restore a recent backup (Tools › Restore From Backup) as soon as possible.",
             ));
         }
         log::info!(
@@ -143,7 +147,8 @@ impl Workspace {
         }
     }
 
-    /// Draw the open dialogs, newest on top, dropping the ones that closed.
+    /// Draw the open dialogs, newest on top, dropping the ones that closed —
+    /// then the task under way, above them all.
     pub fn show_dialogs(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let Workspace { dialogs, journal, .. } = self;
         let mut index = 0;
@@ -153,6 +158,12 @@ impl Workspace {
             } else {
                 dialogs.remove(index);
             }
+        }
+        if let Some(task) = &mut self.task
+            && let Some(done) = task.show(ctx)
+        {
+            self.task = None;
+            done(actions);
         }
     }
 }

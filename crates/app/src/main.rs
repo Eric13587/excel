@@ -17,6 +17,7 @@ mod app;
 mod dialogs;
 mod logging;
 mod screens;
+mod task;
 mod theme;
 mod widgets;
 mod workspace;

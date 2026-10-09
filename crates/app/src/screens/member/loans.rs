@@ -383,7 +383,7 @@ pub fn delete_entry(member: i64, reference: &str, row: &LedgerRow, last: bool) -
     Confirm::new(
         "Delete Entry",
         format!(
-            "Delete {what} on {reference}?\n\n{}  ·  {}  ·  {}\n\n{effect}\n\nEdit → Undo (Ctrl+Alt+Z) puts it back.",
+            "Delete {what} on {reference}?\n\n{}  ·  {}  ·  {}\n\n{effect}\n\nEdit › Undo (Ctrl+Alt+Z) puts it back.",
             row.event_type,
             dates::date_part(&row.date),
             shillings(amount)
