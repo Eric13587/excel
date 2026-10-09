@@ -121,13 +121,16 @@ pub struct LoanMasterApp {
     pub notices: Vec<Notice>,
     actions: Vec<Action>,
     shown_dark: Option<bool>,
+    /// Closing the journal or the window, held while the user decides about
+    /// the Ledger Grid's unsaved changes.
+    leaving: Option<Action>,
 }
 
 impl LoanMasterApp {
     pub fn new(cc: &eframe::CreationContext<'_>, journal: Option<PathBuf>) -> LoanMasterApp {
         let remembered: Remembered = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let mut app = LoanMasterApp { remembered, workspace: None, notices: Vec::new(), actions: Vec::new(), shown_dark: None };
+        let mut app = LoanMasterApp { remembered, workspace: None, notices: Vec::new(), actions: Vec::new(), shown_dark: None, leaving: None };
         if let Some(path) = journal {
             app.actions.push(Action::OpenJournal(path));
         }
@@ -137,7 +140,7 @@ impl LoanMasterApp {
     /// For tests: the app with a journal already open.
     #[cfg(test)]
     pub fn with_workspace(workspace: Workspace) -> LoanMasterApp {
-        LoanMasterApp { remembered: Remembered::default(), workspace: Some(workspace), notices: Vec::new(), actions: Vec::new(), shown_dark: None }
+        LoanMasterApp { remembered: Remembered::default(), workspace: Some(workspace), notices: Vec::new(), actions: Vec::new(), shown_dark: None, leaving: None }
     }
 
     fn dark(&self) -> bool {
@@ -253,6 +256,39 @@ impl LoanMasterApp {
         }
     }
 
+    /// Ask before closing over the Ledger Grid's unsaved changes.
+    fn confirm_leaving(&mut self, ctx: &egui::Context) {
+        let Some(action) = &self.leaving else { return };
+        let what = if matches!(action, Action::CloseJournal) { "close the journal" } else { "quit" };
+        let detail = self.workspace.as_ref().and_then(|ws| ws.unsaved()).unwrap_or_default();
+        let p = theme::palette(ctx);
+        let (mut discard, mut cancel) = (false, false);
+        let response = egui::Modal::new(egui::Id::new("app_leaving")).show(ctx, |ui| {
+            ui.set_max_width(480.0);
+            ui.heading("Unsaved Changes");
+            ui.add_space(4.0);
+            ui.label(format!("The Ledger Grid has unsaved changes ({detail}).\n\nDiscard them and {what}?"));
+            crate::dialogs::footer(ui, |ui| {
+                if crate::widgets::solid(ui, "Discard", p.danger).clicked() {
+                    discard = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if discard {
+            if let Some(ws) = &mut self.workspace {
+                ws.discard_unsaved();
+            }
+            if let Some(action) = self.leaving.take() {
+                self.actions.push(action);
+            }
+        } else if cancel || response.should_close() {
+            self.leaving = None;
+        }
+    }
+
     fn open_journal(&mut self, ctx: &egui::Context, path: PathBuf) {
         match Workspace::open(&path) {
             Ok((workspace, warnings)) => {
@@ -286,6 +322,7 @@ impl LoanMasterApp {
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::OpenJournal(path) => self.open_journal(ctx, path),
+            Action::CloseJournal if self.workspace.as_ref().is_some_and(|ws| ws.unsaved().is_some()) => self.leaving = Some(Action::CloseJournal),
             Action::CloseJournal => {
                 if let Some(ws) = self.workspace.take() {
                     ws.journal.close();
@@ -333,6 +370,11 @@ impl eframe::App for LoanMasterApp {
         if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::CTRL, Key::Q))) {
             self.actions.push(Action::Quit);
         }
+        // The window's own close button, Alt+F4 and Quit all arrive here.
+        if ctx.input(|i| i.viewport().close_requested()) && self.workspace.as_ref().is_some_and(|ws| ws.unsaved().is_some()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.leaving = Some(Action::Quit);
+        }
 
         if self.workspace.is_none() {
             egui::CentralPanel::default().show(ui, |ui| startup::show(ui, &self.remembered, &mut self.actions));
@@ -344,6 +386,7 @@ impl eframe::App for LoanMasterApp {
                 ws.show_dialogs(&ctx, &mut self.actions);
             }
         }
+        self.confirm_leaving(&ctx);
         self.show_notice(&ctx);
         self.process(&ctx);
     }

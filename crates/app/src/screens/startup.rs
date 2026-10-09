@@ -46,6 +46,7 @@ pub fn show(ui: &mut egui::Ui, remembered: &Remembered, actions: &mut Vec<Action
                     let wide = egui::vec2(300.0, 40.0);
                     let open = egui::Button::new(RichText::new("Open Existing Journal").strong().color(egui::Color32::WHITE))
                         .fill(p.accent)
+                        .stroke(egui::Stroke::NONE)
                         .min_size(wide);
                     if ui.add(open).clicked()
                         && let Some(path) = pick_journal()

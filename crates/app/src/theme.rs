@@ -112,6 +112,9 @@ fn visuals(p: &Palette, dark: bool) -> Visuals {
         state.weak_bg_fill = fill;
         state.corner_radius = CornerRadius::same(6);
     }
+    // Controls carry an outline, so a checkbox or a plain button still reads
+    // as one on the grey panel background, not only on a white card.
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, if dark { hex(0x4B5563) } else { hex(0xCBD5E1) });
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, p.text);

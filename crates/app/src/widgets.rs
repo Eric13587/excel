@@ -10,6 +10,7 @@ pub fn solid(ui: &mut Ui, text: &str, fill: Color32) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(theme::text_on(fill)).strong())
             .fill(fill)
+            .stroke(Stroke::NONE)
             .corner_radius(CornerRadius::same(6))
             .min_size(egui::vec2(0.0, 28.0)),
     )
@@ -21,6 +22,7 @@ pub fn solid_enabled(ui: &mut Ui, enabled: bool, text: &str, fill: Color32, why_
     let fill = if enabled { fill } else { fill.gamma_multiply(0.45) };
     let button = egui::Button::new(RichText::new(text).color(theme::text_on(fill)).strong())
         .fill(fill)
+        .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(6))
         .min_size(egui::vec2(0.0, 28.0));
     let response = ui.add_enabled(enabled, button);

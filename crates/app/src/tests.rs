@@ -59,11 +59,20 @@ fn harness(journal: Journal) -> Harness<'static, LoanMasterApp> {
         LoanMasterApp::with_workspace(Workspace::in_memory(journal))
     });
     harness.run();
+    // A blinking cursor repaints on a timer, which a slow render can catch
+    // in the middle of a run.
+    harness.ctx.all_styles_mut(|style| style.visuals.text_cursor.blink = false);
+    harness.run();
     harness
 }
 
+/// The software renderer the screenshots use crashes when several tests
+/// render at once, so they take turns.
+static RENDERING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn shot(harness: &mut Harness<'_, LoanMasterApp>, name: &str) {
     if let Some(dir) = std::env::var_os("LOANMASTER_SHOTS") {
+        let _turn = RENDERING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let image = harness.render().expect("the window renders");
         image.save(Path::new(&dir).join(format!("{name}.png"))).unwrap();
     }
@@ -177,3 +186,163 @@ fn the_savings_tab_lists_every_deposit() {
     shot(&mut harness, "member_savings");
 }
 
+
+// ------------------------------------------------------------ Ledger Grid
+
+fn open_grid(harness: &mut Harness<'_, LoanMasterApp>) {
+    let ws = harness.state_mut().workspace.as_mut().unwrap();
+    ws.open_grid();
+    if let crate::workspace::Screen::Grid(grid) = &mut ws.screen {
+        // Narrow enough that October is on screen: the harness clicks where
+        // a cell is drawn.
+        let month = |m: u32| chrono::NaiveDate::from_ymd_opt(2026, m, 1).unwrap();
+        grid.set_range(month(4), month(10));
+    }
+    harness.run();
+}
+
+fn savings(harness: &Harness<'_, LoanMasterApp>, name: &str) -> f64 {
+    let id = member_id(harness, name);
+    harness.state().workspace.as_ref().unwrap().journal.funds().balance(Fund::Savings, id).unwrap()
+}
+
+fn on_grid(harness: &Harness<'_, LoanMasterApp>) -> bool {
+    matches!(harness.state().workspace.as_ref().unwrap().screen, crate::workspace::Screen::Grid(_))
+}
+
+/// Select a cell and type into it, as a person would.
+fn type_into(harness: &mut Harness<'_, LoanMasterApp>, cell: &str, text: &str) {
+    harness.get_by_label(cell).click();
+    harness.run();
+    harness.event(egui::Event::Text(text.into()));
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+}
+
+#[test]
+fn the_grid_shows_each_savers_months() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("Ledger Grid");
+    harness.get_by_label("ANN WANJIRU, Sep 2026");
+    harness.get_by_label("TOTAL");
+    // Retired Samuel is a past member: hidden until asked for.
+    assert!(harness.query_by_label("SAMUEL KARIUKI, Sep 2026").is_none());
+    shot(&mut harness, "grid_savings");
+}
+
+#[test]
+fn a_typed_figure_is_staged_until_saved_and_the_save_can_be_undone() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    type_into(&mut harness, "ANN WANJIRU, Oct 2026", "3000");
+    harness.get_by_label_contains("1 unsaved change(s).");
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 22_500.0, "nothing is written before Save");
+    shot(&mut harness, "grid_staged");
+
+    harness.get_by_label("Save Changes").click();
+    harness.run();
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 25_500.0);
+    harness.get_by_label_contains("Saved —");
+
+    harness.get_by_label("Undo Last Save").click();
+    harness.run();
+    harness.get_by_label("Undo Save").click();
+    harness.run();
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 22_500.0);
+}
+
+#[test]
+fn a_figure_the_cell_cannot_take_is_refused_with_the_reason() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    type_into(&mut harness, "ANN WANJIRU, Oct 2026", "lots");
+    harness.get_by_label_contains("ANN WANJIRU, Oct 2026:");
+    assert!(harness.query_by_label_contains("unsaved change").is_none());
+}
+
+#[test]
+fn fill_forward_proposes_the_missing_month_for_review() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("Fill Forward…").click();
+    harness.run();
+    // Nine active savers lack October; Samuel retired and is not shown.
+    harness.get_by_label_contains("Propose 9 entries across 9 member(s)");
+    shot(&mut harness, "grid_fill_forward");
+    harness.get_by_label("Stage Them").click();
+    harness.run();
+    harness.get_by_label_contains("9 entries staged");
+    assert_eq!(savings(&harness, "PETER MWANGI"), 22_500.0);
+    harness.get_by_label("Save Changes").click();
+    harness.run();
+    assert_eq!(savings(&harness, "PETER MWANGI"), 25_000.0);
+}
+
+#[test]
+fn a_whole_month_is_deleted_after_a_preview() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("Sep 2026").click();
+    harness.run();
+    harness.key_press(egui::Key::Delete);
+    harness.run();
+    harness.get_by_label("Delete Months");
+    shot(&mut harness, "grid_delete_preview");
+    harness.get_by_label("Stage Deletions").click();
+    harness.run();
+    harness.get_by_label_contains("deletion(s) staged in Sep 2026");
+    harness.get_by_label("Save Changes").click();
+    harness.run();
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 20_000.0);
+}
+
+#[test]
+fn leaving_the_grid_asks_before_dropping_unsaved_work() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    type_into(&mut harness, "ANN WANJIRU, Oct 2026", "3000");
+    harness.get_by_label("⬅ Dashboard").click();
+    harness.run();
+    harness.get_by_label("Unsaved Changes");
+    harness.get_by_label("Cancel").click();
+    harness.run();
+    assert!(on_grid(&harness), "Cancel stays");
+    harness.get_by_label_contains("1 unsaved change(s).");
+
+    harness.get_by_label("⬅ Dashboard").click();
+    harness.run();
+    harness.get_by_label("Discard").click();
+    harness.run();
+    assert!(!on_grid(&harness));
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 22_500.0);
+}
+
+#[test]
+fn the_loans_tab_lists_each_loan_and_its_missed_months() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("Loans").click();
+    harness.run();
+    harness.get_by_label("GRACE ACHIENG · L-001, Jul 2026");
+    shot(&mut harness, "grid_loans");
+    // Grace is due for July: the month takes her deduction.
+    type_into(&mut harness, "GRACE ACHIENG · L-001, Jul 2026", "5750");
+    harness.get_by_label_contains("1 unsaved change(s).");
+    harness.get_by_label("Save Changes").click();
+    harness.run();
+    let grace = member_id(&harness, "GRACE ACHIENG");
+    let loan = harness.state().workspace.as_ref().unwrap().journal.loans().by_ref(grace, "L-001").unwrap().unwrap();
+    assert_eq!(loan.next_due_date.as_deref(), Some("2026-08-01"));
+}
+
+#[test]
+fn f1_opens_the_help_for_the_tab_shown() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.key_press(egui::Key::F1);
+    harness.run();
+    harness.get_by_label_contains("Ledger Grid Help — Savings / Shares");
+    shot(&mut harness, "grid_help");
+}

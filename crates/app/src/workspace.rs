@@ -99,8 +99,26 @@ impl Workspace {
         self.screen = Screen::Member(Box::new(MemberScreen::new(id)));
     }
 
+    /// Show the Ledger Grid — the one already showing, staged work and all,
+    /// if it is.
     pub fn open_grid(&mut self) {
-        self.screen = Screen::Grid(Box::new(GridScreen::new()));
+        if !matches!(self.screen, Screen::Grid(_)) {
+            self.screen = Screen::Grid(Box::default());
+        }
+    }
+
+    /// The Ledger Grid's staged changes, described, if there are any.
+    pub fn unsaved(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Grid(grid) => grid.unsaved(),
+            _ => None,
+        }
+    }
+
+    pub fn discard_unsaved(&mut self) {
+        if let Screen::Grid(grid) = &mut self.screen {
+            grid.discard();
+        }
     }
 
     pub fn undo(&mut self, actions: &mut Vec<Action>) {
