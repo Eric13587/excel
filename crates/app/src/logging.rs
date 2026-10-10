@@ -123,6 +123,11 @@ pub fn install_panic_hook() {
         log::error!("Unexpected error: {info}\n{backtrace}");
         log::logger().flush();
         default(info);
+        // A task's thread ending this way does not end the program: the task
+        // says it stopped, and the window carries on.
+        if std::thread::current().name() != Some("main") {
+            return;
+        }
         let message = format!(
             "LoanMaster hit an unexpected error and must close. Your journal is safe — an interrupted change is \
              never half-written.\n\n{info}\n\nDetails were written to:\n{}",

@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the workspace is written for (rust-version in Cargo.toml).
+  # Raised deliberately: a newer clippy can bring new lints.
+  RUST_TOOLCHAIN: "1.95"
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: clippy
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+    - name: Test
+      run: cargo test --workspace --locked
+
+  build-windows:
+    name: Build Windows Application
+    runs-on: windows-latest
+    needs: test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Build
+      run: cargo build --release --locked -p loanmaster
+
+    - name: Install Inno Setup
+      run: |
+        choco install innosetup --no-progress
+        echo "C:\Program Files (x86)\Inno Setup 6" >> $env:GITHUB_PATH
+
+    - name: Build Installer (Inno Setup)
+      run: iscc setup.iss
+
+    - name: Collect the portable folder
+      run: |
+        New-Item -ItemType Directory -Force build/LoanMaster/resources | Out-Null
+        Copy-Item target/release/loanmaster.exe build/LoanMaster/LoanMaster.exe
+        Copy-Item resources/nairobi_water_sacco_logo.png build/LoanMaster/resources/
+
+    - name: Upload Artifact - Portable Folder
+      uses: actions/upload-artifact@v4
+      with:
+        name: LoanMaster-Portable
+        path: build/LoanMaster
+
+    - name: Upload Artifact - Installer
+      uses: actions/upload-artifact@v4
+      with:
+        name: LoanMaster-Installer
+        path: build/LoanMasterSetup.exe
