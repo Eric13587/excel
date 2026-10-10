@@ -32,6 +32,17 @@ enum Tone {
 /// A cell by its row's key and its month.
 type CellKey = (i64, String);
 
+/// The narrowest a month column gets, and the widest before its text is cut
+/// short — the bar above the grid shows a cut-short cell in full.
+const MONTH_MIN: f32 = 88.0;
+const MONTH_MAX: f32 = 340.0;
+/// A cell's margins, and room for the mark on a locked cell.
+const CELL_PAD: f32 = 26.0;
+
+fn text_width(ctx: &egui::Context, font: &egui::FontId, text: &str) -> f32 {
+    ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE).size().x)
+}
+
 /// A cell being typed into.
 struct Editing {
     key: i64,
@@ -82,6 +93,10 @@ pub struct Page<S: Sheet> {
     rebase: bool,
     status: Option<(String, Tone)>,
     pending: Option<Pending<S::Change>>,
+    /// How many times the journal has been read, and each month column's
+    /// width for what was read: measured once per read, not every frame.
+    loads: u64,
+    fit: Option<(u64, Vec<f32>)>,
 }
 
 impl<S: Sheet> Page<S> {
@@ -113,6 +128,8 @@ impl<S: Sheet> Page<S> {
             rebase: false,
             status: None,
             pending: None,
+            loads: 0,
+            fit: None,
         }
     }
 
@@ -165,6 +182,7 @@ impl<S: Sheet> Page<S> {
             }
         }
         self.loaded = Some(Loaded { revision, months, flags });
+        self.loads += 1;
         if self.rebase {
             self.rebase = false;
             self.rebase_staged();
@@ -201,6 +219,40 @@ impl<S: Sheet> Page<S> {
             .iter()
             .filter(|r| needle.is_empty() || self.sheet.row_label(r).to_lowercase().contains(&needle) || self.sheet.lead_values(r).join(" ").to_lowercase().contains(&needle))
             .collect()
+    }
+
+    /// What a cell holds in the journal, as the grid writes it.
+    fn saved_text(&self, row: &S::Row, month: &str) -> String {
+        self.sheet.display_text(row, month).unwrap_or_else(|| if self.sheet.has_rows(row, month) { shillings(self.sheet.net(row, month)) } else { "—".into() })
+    }
+
+    fn staged_text(&self, change: &S::Change) -> String {
+        self.sheet.staged_text(change).unwrap_or_else(|| if self.sheet.is_delete(change) { "—".into() } else { shillings(self.sheet.effect(change)) })
+    }
+
+    /// Each month column wide enough for its widest cell, so a month holding
+    /// several entries can be read: the journal's figures are measured once
+    /// per read, the staged ones as they change.
+    fn month_widths(&mut self, ctx: &egui::Context, font: &egui::FontId, grid: &S::Grid, months: &[String]) -> Vec<f32> {
+        let fit = |text_width: f32| (text_width + CELL_PAD).clamp(MONTH_MIN, MONTH_MAX);
+        if self.fit.as_ref().is_none_or(|(loads, widths)| *loads != self.loads || widths.len() != months.len()) {
+            let widths = months
+                .iter()
+                .map(|month| {
+                    let header = text_width(ctx, font, &dates::month_label(month));
+                    let widest = self.sheet.rows(grid).iter().map(|row| text_width(ctx, font, &self.saved_text(row, month))).fold(header, f32::max);
+                    fit(widest)
+                })
+                .collect();
+            self.fit = Some((self.loads, widths));
+        }
+        let mut widths = self.fit.as_ref().map(|(_, widths)| widths.clone()).unwrap_or_default();
+        for ((_, month), change) in &self.staged {
+            if let Some(i) = months.iter().position(|m| m == month) {
+                widths[i] = widths[i].max(fit(text_width(ctx, font, &self.staged_text(change))));
+            }
+        }
+        widths
     }
 
     fn effective(&self, row: &S::Row, month: &str) -> f64 {
@@ -557,6 +609,58 @@ impl<S: Sheet> Page<S> {
                 self.say("The grid was read again.", Tone::Muted);
             }
         });
+        ui.add_space(4.0);
+        self.details(ui);
+    }
+
+    /// The selected cell in full, above the grid: every entry it holds and
+    /// what they are, however narrow its column — and, while it is typed
+    /// into, what the text will do or why it will not be taken.
+    fn details(&self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui.ctx());
+        egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(6).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let cell = self.editing.as_ref().map(|e| (e.key, e.month.clone())).or_else(|| self.anchor.clone());
+                let found = cell.as_ref().and_then(|(key, month)| {
+                    let grid = self.grid.as_ref()?;
+                    let row = self.sheet.rows(grid).iter().find(|r| self.sheet.key(r) == *key)?;
+                    Some((grid, row, month.as_str()))
+                });
+                let Some((grid, row, month)) = found else {
+                    ui.label(RichText::new("Select a cell to see everything in it; type to change it.").color(p.muted));
+                    return;
+                };
+                ui.label(RichText::new(format!("{}, {}", self.sheet.row_label(row), dates::month_label(month))).strong());
+                ui.separator();
+                let id = (self.sheet.key(row), month.to_string());
+                let entries = |text: String| if text.is_empty() { "empty".to_string() } else { text };
+                let (shown, colour) = if let Some(editing) = &self.editing {
+                    match self.sheet.stage(grid, row, month, &editing.text) {
+                        Ok(Some(change)) => {
+                            let others: Vec<&S::Change> = self.staged.values().collect();
+                            (format!("Enter stages it: {}", self.sheet.describe(Some(row), &change, &others)), p.text)
+                        }
+                        Ok(None) => ("Enter leaves the month as it is.".to_string(), p.muted),
+                        Err(problem) => (problem, p.danger),
+                    }
+                } else if let Some(reason) = self.refused.get(&id) {
+                    (format!("Refused: {reason}"), p.danger)
+                } else if let Some(change) = self.staged.get(&id) {
+                    let others: Vec<&S::Change> = self.staged.values().collect();
+                    (format!("{} — unsaved: {}", entries(self.sheet.staged_edit_text(change)), self.sheet.describe(Some(row), change, &others)), p.warning)
+                } else if let Some(reason) = self.sheet.refusal(grid, row, month) {
+                    let what = self.sheet.rows_tooltip(row, month).map(|t| format!("{} — ", t.replace('\n', " · "))).unwrap_or_default();
+                    (format!("{what}{reason}"), p.muted)
+                } else if let Some(note) = self.sheet.cell_note(row, month) {
+                    (note, p.danger)
+                } else {
+                    let rows = self.sheet.rows_tooltip(row, month).map(|t| format!(" — {}", t.replace('\n', " · "))).unwrap_or_default();
+                    (format!("{}{rows}", entries(self.sheet.edit_text(row, month))), p.text)
+                };
+                ui.add(egui::Label::new(RichText::new(&shown).color(colour)).truncate()).on_hover_text(&shown);
+            });
+        });
     }
 
     fn footer(&mut self, ui: &mut egui::Ui, journal: &Journal, actions: &mut Vec<Action>) {
@@ -623,6 +727,8 @@ impl<S: Sheet> Page<S> {
         let rows = self.visible(&grid);
         let lead = self.sheet.lead_columns();
         let mut clicks: Vec<CellClick> = Vec::new();
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let widths = self.month_widths(ui.ctx(), &font, &grid, &months);
         egui::ScrollArea::horizontal().id_salt(("grid_scroll", self.sheet.label())).show(ui, |ui| {
             let mut builder = TableBuilder::new(ui)
                 .id_salt(("grid", self.sheet.label()))
@@ -631,8 +737,8 @@ impl<S: Sheet> Page<S> {
                 .column(Column::exact(210.0))
                 .column(Column::exact(84.0))
                 .column(Column::exact(96.0));
-            for _ in &months {
-                builder = builder.column(Column::exact(96.0));
+            for width in &widths {
+                builder = builder.column(Column::exact(*width));
             }
             builder = builder.column(Column::exact(110.0)).column(Column::exact(120.0));
             builder
@@ -754,7 +860,22 @@ impl<S: Sheet> Page<S> {
     fn cell(&mut self, ui: &mut egui::Ui, grid: &S::Grid, row: &S::Row, key: i64, month: &str, p: &Palette, clicks: &mut Vec<CellClick>, actions: &mut Vec<Action>) {
         let id = (key, month.to_string());
         if let Some(editing) = self.editing.as_mut().filter(|e| e.key == key && e.month == month) {
-            let response = ui.add(egui::TextEdit::singleline(&mut editing.text).desired_width(f32::INFINITY).horizontal_align(egui::Align::RIGHT));
+            // The editor floats over the grid from the cell's corner and grows
+            // with what is typed, as a spreadsheet's does, so every entry of a
+            // busy month stays in view.
+            let cell = ui.max_rect();
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let room = ui.ctx().content_rect().right() - cell.left() - 8.0;
+            let width = (text_width(ui.ctx(), &font, &editing.text) + 40.0).max(cell.width()).min(room.max(cell.width()));
+            let area = egui::Area::new(egui::Id::new(("grid_editor", self.sheet.label())))
+                .order(egui::Order::Foreground)
+                .fixed_pos(cell.left_top())
+                .constrain(true)
+                .show(ui.ctx(), |ui| {
+                    let frame = egui::Frame::new().fill(p.input).stroke(egui::Stroke::new(1.5, p.accent)).corner_radius(3);
+                    ui.add(egui::TextEdit::singleline(&mut editing.text).frame(frame).margin(egui::Margin::symmetric(5, 3)).desired_width(width - 10.0))
+                });
+            let response = area.inner;
             if editing.focus {
                 response.request_focus();
                 editing.focus = false;
@@ -775,10 +896,8 @@ impl<S: Sheet> Page<S> {
         };
         let note = self.sheet.cell_note(row, month);
         let mut text = match staged {
-            Some(change) => self.sheet.staged_text(change).unwrap_or_else(|| if self.sheet.is_delete(change) { "—".into() } else { shillings(self.sheet.effect(change)) }),
-            None => self.sheet.display_text(row, month).unwrap_or_else(|| {
-                if self.sheet.has_rows(row, month) { shillings(self.sheet.net(row, month)) } else { "—".into() }
-            }),
+            Some(change) => self.staged_text(change),
+            None => self.saved_text(row, month),
         };
         let (fill, colour, tip): (Option<Color32>, Color32, Option<String>) = if let Some(reason) = self.refused.get(&id) {
             (Some(p.danger_bg), p.danger, Some(reason.clone()))
@@ -805,7 +924,9 @@ impl<S: Sheet> Page<S> {
         if note.is_some() && staged.is_none() {
             rich = rich.strong();
         }
-        let response = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.add(egui::Label::new(rich).selectable(false).sense(egui::Sense::click()))).inner;
+        let response = ui
+            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.add(egui::Label::new(rich).selectable(false).truncate().sense(egui::Sense::click())))
+            .inner;
         let response = ui.interact(ui.max_rect(), ui.id().with(("cell", key, month)), egui::Sense::click()).union(response);
         // Named for screen readers (and the tests): "ANN WANJIRU, Oct 2026".
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, format!("{}, {}", self.sheet.row_label(row), dates::month_label(month))));

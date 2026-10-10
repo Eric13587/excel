@@ -254,6 +254,37 @@ fn a_typed_figure_is_staged_until_saved_and_the_save_can_be_undone() {
 }
 
 #[test]
+fn a_busy_month_stays_readable_while_typed_and_after() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("ANN WANJIRU, Oct 2026").click();
+    harness.run();
+    harness.event(egui::Event::Text("2,000, @W=500, +@W=250".into()));
+    harness.run();
+    // The bar above the grid says what the text will do before it is staged.
+    harness.get_by_label_contains("Enter stages it");
+    shot(&mut harness, "grid_editing_busy");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    harness.get_by_label("ANN WANJIRU, Oct 2026").click();
+    harness.run();
+    harness.get_by_label_contains("unsaved: Leaves: Deposit 2,000; Withdrawal 500; Withdrawal 250");
+    shot(&mut harness, "grid_busy_cell");
+}
+
+#[test]
+fn typing_something_the_cell_cannot_take_says_why_before_enter() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("ANN WANJIRU, Oct 2026").click();
+    harness.run();
+    harness.event(egui::Event::Text("@X=5".into()));
+    harness.run();
+    assert!(harness.query_by_label_contains("Enter stages it").is_none());
+    shot(&mut harness, "grid_editing_wrong");
+}
+
+#[test]
 fn a_figure_the_cell_cannot_take_is_refused_with_the_reason() {
     let mut harness = harness(sample());
     open_grid(&mut harness);
@@ -688,4 +719,3 @@ fn smoke_every_screen_over_a_real_journal() {
     }
     timed("every report and tool window", started);
 }
-
