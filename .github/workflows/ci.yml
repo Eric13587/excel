@@ -20,7 +20,7 @@ jobs:
     name: Lint and test
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - uses: dtolnay/rust-toolchain@master
       with:
@@ -41,7 +41,7 @@ jobs:
     needs: test
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - uses: dtolnay/rust-toolchain@master
       with:
@@ -66,13 +66,13 @@ jobs:
         Copy-Item target/release/loanmaster.exe build/LoanMaster/LoanMaster.exe
 
     - name: Upload Artifact - Portable Folder
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: LoanMaster-Portable
         path: build/LoanMaster
 
     - name: Upload Artifact - Installer
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: LoanMaster-Installer
         path: build/LoanMasterSetup.exe
