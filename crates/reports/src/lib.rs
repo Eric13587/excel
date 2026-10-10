@@ -5,7 +5,7 @@
 //! typeset with Typst from fixed templates, with Liberation Sans built in so a
 //! document looks the same on every machine.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use loanmaster_core::Journal;
 use loanmaster_core::reports::Table;
@@ -27,39 +27,59 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The logo that ships inside the program: the society's own, printed until
+/// Settings names another.
+pub const BUNDLED_LOGO: &[u8] = include_bytes!("../../../resources/nairobi_water_sacco_logo.png");
+
+/// A letterhead image: its bytes, and the kind of image they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Logo {
+    /// `png`, `jpg`, `gif` or `svg`: how the bytes are read.
+    pub kind: String,
+    pub bytes: Vec<u8>,
+}
+
+impl Logo {
+    pub fn bundled() -> Logo {
+        Logo { kind: "png".into(), bytes: BUNDLED_LOGO.to_vec() }
+    }
+
+    /// An image file, its kind taken from its extension.
+    pub fn read(path: &Path) -> std::io::Result<Logo> {
+        let kind = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("jpeg" | "jpg") => "jpg".to_string(),
+            Some(other) => other.to_string(),
+            None => "png".to_string(),
+        };
+        Ok(Logo { kind, bytes: std::fs::read(path)? })
+    }
+}
+
 /// The society's identity on every document, and the workbook colours.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Branding {
     pub org_name: String,
-    /// The logo to print, if one is configured or shipped and exists.
-    pub logo: Option<PathBuf>,
+    pub logo: Option<Logo>,
     /// Workbook header and total row backgrounds (`#RRGGBB`).
     pub header_bg: String,
     pub total_bg: String,
 }
 
-/// Where the shipped logo lives: `resources/` beside the executable.
-pub fn bundled_logo() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.join("resources").join("nairobi_water_sacco_logo.png");
-    path.exists().then_some(path)
-}
-
 impl Branding {
     /// The journal's own branding: its organisation name, and its logo —
-    /// the configured one if the file still exists, else the shipped one.
+    /// the one Settings names if it can be read, else the bundled one.
     pub fn of(journal: &Journal) -> Branding {
         let settings = journal.settings();
         let configured = settings.org_logo_path();
-        let logo = if !configured.is_empty() && Path::new(&configured).exists() {
-            Some(PathBuf::from(&configured))
+        let logo = if configured.trim().is_empty() {
+            Logo::bundled()
         } else {
-            if !configured.is_empty() {
-                log::warn!("Configured logo not found on disk: {configured}");
-            }
-            bundled_logo()
+            Logo::read(Path::new(configured.trim())).unwrap_or_else(|e| {
+                log::warn!("The logo {configured} could not be read ({e}); printing the bundled one");
+                Logo::bundled()
+            })
         };
-        Branding { org_name: settings.org_name(), logo, header_bg: settings.excel_header_bg(), total_bg: settings.excel_total_bg() }
+        Branding { org_name: settings.org_name(), logo: Some(logo), header_bg: settings.excel_header_bg(), total_bg: settings.excel_total_bg() }
     }
 }
 
@@ -104,6 +124,6 @@ pub fn write_statement_pdf(statement: &Statement, config: &StatementConfig, bran
 }
 
 /// Save a statement as a workbook.
-pub fn write_statement_xlsx(statement: &Statement, config: &StatementConfig, path: &Path) -> Result<()> {
-    xlsx::write_statement(statement, config, path)
+pub fn write_statement_xlsx(statement: &Statement, config: &StatementConfig, branding: &Branding, path: &Path) -> Result<()> {
+    xlsx::write_statement(statement, config, branding, path)
 }

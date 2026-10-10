@@ -14,7 +14,6 @@ use crate::dialogs::member::MemberForm;
 use crate::theme;
 use crate::widgets;
 
-const ICON: &[u8] = include_bytes!("../../../../resources/icon.png");
 
 /// One member's line in the list.
 #[derive(Debug, Clone)]
@@ -117,7 +116,7 @@ impl Dashboard {
             .frame(egui::Frame::new().fill(p.header).inner_margin(egui::Margin::symmetric(24, 12)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Image::from_bytes("bytes://icon.png", ICON).fit_to_exact_size(egui::vec2(34.0, 34.0)));
+                    ui.add(egui::Image::from_bytes("bytes://icon.png", crate::ICON).fit_to_exact_size(egui::vec2(34.0, 34.0)));
                     ui.vertical(|ui| {
                         ui.label(RichText::new("LoanMaster").size(20.0).strong().color(egui::Color32::WHITE));
                         if !org_name.is_empty() {

@@ -2,9 +2,10 @@
 //! printing. The `reports` crate writes it as a PDF or a workbook.
 //!
 //! Each loan is replayed from its first entry, so the running figures at the
-//! start of the period are right even when the period begins mid-loan. The
-//! "gross" figure is principal plus all the interest the loan was written
-//! to charge, less what has been paid — at the loan's own rate.
+//! start of the period are right even when the period begins mid-loan, and a
+//! "Balance b/f" line carries them in. The "gross" figure is principal plus
+//! all the interest the loan was written to charge, less what has been paid —
+//! at the loan's own rate.
 
 use chrono::{Datelike, NaiveDate};
 
@@ -20,10 +21,21 @@ pub const LOAN_COLUMNS: [&str; 8] = ["Date", "Type", "Debit", "Interest", "Credi
 /// The savings columns a statement can show, in their default order.
 pub const SAVINGS_COLUMNS: [&str; 5] = ["Date", "Type", "Amount", "Balance", "Notes"];
 
+/// Which loans a statement shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoanScope {
+    /// Loans with something still owed when the period closes.
+    Active,
+    /// Every loan with an entry in the period, or a balance carried into it.
+    #[default]
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatementConfig {
     pub show_loans: bool,
     pub show_savings: bool,
+    pub loans: LoanScope,
     pub title: String,
     pub footer: String,
     /// How the period and statement date are written (`strftime`).
@@ -37,6 +49,7 @@ impl Default for StatementConfig {
         StatementConfig {
             show_loans: true,
             show_savings: true,
+            loans: LoanScope::All,
             title: "ACCOUNT STATEMENT".into(),
             footer: String::new(),
             date_format: "%B %d, %Y".into(),
@@ -60,7 +73,12 @@ pub struct LoanLine {
     pub notes: String,
     /// A note spanning the row — a suspension — instead of an entry.
     pub annotation: Option<String>,
+    /// The loan as it stood when the period began, carried in.
+    pub brought_forward: bool,
 }
+
+/// The line that carries a balance into the period.
+pub const BROUGHT_FORWARD: &str = "Balance b/f";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoanSection {
@@ -76,6 +94,8 @@ pub struct SavingsLine {
     pub amount: f64,
     pub balance: f64,
     pub notes: String,
+    /// The savings as they stood when the period began, carried in.
+    pub brought_forward: bool,
 }
 
 impl SavingsLine {
@@ -88,6 +108,7 @@ impl SavingsLine {
 pub struct Statement {
     pub member_id: i64,
     pub name: String,
+    pub pf_no: String,
     pub phone: String,
     pub from: String,
     pub to: String,
@@ -106,7 +127,7 @@ pub struct Statement {
 }
 
 impl Statement {
-    /// Nothing to print in the period.
+    /// Nothing to print for the period: no entries and no balance carried in.
     pub fn is_empty(&self) -> bool {
         self.loans.is_empty() && self.savings.is_empty()
     }
@@ -231,6 +252,7 @@ fn suspension_lines(reference: &str, spans: &[Suspension], from: &str, to: &str,
             gross: None,
             notes: String::new(),
             annotation: Some(text),
+            brought_forward: false,
         });
     }
     lines
@@ -268,6 +290,8 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                 ledger.iter().filter(|r| r.loan_ref == reference || (r.loan_ref.is_empty() && reference == "-")).collect();
             let mut lines = Vec::new();
             let (mut gross, mut at_end) = (0.0, (0.0, 0.0));
+            // Where the loan stood when the period began, if it began earlier.
+            let mut carried: Option<(f64, f64)> = None;
             for row in entries {
                 if dates::date_part(&row.date) > to.as_str() {
                     break;
@@ -281,6 +305,7 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                 }
                 at_end = (row.balance, gross);
                 if dates::date_part(&row.date) < from.as_str() {
+                    carried = Some(at_end);
                     continue;
                 }
                 let shows_gross =
@@ -295,6 +320,7 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                     gross: shows_gross.then(|| ceil(gross)),
                     notes: clean_notes(&row.notes),
                     annotation: None,
+                    brought_forward: false,
                 });
             }
             let notes = suspension_lines(&reference, &suspensions, &from, &to, &config.date_format);
@@ -302,7 +328,29 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                 lines.extend(notes);
                 lines.sort_by(|a, b| a.date.cmp(&b.date));
             }
-            if !lines.is_empty() {
+            // A loan still owing when the period began opens with what it owed.
+            if let Some((balance, gross)) = carried.filter(|(balance, _)| *balance > 0.005) {
+                lines.insert(
+                    0,
+                    LoanLine {
+                        date: from.clone(),
+                        event_type: BROUGHT_FORWARD.into(),
+                        debit: 0.0,
+                        interest: 0.0,
+                        credit: 0.0,
+                        balance: ceil(balance),
+                        gross: Some(ceil(gross)),
+                        notes: String::new(),
+                        annotation: None,
+                        brought_forward: true,
+                    },
+                );
+            }
+            let shown = match config.loans {
+                LoanScope::All => !lines.is_empty(),
+                LoanScope::Active => at_end.0 > 0.005,
+            };
+            if shown {
                 loans.push(LoanSection { reference: reference.clone(), lines });
             }
             // What the loan stood at when the period closed, even with no
@@ -318,9 +366,13 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
     let mut running = 0.0;
     let mut savings_balance = 0.0;
     let mut savings = Vec::new();
+    let mut carried: Option<f64> = None;
     for row in &history {
         running = total([running, row.signed()]);
         let date = dates::date_part(&row.date);
+        if date < from.as_str() {
+            carried = Some(running);
+        }
         if date <= to.as_str() {
             savings_balance = running;
         }
@@ -331,13 +383,23 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                 amount: row.signed(),
                 balance: running,
                 notes: clean_notes(&row.notes),
+                brought_forward: false,
             });
         }
+    }
+    if config.show_savings
+        && let Some(balance) = carried.filter(|balance| balance.abs() > 0.005)
+    {
+        savings.insert(
+            0,
+            SavingsLine { date: from.clone(), kind: BROUGHT_FORWARD.into(), amount: 0.0, balance, notes: String::new(), brought_forward: true },
+        );
     }
 
     Ok(Statement {
         member_id,
         period: format!("{} to {}", display(&from, &config.date_format), display(&to, &config.date_format)),
+        pf_no: member.pf_no,
         name: member.name,
         phone: member.phone,
         from,

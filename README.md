@@ -75,10 +75,9 @@ iscc setup.iss
 ```
 
 The installer is written to `build\LoanMasterSetup.exe` and upgrades a 1.x
-installation in place. For a portable copy, put
-`target\release\loanmaster.exe` in a folder beside a `resources` folder
-holding `nairobi_water_sacco_logo.png`, the default logo. CI produces both on
-every push to `main`.
+installation in place. `target\release\loanmaster.exe` on its own is the
+portable copy: fonts, icon and the default logo are built in. CI produces both
+on every push to `main`.
 
 ## Data safety
 

@@ -19,33 +19,39 @@
 )
 #set text(font: "Liberation Sans", size: 8pt)
 
+// The letterhead: the society's logo at the top left with its name beside
+// it, and the statement's date and period on the right.
 #grid(
-  columns: (70pt, 1fr, 70pt),
-  align: (left + horizon, center + horizon, right),
-  if data.logo != none { image(data.logo, height: 46pt) } else [],
+  columns: (auto, 1fr, auto),
+  column-gutter: 14pt,
+  align: (left + horizon, left + horizon, right + horizon),
+  if data.logo != none { image(data.logo, height: 58pt) } else [],
   {
     if data.org != "" {
-      text(size: 13pt, weight: "bold", fill: rgb("#0f172a"))[#data.org]
+      text(size: 16pt, weight: "bold", fill: rgb("#0f172a"))[#data.org]
       linebreak()
     }
-    text(size: 18pt, weight: "bold", fill: accent)[#data.title]
-    linebreak()
-    text(size: 13pt)[#data.name]
-    linebreak()
-    text(size: 9pt, fill: grey)[For the period: #data.period]
+    text(size: 12pt, weight: "bold", fill: accent, tracking: 0.6pt)[#upper(data.title)]
   },
-  [],
+  {
+    text(size: 7pt, fill: grey, tracking: 0.4pt)[STATEMENT DATE]
+    linebreak()
+    text(size: 9pt, weight: "bold")[#data.statement_date]
+    linebreak()
+    text(size: 7pt, fill: grey, tracking: 0.4pt)[PERIOD]
+    linebreak()
+    text(size: 9pt, weight: "bold")[#data.period]
+  },
 )
-#v(2pt)
+#v(4pt)
 #line(length: 100%, stroke: 2.5pt + accent)
 #v(4pt)
 
 #block(fill: rgb("#f5f5f5"), inset: 7pt, radius: 4pt, width: 100%)[
   #grid(
     columns: (1fr, 1fr),
-    [*Client Name:* #data.name \ *Contact:* #data.phone],
+    [*Member:* #data.name #if data.pf_no != "" [#h(10pt) *PF No:* #data.pf_no] \ *Contact:* #data.phone],
     align(right)[
-      *Statement Date:* #data.statement_date \
       *Account Status:* #text(fill: if data.active { green } else { red }, weight: "bold")[#data.status]
     ],
   )
@@ -55,6 +61,8 @@
 #let band(body, fill) = block(fill: fill, inset: 5pt, width: 100%, below: 0pt, text(fill: white, weight: "bold", size: 9pt, body))
 #let nothing(what) = block(inset: 8pt, text(fill: grey)[No #what transactions in this period])
 #let cell(v, numeric) = if numeric { align(right)[#v] } else [#v]
+// A balance carried into the period reads apart from the period's entries.
+#let carried(r, body) = if r.at("bf", default: false) { text(style: "italic", fill: grey, body) } else { body }
 // Notes (else Type) takes the spare width, so each table fills its column.
 #let widths(columns) = {
   let at = columns.position(c => c == "Notes")
@@ -77,7 +85,7 @@
       .map(r => if "note" in r {
         (table.cell(colspan: n, fill: rgb("#f0f0f0"), text(fill: rgb("#888888"), style: "italic")[#r.note]),)
       } else {
-        r.cells.enumerate().map(((i, v)) => cell(v, data.loan_numeric.at(i)))
+        r.cells.enumerate().map(((i, v)) => carried(r, cell(v, data.loan_numeric.at(i))))
       })
       .flatten(),
   )
@@ -91,7 +99,7 @@
   ..data
     .savings
     .map(r => r.cells.enumerate().map(((i, v)) => {
-      let body = cell(v, data.savings_numeric.at(i))
+      let body = carried(r, cell(v, data.savings_numeric.at(i)))
       if r.withdrawal and data.savings_columns.at(i) == "Amount" { text(fill: red, body) } else { body }
     }))
     .flatten(),

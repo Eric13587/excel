@@ -7,7 +7,6 @@ use eframe::egui::{self, RichText};
 use crate::app::{Action, Remembered};
 use crate::theme;
 
-const ICON: &[u8] = include_bytes!("../../../../resources/icon.png");
 
 fn pick_journal() -> Option<PathBuf> {
     rfd::FileDialog::new().set_title("Open Journal").add_filter("LoanMaster journal", &["db"]).pick_file()
@@ -34,7 +33,7 @@ pub fn show(ui: &mut egui::Ui, remembered: &Remembered, actions: &mut Vec<Action
             .show(ui, |ui| {
                 ui.set_width(420.0);
                 ui.vertical_centered(|ui| {
-                    ui.add(egui::Image::from_bytes("bytes://icon.png", ICON).fit_to_exact_size(egui::vec2(64.0, 64.0)));
+                    ui.add(egui::Image::from_bytes("bytes://icon.png", crate::ICON).fit_to_exact_size(egui::vec2(64.0, 64.0)));
                     ui.add_space(6.0);
                     ui.label(RichText::new("LoanMaster").size(26.0).strong().color(p.text));
                     ui.label(

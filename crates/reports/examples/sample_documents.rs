@@ -16,7 +16,7 @@ fn main() {
     let member: i64 = args[3].parse().unwrap();
     let mut branding = Branding::of(&journal);
     if let Some(logo) = args.get(4) {
-        branding.logo = Some(logo.into());
+        branding.logo = Some(loanmaster_reports::Logo::read(Path::new(logo)).expect("a readable logo"));
         branding.org_name = "Sample Society".into();
     }
     let mut go = |_: usize, _: usize, _: &str| true;
@@ -35,6 +35,6 @@ fn main() {
     let config = StatementConfig::default();
     let statement = prepare(&journal, member, "2025-11-01", "2026-10-31", &config).unwrap();
     write_statement_pdf(&statement, &config, &branding, &out.join("statement.pdf")).unwrap();
-    write_statement_xlsx(&statement, &config, &out.join("statement.xlsx")).unwrap();
+    write_statement_xlsx(&statement, &config, &branding, &out.join("statement.xlsx")).unwrap();
     println!("written in {:?}", started.elapsed());
 }

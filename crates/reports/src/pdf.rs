@@ -21,7 +21,7 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
 
-use crate::{Branding, Error, Result};
+use crate::{Branding, Error, Logo, Result};
 
 const TABLE: &str = include_str!("table.typ");
 const STATEMENT: &str = include_str!("statement.typ");
@@ -80,23 +80,31 @@ impl World for Document {
     }
 }
 
-/// Typeset `template` with `data`, adding the logo to the data when there is one.
+/// Typeset `template` with `data` under the branding's letterhead. A logo
+/// that will not typeset — a damaged file, say — is left off rather than
+/// costing the document.
 fn render(template: &str, mut data: Json, branding: &Branding) -> Result<Vec<u8>> {
-    let mut files = HashMap::new();
-    let mut logo = Json::Null;
-    if let Some(path) = &branding.logo {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("png").to_ascii_lowercase();
-                let name = format!("logo.{extension}");
-                files.insert(file_id(&format!("/{name}")), Bytes::new(bytes));
-                logo = json!(name);
-            }
-            Err(e) => log::warn!("Could not read the logo {}: {e}", path.display()),
+    data["org"] = json!(branding.org_name);
+    if let Some(logo) = &branding.logo {
+        match typeset(template, &data, Some(logo)) {
+            Ok(pdf) => return Ok(pdf),
+            Err(e) => log::warn!("The logo could not be printed, so it is left off: {e}"),
         }
     }
-    data["logo"] = logo;
-    data["org"] = json!(branding.org_name);
+    typeset(template, &data, None)
+}
+
+fn typeset(template: &str, data: &Json, logo: Option<&Logo>) -> Result<Vec<u8>> {
+    let mut data = data.clone();
+    let mut files = HashMap::new();
+    data["logo"] = match logo {
+        Some(logo) => {
+            let name = format!("logo.{}", logo.kind);
+            files.insert(file_id(&format!("/{name}")), Bytes::new(logo.bytes.clone()));
+            json!(name)
+        }
+        None => Json::Null,
+    };
     files.insert(file_id("/data.json"), Bytes::new(serde_json::to_vec(&data).map_err(|e| Error::Pdf(e.to_string()))?));
     let world = Document { main: Source::new(file_id("/main.typ"), template.to_string()), files };
 
@@ -136,6 +144,10 @@ pub fn table(table: &Table, branding: &Branding) -> Result<Vec<u8>> {
 }
 
 fn loan_cell(line: &LoanLine, column: &str) -> String {
+    // A balance carried in has no movement of its own.
+    if line.brought_forward && matches!(column, "Debit" | "Interest" | "Credit" | "Notes") {
+        return String::new();
+    }
     match column {
         "Date" => line.date.clone(),
         "Type" => line.event_type.clone(),
@@ -150,6 +162,9 @@ fn loan_cell(line: &LoanLine, column: &str) -> String {
 }
 
 fn savings_cell(line: &SavingsLine, column: &str) -> String {
+    if line.brought_forward && matches!(column, "Amount" | "Notes") {
+        return String::new();
+    }
     match column {
         "Date" => line.date.clone(),
         "Type" => line.kind.clone(),
@@ -173,7 +188,7 @@ pub fn statement(statement: &Statement, config: &StatementConfig, branding: &Bra
                 .iter()
                 .map(|line| match &line.annotation {
                     Some(note) => json!({"note": note}),
-                    None => json!({"cells": config.columns.iter().map(|c| loan_cell(line, c)).collect::<Vec<_>>()}),
+                    None => json!({"cells": config.columns.iter().map(|c| loan_cell(line, c)).collect::<Vec<_>>(), "bf": line.brought_forward}),
                 })
                 .collect();
             json!({"ref": loan.reference, "rows": rows})
@@ -186,6 +201,7 @@ pub fn statement(statement: &Statement, config: &StatementConfig, branding: &Bra
             json!({
                 "cells": config.savings_columns.iter().map(|c| savings_cell(line, c)).collect::<Vec<_>>(),
                 "withdrawal": line.is_withdrawal(),
+                "bf": line.brought_forward,
             })
         })
         .collect();
@@ -193,6 +209,7 @@ pub fn statement(statement: &Statement, config: &StatementConfig, branding: &Bra
     let data = json!({
         "title": config.title,
         "name": statement.name,
+        "pf_no": statement.pf_no,
         "phone": statement.phone,
         "period": statement.period,
         "statement_date": Local::now().format(&config.date_format).to_string(),

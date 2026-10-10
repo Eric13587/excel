@@ -25,7 +25,8 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
-const ICON: &[u8] = include_bytes!("../../../resources/icon.png");
+/// The application icon, for the window and the screens that show it.
+pub const ICON: &[u8] = include_bytes!("../../../resources/icon.png");
 const RELAUNCHED: &str = "LOANMASTER_RELAUNCHED";
 
 /// The graphics adapter to draw with: a real GPU when there is one that can

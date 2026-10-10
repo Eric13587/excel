@@ -48,8 +48,8 @@ Type: filesandordirs; Name: "{app}\dateutil"
 Type: filesandordirs; Name: "{app}\src"
 
 [Files]
+; The program is one file: fonts, icon and the default logo are built in.
 Source: "{#MyBuild}\loanmaster.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
-Source: "resources\nairobi_water_sacco_logo.png"; DestDir: "{app}\resources"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

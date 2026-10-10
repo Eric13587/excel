@@ -116,6 +116,12 @@ pub fn date(ui: &mut Ui, id: &str, value: &mut chrono::NaiveDate) -> egui::Respo
     response
 }
 
+/// How tall a dialog's body may grow before it scrolls, leaving its title and
+/// its row of buttons on a small screen (1366 × 768 is common).
+pub fn dialog_room(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() - 190.0).max(220.0)
+}
+
 /// Make a table's rows take clicks anywhere on them: text that can be
 /// selected would otherwise take a click on a name for itself.
 pub fn clickable_rows(ui: &mut Ui) {

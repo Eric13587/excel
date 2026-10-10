@@ -124,9 +124,22 @@ purpose.
   paid off in full could show a gross balance of 1.
 * **Savings balances are summed from the rows.** 1.x printed each row's
   stored running balance. On the production journal the two agree.
-* **A member with no activity in the period is skipped, in either format**,
-  and the summary says so. 1.x counted an empty workbook statement as a
-  failure.
+* **A statement covers active loans or all of them, over this financial
+  year, the whole history or chosen months.** 1.x printed every loan with an
+  entry in the period and started the period at the selected members' first
+  entry, so a statement ran from the member's first loan, paid-off loans and
+  all.
+* **A balance from before the period is carried in** as a "Balance b/f" line
+  on each loan and on savings, so a statement that starts mid-history still
+  explains its figures. 1.x began with the period's first entry.
+* **A member with nothing to show for the period — no entries and no balance
+  carried in — is skipped, in either format**, and the summary says so. 1.x
+  counted an empty workbook statement as a failure.
+* **The member's PF number is printed, and the workbook has the PDF's
+  letterhead**: the logo and the society's name, printed landscape and one
+  page wide. 1.x's workbook had neither.
+* **The default logo is built into the program**, so it prints however the
+  program was installed. 1.x read it from a file beside the program.
 * **Two members of the same name get a file each.** 1.x wrote both
   statements to one file name, so the second replaced the first.
 

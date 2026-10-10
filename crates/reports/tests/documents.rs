@@ -7,7 +7,7 @@ use loanmaster_core::funds;
 use loanmaster_core::loans::service::{catch_up, issue};
 use loanmaster_core::reports::{self, Table, Value};
 use loanmaster_core::statements::{StatementConfig, prepare};
-use loanmaster_reports::{Branding, Format, csv, pdf, write_statement_pdf, write_statement_xlsx, write_table};
+use loanmaster_reports::{Branding, Format, Logo, csv, pdf, write_statement_pdf, write_statement_xlsx, write_table};
 
 fn journal_with(name: &str) -> (Journal, i64) {
     let journal = Journal::open_in_memory().unwrap();
@@ -65,14 +65,17 @@ fn a_statement_is_written_as_pdf_and_workbook() {
     let dir = tempfile::tempdir().unwrap();
     let config = StatementConfig::default();
     let statement = prepare(&journal, id, "2026-01-01", "2026-06-30", &config).unwrap();
-    write_statement_pdf(&statement, &config, &Branding::default(), &dir.path().join("s.pdf")).unwrap();
-    write_statement_xlsx(&statement, &config, &dir.path().join("s.xlsx")).unwrap();
+    // With the letterhead's logo, as printed, and without.
+    let branded = Branding::of(&journal);
+    write_statement_pdf(&statement, &config, &branded, &dir.path().join("s.pdf")).unwrap();
+    write_statement_xlsx(&statement, &config, &branded, &dir.path().join("s.xlsx")).unwrap();
+    write_statement_xlsx(&statement, &config, &Branding::default(), &dir.path().join("plain.xlsx")).unwrap();
     assert!(std::fs::read(dir.path().join("s.pdf")).unwrap().starts_with(b"%PDF-"));
 
     // One column, and savings alone: no merged single cells, nothing missing.
     let narrow = StatementConfig { show_loans: false, savings_columns: vec!["Amount".into()], columns: vec!["Date".into()], ..config };
     let statement = prepare(&journal, id, "2026-01-01", "2026-06-30", &narrow).unwrap();
-    write_statement_xlsx(&statement, &narrow, &dir.path().join("narrow.xlsx")).unwrap();
+    write_statement_xlsx(&statement, &narrow, &branded, &dir.path().join("narrow.xlsx")).unwrap();
     pdf::statement(&statement, &narrow, &Branding::default()).unwrap();
 }
 
@@ -87,10 +90,22 @@ fn a_name_is_printed_as_written_never_read_as_markup() {
 }
 
 #[test]
-fn a_logo_that_cannot_be_read_is_left_out() {
-    let (journal, _) = journal_with("Ann");
-    let branding = Branding { logo: Some("/no/such/logo.png".into()), ..Branding::default() };
+fn a_logo_that_will_not_typeset_is_left_out() {
+    let (journal, id) = journal_with("Ann");
+    let broken = Logo { kind: "png".into(), bytes: b"not an image".to_vec() };
+    let branding = Branding { logo: Some(broken), ..Branding::default() };
     assert!(pdf::table(&interest(&journal), &branding).unwrap().starts_with(b"%PDF-"));
+    let config = StatementConfig::default();
+    let statement = prepare(&journal, id, "2026-01-01", "2026-06-30", &config).unwrap();
+    assert!(pdf::statement(&statement, &config, &branding).unwrap().starts_with(b"%PDF-"));
+}
+
+#[test]
+fn the_bundled_logo_is_the_default_and_an_unreadable_one_falls_back_to_it() {
+    let (journal, _) = journal_with("Ann");
+    assert_eq!(Branding::of(&journal).logo, Some(Logo::bundled()));
+    journal.settings().set("org_logo_path", "/no/such/logo.png").unwrap();
+    assert_eq!(Branding::of(&journal).logo, Some(Logo::bundled()));
 }
 
 #[test]
@@ -98,7 +113,7 @@ fn the_shipped_logos_print() {
     let (journal, id) = journal_with("Ann");
     for logo in ["nairobi_water_sacco_logo.png", "nairobi_water_sacco_logo.jpg"] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources").join(logo);
-        let branding = Branding { logo: Some(path), org_name: "Society".into(), ..Branding::default() };
+        let branding = Branding { logo: Some(Logo::read(&path).unwrap()), org_name: "Society".into(), ..Branding::default() };
         assert!(pdf::table(&interest(&journal), &branding).unwrap().starts_with(b"%PDF-"));
         let config = StatementConfig::default();
         let statement = prepare(&journal, id, "2026-01-01", "2026-06-30", &config).unwrap();

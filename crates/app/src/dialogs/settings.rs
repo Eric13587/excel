@@ -27,6 +27,8 @@ pub struct SettingsForm {
     total_bg: [u8; 3],
     dark: bool,
     error: Option<String>,
+    /// The chosen logo file, read once for its preview.
+    logo_bytes: Option<(String, Option<egui::load::Bytes>)>,
 }
 
 fn rgb(hex: &str) -> Option<[u8; 3]> {
@@ -67,7 +69,24 @@ impl SettingsForm {
             total_bg: colour(settings.excel_total_bg(), keys::EXCEL_TOTAL_BG),
             dark: settings.app_theme() == "Dark",
             error: None,
+            logo_bytes: None,
         }
+    }
+
+    /// The logo as it will print, for showing: the bundled one, or the chosen
+    /// file when it is an image this window can draw.
+    fn preview(&mut self) -> Option<(String, egui::load::Bytes)> {
+        if self.logo.trim().is_empty() {
+            return Some(("bytes://logo/bundled.png".into(), egui::load::Bytes::Static(loanmaster_reports::BUNDLED_LOGO)));
+        }
+        if self.logo_bytes.as_ref().is_none_or(|(path, _)| *path != self.logo) {
+            let path = std::path::Path::new(self.logo.trim());
+            let drawable = path.extension().and_then(|e| e.to_str()).is_some_and(|e| ["png", "jpg", "jpeg"].contains(&e.to_ascii_lowercase().as_str()));
+            let bytes = if drawable { std::fs::read(path).ok().map(|b| egui::load::Bytes::Shared(b.into())) } else { None };
+            self.logo_bytes = Some((self.logo.clone(), bytes));
+        }
+        let (path, bytes) = self.logo_bytes.as_ref()?;
+        Some((format!("bytes://logo/{path}"), bytes.clone()?))
     }
 
     /// The values to write, or what is wrong with the form.
@@ -118,97 +137,107 @@ impl SettingsForm {
         let mut close = false;
         egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
             ui.set_width(520.0);
-            let section = |ui: &mut egui::Ui, title: &str| {
-                ui.add_space(6.0);
-                ui.label(RichText::new(title).strong().size(15.0));
-                ui.separator();
-            };
+            egui::ScrollArea::vertical().max_height(widgets::dialog_room(ctx)).show(ui, |ui| {
+                let section = |ui: &mut egui::Ui, title: &str| {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(title).strong().size(15.0));
+                    ui.separator();
+                };
 
-            section(ui, "Organization");
-            egui::Grid::new("settings_org").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                let label = ui.label("Organization name");
-                ui.add(egui::TextEdit::singleline(&mut self.org_name).hint_text("e.g. Umoja Staff Co-operative").desired_width(320.0)).labelled_by(label.id);
-                ui.end_row();
-                ui.label("Logo");
-                ui.horizontal(|ui| {
+                section(ui, "Organization");
+                egui::Grid::new("settings_org").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    let label = ui.label("Organization name");
+                    ui.add(egui::TextEdit::singleline(&mut self.org_name).hint_text("e.g. Umoja Staff Co-operative").desired_width(320.0)).labelled_by(label.id);
+                    ui.end_row();
+                    ui.label("Logo");
+                    match self.preview() {
+                        Some((uri, bytes)) => {
+                            ui.add(egui::Image::from_bytes(uri, bytes).fit_to_exact_size(egui::vec2(140.0, 64.0)));
+                        }
+                        None => {
+                            ui.label(RichText::new("(no preview for this kind of image)").small().color(p.muted));
+                        }
+                    }
+                    ui.end_row();
+                    ui.label("");
                     let shown = if self.logo.is_empty() { "Bundled default logo".to_string() } else { self.logo.clone() };
                     ui.add(egui::Label::new(RichText::new(shown).color(if self.logo.is_empty() { p.muted } else { p.text })).truncate()).on_hover_text(&self.logo);
+                    ui.end_row();
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        if ui.button("Browse…").clicked()
+                            && let Some(path) = files::pick("Choose Logo", &[("Images", &["png", "jpg", "jpeg", "gif", "svg"])])
+                        {
+                            self.logo = path.display().to_string();
+                        }
+                        if ui.add_enabled(!self.logo.is_empty(), egui::Button::new("Clear")).clicked() {
+                            self.logo.clear();
+                        }
+                    });
+                    ui.end_row();
                 });
-                ui.end_row();
-                ui.label("");
-                ui.horizontal(|ui| {
-                    if ui.button("Browse…").clicked()
-                        && let Some(path) = files::pick("Choose Logo", &[("Images", &["png", "jpg", "jpeg", "gif", "svg"])])
-                    {
-                        self.logo = path.display().to_string();
-                    }
-                    if ui.add_enabled(!self.logo.is_empty(), egui::Button::new("Clear")).clicked() {
-                        self.logo.clear();
-                    }
+                ui.label(RichText::new("Shown on statements, reports and exports. Leave the logo blank to use the bundled one.").small().color(p.muted));
+
+                section(ui, "Financial");
+                egui::Grid::new("settings_financial").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Financial year starts in");
+                    month_picker(ui, "settings_fy", &mut self.fy_month);
+                    ui.end_row();
+                    let label = ui.label("Loan interest rate");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.rate).desired_width(80.0).horizontal_align(egui::Align::RIGHT)).labelled_by(label.id);
+                        ui.label("%");
+                    })
+                    .response
+                    .on_hover_text("The rate a new loan is written at unless another is given. Existing loans keep their own rate.");
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut self.deduct_same_month, "Allow deduction in the same month as issue");
+                    ui.end_row();
                 });
-                ui.end_row();
-            });
-            ui.label(RichText::new("Shown on statements, reports and exports. Leave the logo blank to use the bundled one.").small().color(p.muted));
 
-            section(ui, "Financial");
-            egui::Grid::new("settings_financial").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Financial year starts in");
-                month_picker(ui, "settings_fy", &mut self.fy_month);
-                ui.end_row();
-                let label = ui.label("Loan interest rate");
+                section(ui, "Funds");
+                egui::Grid::new("settings_funds").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Christmas withdrawal month");
+                    month_picker(ui, "settings_unlock", &mut self.unlock_month);
+                    ui.end_row();
+                    let label = ui.label("Default monthly savings");
+                    ui.add(egui::TextEdit::singleline(&mut self.savings_increment).desired_width(120.0).horizontal_align(egui::Align::RIGHT)).labelled_by(label.id);
+                    ui.end_row();
+                    let label = ui.label("Default monthly Christmas");
+                    ui.add(egui::TextEdit::singleline(&mut self.christmas_increment).desired_width(120.0).horizontal_align(egui::Align::RIGHT)).labelled_by(label.id);
+                    ui.end_row();
+                });
+                ui.label(RichText::new("The defaults apply when a member has no contribution history to infer an amount from.").small().color(p.muted));
+
+                section(ui, "Reports");
+                egui::Grid::new("settings_reports").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Workbook header background");
+                    ui.color_edit_button_srgb(&mut self.header_bg);
+                    ui.end_row();
+                    ui.label("Workbook total row background");
+                    ui.color_edit_button_srgb(&mut self.total_bg);
+                    ui.end_row();
+                    ui.label("");
+                    if ui.button("Reset Colours").clicked() {
+                        self.header_bg = rgb(default_for(keys::EXCEL_HEADER_BG)).unwrap_or_default();
+                        self.total_bg = rgb(default_for(keys::EXCEL_TOTAL_BG)).unwrap_or_default();
+                    }
+                    ui.end_row();
+                });
+
+                section(ui, "Appearance");
                 ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.rate).desired_width(80.0).horizontal_align(egui::Align::RIGHT)).labelled_by(label.id);
-                    ui.label("%");
-                })
-                .response
-                .on_hover_text("The rate a new loan is written at unless another is given. Existing loans keep their own rate.");
-                ui.end_row();
-                ui.label("");
-                ui.checkbox(&mut self.deduct_same_month, "Allow deduction in the same month as issue");
-                ui.end_row();
-            });
+                    ui.label("Theme");
+                    ui.radio_value(&mut self.dark, false, "Light");
+                    ui.radio_value(&mut self.dark, true, "Dark");
+                });
 
-            section(ui, "Funds");
-            egui::Grid::new("settings_funds").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Christmas withdrawal month");
-                month_picker(ui, "settings_unlock", &mut self.unlock_month);
-                ui.end_row();
-                let label = ui.label("Default monthly savings");
-                ui.add(egui::TextEdit::singleline(&mut self.savings_increment).desired_width(120.0).horizontal_align(egui::Align::RIGHT)).labelled_by(label.id);
-                ui.end_row();
-                let label = ui.label("Default monthly Christmas");
-                ui.add(egui::TextEdit::singleline(&mut self.christmas_increment).desired_width(120.0).horizontal_align(egui::Align::RIGHT)).labelled_by(label.id);
-                ui.end_row();
-            });
-            ui.label(RichText::new("The defaults apply when a member has no contribution history to infer an amount from.").small().color(p.muted));
-
-            section(ui, "Reports");
-            egui::Grid::new("settings_reports").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Workbook header background");
-                ui.color_edit_button_srgb(&mut self.header_bg);
-                ui.end_row();
-                ui.label("Workbook total row background");
-                ui.color_edit_button_srgb(&mut self.total_bg);
-                ui.end_row();
-                ui.label("");
-                if ui.button("Reset Colours").clicked() {
-                    self.header_bg = rgb(default_for(keys::EXCEL_HEADER_BG)).unwrap_or_default();
-                    self.total_bg = rgb(default_for(keys::EXCEL_TOTAL_BG)).unwrap_or_default();
+                if let Some(error) = &self.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(p.danger, error);
                 }
-                ui.end_row();
             });
-
-            section(ui, "Appearance");
-            ui.horizontal(|ui| {
-                ui.label("Theme");
-                ui.radio_value(&mut self.dark, false, "Light");
-                ui.radio_value(&mut self.dark, true, "Dark");
-            });
-
-            if let Some(error) = &self.error {
-                ui.add_space(6.0);
-                ui.colored_label(p.danger, error);
-            }
             super::footer(ui, |ui| {
                 if widgets::solid(ui, "Save", p.accent).clicked() && self.save(actions) {
                     close = true;

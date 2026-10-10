@@ -1,13 +1,13 @@
-//! Member statements, a batch at a time: who, which months, what to show,
-//! PDF or workbook — then one file per member in a folder of the user's
-//! choosing.
+//! Member statements, a batch at a time: who, which loans and which months,
+//! what to show, PDF or workbook — then one file per member in a folder of
+//! the user's choosing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, NaiveDate};
 use eframe::egui::{self, RichText};
-use loanmaster_core::statements::{self, LOAN_COLUMNS, SAVINGS_COLUMNS, Statement, StatementConfig};
+use loanmaster_core::statements::{self, LOAN_COLUMNS, LoanScope, SAVINGS_COLUMNS, Statement, StatementConfig};
 use loanmaster_core::{Journal, dates};
 use loanmaster_reports::Branding;
 
@@ -24,16 +24,27 @@ struct Person {
     retired: bool,
 }
 
+/// The months a statement covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Period {
+    /// From the first day of the financial year to today.
+    FinancialYear,
+    /// From each member's own first entry to today.
+    WholeHistory,
+    /// The whole months between two dates.
+    Dates,
+}
+
 pub struct Statements {
     people: Vec<Person>,
     chosen: BTreeSet<i64>,
     filter: String,
+    loans: LoanScope,
+    period: Period,
+    /// The first day of this financial year.
+    year_start: NaiveDate,
     from: NaiveDate,
     to: NaiveDate,
-    /// The user set the start date: choosing members no longer moves it.
-    from_set: bool,
-    /// The members the start date was last worked out for.
-    from_for: BTreeSet<i64>,
     show_loans: bool,
     show_savings: bool,
     loan_columns: Columns,
@@ -57,11 +68,12 @@ impl Statements {
             people,
             chosen: BTreeSet::new(),
             filter: String::new(),
-            from: dates::add_months(today, -1),
-            // To the end of last month: the last one complete.
+            loans: LoanScope::Active,
+            period: Period::FinancialYear,
+            year_start: loanmaster_core::reports::fy_start(journal, today),
+            // Chosen dates start as last month: the last one complete.
+            from: dates::add_months(this_month, -1),
             to: dates::add_days(this_month, -1),
-            from_set: false,
-            from_for: BTreeSet::new(),
             show_loans: true,
             show_savings: true,
             loan_columns: Columns::named(&names(&LOAN_COLUMNS)),
@@ -70,22 +82,24 @@ impl Statements {
         }
     }
 
-    /// Start from the earliest entry of the members chosen, so a statement
-    /// covers their whole history unless told otherwise.
-    fn follow_selection(&mut self, journal: &Journal) {
-        if self.from_set || self.chosen == self.from_for {
-            return;
+    /// The dates one member's statement covers.
+    fn span(&self, journal: &Journal, member: i64) -> (NaiveDate, NaiveDate) {
+        let today = chrono::Local::now().date_naive();
+        match self.period {
+            Period::FinancialYear => (self.year_start, today),
+            Period::WholeHistory => {
+                let first = journal.ledger().earliest_date_for(&[member]).ok().flatten();
+                (first.as_deref().and_then(|d| dates::parse(dates::date_part(d))).unwrap_or(today).min(today), today)
+            }
+            Period::Dates => statements::whole_months(self.from, self.to),
         }
-        self.from_for = self.chosen.clone();
-        let ids: Vec<i64> = self.chosen.iter().copied().collect();
-        let earliest = if ids.is_empty() { None } else { journal.ledger().earliest_date_for(&ids).ok().flatten() };
-        self.from = earliest.as_deref().and_then(|d| dates::parse(dates::date_part(d))).unwrap_or_else(|| dates::add_months(chrono::Local::now().date_naive(), -1));
     }
 
     fn config(&self) -> StatementConfig {
         StatementConfig {
             show_loans: self.show_loans,
             show_savings: self.show_savings,
+            loans: self.loans,
             columns: self.loan_columns.chosen(),
             savings_columns: self.savings_columns.chosen(),
             ..StatementConfig::default()
@@ -101,24 +115,23 @@ impl Statements {
             actions.push(Action::Notice(Notice::info("Statements", "Include the loans section, the savings section, or both.")));
             return false;
         }
-        let (from, to) = statements::whole_months(self.from, self.to);
-        if to < from {
+        if self.period == Period::Dates && self.to < self.from {
             actions.push(Action::Notice(Notice::info("Statements", "The period ends before it starts.")));
             return false;
         }
         let Some(folder) = super::files::folder("Select Folder to Save Statements") else { return false };
         let config = self.config();
-        let (from, to) = (dates::format(from), dates::format(to));
         // Read now, on this thread; the task only typesets and writes.
         let mut prepared: Vec<(String, Result<Statement, String>)> = Vec::new();
         for person in self.people.iter().filter(|p| self.chosen.contains(&p.id)) {
-            let statement = statements::prepare(journal, person.id, &from, &to, &config).map_err(|e| {
+            let (from, to) = self.span(journal, person.id);
+            let statement = statements::prepare(journal, person.id, &dates::format(from), &dates::format(to), &config).map_err(|e| {
                 log::error!("Statement for {} ({}) could not be prepared: {e}", person.name, person.id);
                 e.to_string()
             });
             prepared.push((person.name.clone(), statement));
         }
-        let task = batch(ctx, prepared, config, Branding::of(journal), folder, from, to, self.excel);
+        let task = batch(ctx, prepared, config, Branding::of(journal), folder, self.excel);
         actions.push(Action::Task(Box::new(task)));
         true
     }
@@ -128,7 +141,7 @@ impl Statements {
         let mut open = true;
         let mut close = false;
         egui::Window::new("Statements").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.horizontal_top(|ui| {
+            egui::ScrollArea::vertical().max_height(widgets::dialog_room(ctx)).show(ui, |ui| ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(330.0);
                     ui.label(RichText::new("Members").strong());
@@ -172,18 +185,44 @@ impl Statements {
                 });
                 ui.add_space(16.0);
                 ui.vertical(|ui| {
-                    self.follow_selection(journal);
+                    ui.label(RichText::new("Loans").strong());
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.loans, LoanScope::Active, "Active loans");
+                        ui.radio_value(&mut self.loans, LoanScope::All, "All loans");
+                    });
+                    let loans = match self.loans {
+                        LoanScope::Active => "Loans still owing when the period ends, each from the balance it carried in.",
+                        LoanScope::All => "Every loan with an entry in the period, paid off or not.",
+                    };
+                    ui.label(RichText::new(loans).small().color(p.muted));
+                    ui.add_space(8.0);
                     ui.label(RichText::new("Period").strong());
                     ui.horizontal(|ui| {
-                        ui.label("From");
-                        let before = self.from;
-                        widgets::date(ui, "statements_from", &mut self.from);
-                        self.from_set |= before != self.from;
-                        ui.label("to");
-                        widgets::date(ui, "statements_to", &mut self.to);
+                        ui.radio_value(&mut self.period, Period::FinancialYear, "This financial year");
+                        ui.radio_value(&mut self.period, Period::WholeHistory, "Whole history");
+                        ui.radio_value(&mut self.period, Period::Dates, "Dates");
                     });
-                    let (from, to) = statements::whole_months(self.from, self.to);
-                    ui.label(RichText::new(format!("Whole months: {} to {}.", from.format("%-d %b %Y"), to.format("%-d %b %Y"))).small().color(p.muted));
+                    let today = chrono::Local::now().date_naive();
+                    let period = match self.period {
+                        Period::FinancialYear => format!("{} to today, {}.", self.year_start.format("%-d %b %Y"), today.format("%-d %b %Y")),
+                        Period::WholeHistory => "From each member's first entry to today: a full statement.".to_string(),
+                        Period::Dates => {
+                            ui.horizontal(|ui| {
+                                ui.label("From");
+                                widgets::date(ui, "statements_from", &mut self.from);
+                                ui.label("to");
+                                widgets::date(ui, "statements_to", &mut self.to);
+                            });
+                            let (from, to) = statements::whole_months(self.from, self.to);
+                            format!("Whole months: {} to {}.", from.format("%-d %b %Y"), to.format("%-d %b %Y"))
+                        }
+                    };
+                    ui.label(RichText::new(period).small().color(p.muted));
+                    ui.label(
+                        RichText::new("A loan or savings balance from before the period starts the statement as “Balance b/f”.")
+                            .small()
+                            .color(p.muted),
+                    );
                     ui.add_space(8.0);
                     ui.label(RichText::new("Content").strong());
                     ui.checkbox(&mut self.show_loans, "Include Loans Section");
@@ -199,7 +238,7 @@ impl Statements {
                         self.savings_columns.show(ui, "statement_savings_columns", 110.0);
                     });
                 });
-            });
+            }));
             super::footer(ui, |ui| {
                 if widgets::solid(ui, "Generate…", p.accent).on_hover_text("Choose a folder; one file is written per member").clicked() && self.generate(ctx, journal, actions) {
                     close = true;
@@ -249,17 +288,7 @@ fn names(list: &[String]) -> String {
     if list.len() <= CAP { list.join(", ") } else { format!("{}, and {} more", list[..CAP].join(", "), list.len() - CAP) }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn batch(
-    ctx: &egui::Context,
-    prepared: Vec<(String, Result<Statement, String>)>,
-    config: StatementConfig,
-    branding: Branding,
-    folder: PathBuf,
-    from: String,
-    to: String,
-    excel: bool,
-) -> Task {
+fn batch(ctx: &egui::Context, prepared: Vec<(String, Result<Statement, String>)>, config: StatementConfig, branding: Branding, folder: PathBuf, excel: bool) -> Task {
     Task::spawn(ctx, "Generating Statements", move |reporter| {
         let today = chrono::Local::now().date_naive();
         let mut outcome = Outcome::default();
@@ -282,8 +311,8 @@ fn batch(
                 continue;
             }
             let written = if excel {
-                let path = unused(&folder, statements::excel_file_name(&statement.name, &from, &to), &mut taken);
-                loanmaster_reports::write_statement_xlsx(&statement, &config, &path)
+                let path = unused(&folder, statements::excel_file_name(&statement.name, &statement.from, &statement.to), &mut taken);
+                loanmaster_reports::write_statement_xlsx(&statement, &config, &branding, &path)
             } else {
                 let path = unused(&folder, statements::pdf_file_name(&statement.name, today), &mut taken);
                 loanmaster_reports::write_statement_pdf(&statement, &config, &branding, &path)
@@ -300,7 +329,7 @@ fn batch(
         Box::new(move |actions: &mut Vec<Action>| {
             let mut lines = vec![format!("Saved {} statement(s) to:\n{}", outcome.saved.len(), folder.display())];
             if !outcome.empty.is_empty() {
-                lines.push(format!("{} skipped — no activity in this period: {}", outcome.empty.len(), names(&outcome.empty)));
+                lines.push(format!("{} skipped — nothing to show for this period: {}", outcome.empty.len(), names(&outcome.empty)));
             }
             if !outcome.failed.is_empty() {
                 lines.push(format!("{} failed — see the log: {}", outcome.failed.len(), names(&outcome.failed)));

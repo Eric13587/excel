@@ -60,11 +60,10 @@ jobs:
     - name: Build Installer (Inno Setup)
       run: iscc setup.iss
 
-    - name: Collect the portable folder
+    - name: Collect the portable copy
       run: |
-        New-Item -ItemType Directory -Force build/LoanMaster/resources | Out-Null
+        New-Item -ItemType Directory -Force build/LoanMaster | Out-Null
         Copy-Item target/release/loanmaster.exe build/LoanMaster/LoanMaster.exe
-        Copy-Item resources/nairobi_water_sacco_logo.png build/LoanMaster/resources/
 
     - name: Upload Artifact - Portable Folder
       uses: actions/upload-artifact@v4

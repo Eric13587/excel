@@ -6,7 +6,7 @@ use std::path::Path;
 
 use loanmaster_core::reports::{Table, Value};
 use loanmaster_core::statements::{LoanLine, SavingsLine, Statement, StatementConfig};
-use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook, Worksheet};
+use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Image, Workbook, Worksheet};
 
 use crate::{Branding, Result};
 
@@ -75,6 +75,10 @@ pub fn write_table(table: &Table, branding: &Branding, path: &Path) -> Result<()
 }
 
 fn loan_value(line: &LoanLine, column: &str) -> Value {
+    // A balance carried in has no movement of its own.
+    if line.brought_forward && matches!(column, "Debit" | "Interest" | "Credit" | "Notes") {
+        return Value::Blank;
+    }
     match column {
         "Date" => Value::text(&line.date),
         "Type" => Value::text(&line.event_type),
@@ -89,6 +93,9 @@ fn loan_value(line: &LoanLine, column: &str) -> Value {
 }
 
 fn savings_value(line: &SavingsLine, column: &str) -> Value {
+    if line.brought_forward && matches!(column, "Amount" | "Notes") {
+        return Value::Blank;
+    }
     match column {
         "Date" => Value::text(&line.date),
         "Type" => Value::text(&line.kind),
@@ -109,12 +116,36 @@ fn band(sheet: &mut Worksheet, row: u32, columns: usize, text: &str, format: &Fo
     Ok(())
 }
 
-/// A statement as a one-sheet workbook: the loans, each under its reference,
-/// then savings.
-pub fn write_statement(statement: &Statement, config: &StatementConfig, path: &Path) -> Result<()> {
+/// The logo in the top-left corner, about as tall as the three letterhead
+/// rows beside it. False when there is none, or it is not an image a
+/// workbook can hold (SVG).
+fn letterhead_logo(sheet: &mut Worksheet, branding: &Branding) -> bool {
+    let Some(logo) = &branding.logo else { return false };
+    let image = match Image::new_from_buffer(&logo.bytes) {
+        Ok(image) => image.set_scale_to_size(58, 58, true),
+        Err(e) => {
+            log::warn!("The logo cannot go in a workbook ({e}); it is left out");
+            return false;
+        }
+    };
+    match sheet.insert_image(0, 0, &image) {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("The logo could not be placed ({e}); it is left out");
+            false
+        }
+    }
+}
+
+/// A statement as a one-sheet workbook: the letterhead, the loans, each
+/// under its reference, then savings.
+pub fn write_statement(statement: &Statement, config: &StatementConfig, branding: &Branding, path: &Path) -> Result<()> {
     let mut workbook = Workbook::new();
     let sheet = workbook.add_worksheet();
     sheet.set_name("Statement")?;
+    // Printed as the PDF is: landscape, every column on the page.
+    sheet.set_landscape();
+    sheet.set_print_fit_to_pages(1, 0);
 
     let status_color = if statement.active { "#28A745" } else { "#DC3545" };
     let title = Format::new()
@@ -141,14 +172,34 @@ pub fn write_statement(statement: &Statement, config: &StatementConfig, path: &P
         .set_font_color(color("#888888", "#888888"))
         .set_background_color(color("#F0F0F0", "#F0F0F0"));
 
-    sheet.merge_range(0, 0, 0, 7, &format!("{} - {}", config.title, statement.name), &title)?;
-    sheet.merge_range(1, 0, 1, 5, &format!("For the period: {}", statement.period), &period)?;
-    sheet.merge_range(1, 6, 1, 7, if statement.active { "Active" } else { "Inactive" }, &status)?;
-    for i in 0..config.columns.len().max(1) {
+    let carried = cell.clone().set_italic().set_font_color(color("#666666", "#666666"));
+    let carried_money = money.clone().set_italic().set_font_color(color("#666666", "#666666"));
+    let org = Format::new().set_bold().set_font_size(14);
+    let details = Format::new().set_font_size(10);
+
+    // The letterhead: the logo at the top left, the society and the
+    // statement beside it.
+    let first = if letterhead_logo(sheet, branding) { 1 } else { 0 };
+    let last = 7u16;
+    sheet.merge_range(0, first, 0, last, &branding.org_name, &org)?;
+    sheet.merge_range(1, first, 1, last, &format!("{} - {}", config.title, statement.name), &title)?;
+    sheet.merge_range(2, first, 2, last - 2, &format!("For the period: {}", statement.period), &period)?;
+    sheet.merge_range(2, last - 1, 2, last, if statement.active { "Active" } else { "Inactive" }, &status)?;
+    let mut who: Vec<String> = Vec::new();
+    if !statement.pf_no.is_empty() {
+        who.push(format!("PF No: {}", statement.pf_no));
+    }
+    if !statement.phone.is_empty() {
+        who.push(format!("Contact: {}", statement.phone));
+    }
+    if !who.is_empty() {
+        sheet.merge_range(3, first, 3, last, &who.join("    "), &details)?;
+    }
+    for i in 0..config.columns.len().max(8) {
         sheet.set_column_width(col(i), 15.0)?;
     }
 
-    let mut row = 3u32;
+    let mut row = 5u32;
     if config.show_loans {
         for loan in &statement.loans {
             band(sheet, row, config.columns.len(), &format!("Loan Reference: {}", loan.reference), &section)?;
@@ -161,8 +212,9 @@ pub fn write_statement(statement: &Statement, config: &StatementConfig, path: &P
                 if let Some(text) = &line.annotation {
                     band(sheet, row, config.columns.len(), text, &note)?;
                 } else {
+                    let (text, number) = if line.brought_forward { (&carried, &carried_money) } else { (&cell, &money) };
                     for (i, name) in config.columns.iter().enumerate() {
-                        write_value(sheet, row, col(i), &loan_value(line, name), &cell, &money)?;
+                        write_value(sheet, row, col(i), &loan_value(line, name), text, number)?;
                     }
                 }
                 row += 1;
@@ -178,8 +230,9 @@ pub fn write_statement(statement: &Statement, config: &StatementConfig, path: &P
         }
         row += 1;
         for line in &statement.savings {
+            let (text, number) = if line.brought_forward { (&carried, &carried_money) } else { (&cell, &money) };
             for (i, name) in config.savings_columns.iter().enumerate() {
-                write_value(sheet, row, col(i), &savings_value(line, name), &cell, &money)?;
+                write_value(sheet, row, col(i), &savings_value(line, name), text, number)?;
             }
             row += 1;
         }
