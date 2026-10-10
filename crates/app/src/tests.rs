@@ -596,3 +596,76 @@ fn a_roster_spreadsheet_updates_and_adds_members() {
     let journal = &harness.state().workspace.as_ref().unwrap().journal;
     assert_eq!(journal.members().get(ann).unwrap().unwrap().phone, "0711000001");
 }
+
+// ------------------------------------------------------------------ smoke
+
+/// Every screen over a real journal, to catch what a small sample cannot.
+/// Point `LOANMASTER_SMOKE` at a *copy* of a journal and run with
+/// `cargo test --release -p loanmaster -- --ignored smoke`. It takes no
+/// screenshots: they would hold the members' data.
+#[test]
+#[ignore = "needs LOANMASTER_SMOKE=<a copy of a journal>"]
+fn smoke_every_screen_over_a_real_journal() {
+    use crate::screens::grid::Tab as GridTab;
+    use crate::screens::member::Tab;
+    use crate::workspace::Screen;
+    let Some(path) = std::env::var_os("LOANMASTER_SMOKE") else { return };
+    let journal = Journal::open(&path, loanmaster_core::OpenOptions::default()).unwrap();
+    let ids: Vec<i64> = journal.members().all().unwrap().iter().map(|m| m.id).collect();
+    let mut harness = harness(journal);
+    let timed = |what: &str, started: std::time::Instant| eprintln!("{what}: {:.2?}", started.elapsed());
+
+    let started = std::time::Instant::now();
+    for id in &ids {
+        harness.state_mut().workspace.as_mut().unwrap().open_member(*id);
+        harness.run();
+        for tab in [Tab::Fund(Fund::Savings), Tab::Fund(Fund::Christmas), Tab::Fund(Fund::Benevolent)] {
+            if let Screen::Member(member) = &mut harness.state_mut().workspace.as_mut().unwrap().screen {
+                member.tab = tab;
+            }
+            harness.run();
+        }
+    }
+    timed(&format!("{} members' ledgers, every tab", ids.len()), started);
+
+    let started = std::time::Instant::now();
+    harness.state_mut().workspace.as_mut().unwrap().open_grid();
+    harness.run();
+    for tab in [GridTab::Savings, GridTab::Christmas, GridTab::Benevolent, GridTab::Loans] {
+        if let Screen::Grid(grid) = &mut harness.state_mut().workspace.as_mut().unwrap().screen {
+            grid.tab = tab;
+        }
+        harness.run();
+        harness.get_by_label("Fill Forward…").click();
+        harness.run();
+        // The proposal, or the note that there is nothing to fill.
+        let close = if harness.query_by_label("Stage Them").is_some() { "Cancel" } else { "Close" };
+        harness.get_by_label(close).click();
+        harness.run();
+    }
+    timed("the grid's four tabs with Fill Forward", started);
+
+    let started = std::time::Instant::now();
+    harness.state_mut().workspace.as_mut().unwrap().screen = Screen::Dashboard;
+    harness.run();
+    for (menu_name, item) in [
+        ("Reports", "Loan (Quarterly) Report…"),
+        ("Reports", "Savings / Shares Report…"),
+        ("Reports", "Christmas Report…"),
+        ("Reports", "Benevolent Report…"),
+        ("Reports", "Loans in Arrears…"),
+        ("Reports", "Members List (Excel / PDF)…"),
+        ("Reports", "Statements…"),
+        ("Tools", "Activity Log…"),
+    ] {
+        menu(&mut harness, menu_name, item);
+        // A window may answer with a notice instead ("Nothing is in
+        // arrears"), which would hold the next menu shut.
+        let app = harness.state_mut();
+        app.notices.clear();
+        app.workspace.as_mut().unwrap().dialogs.clear();
+        harness.run();
+    }
+    timed("every report and tool window", started);
+}
+

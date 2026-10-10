@@ -1046,13 +1046,15 @@ impl<S: Sheet> Page<S> {
                             self.sheet.noun()
                         ));
                         ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!(
-                                "Only months that were missed are filled — never one still to come, and never one that already has its {}. Nothing is written until you press Save Changes.",
-                                self.sheet.noun()
-                            ))
-                            .color(p.muted),
-                        );
+                        let rule = if self.sheet.is_loans() {
+                            "Only the months each loan is due are filled, in order from its next due month — never a suspended month, and never one still to come.".to_string()
+                        } else {
+                            let noun = self.sheet.noun();
+                            format!(
+                                "Only months that were missed are filled — never a month before the member's account began, never a month still to come, and never one that already has its {noun}. A month holding only a withdrawal still gets its {noun}, beside it."
+                            )
+                        };
+                        ui.label(RichText::new(format!("{rule} Nothing is written until you press Save Changes.")).color(p.muted));
                         for note in &fill.notes {
                             ui.label(RichText::new(format!("• {note}")).color(p.muted));
                         }
