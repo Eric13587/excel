@@ -39,6 +39,7 @@ The ledger, the loans and the members are then compared column by column.
 | 15 report tables: five quarters of the interest and shares reports, the three fund reports, the members list, arrears | identical, cell by cell |
 | 240 statements: every member, over a financial year and over all time | identical, except the gross figures listed under [Statements](#statements) |
 | The whole production journal imported into an empty one | all 120 members, 124 loans and 3,116 ledger entries; every loan balance, due date and fund balance identical |
+| Every screen of the application over the production journal: each member's ledger on every tab, the Ledger Grid's tabs with Fill Forward, every report and tool window (the opt-in smoke test in `crates/app/src/tests.rs`) | opens without error |
 
 The scenarios stop short of the cases listed below, where 2.0 differs on
 purpose.

@@ -2,9 +2,10 @@
 
 What happens, row by row, when a month column — or several — is deleted in the
 Ledger Grid, and why each rule is the one it is. This is the specification; the
-code in `src/services/fund_grid.py`, `src/services/loan_grid.py` and
-`src/views/fund_grid.py` implements it, and `tests/test_grid_delete_months.py`
-holds it to it.
+code in `crates/core/src/grid/fund.rs`, `crates/core/src/grid/loan.rs` and
+`crates/app/src/screens/grid/` implements it, and the tests beside the grid
+code (`crates/core/src/grid/fund/tests.rs`, `crates/core/src/grid/loan/tests.rs`)
+hold it to it.
 
 ---
 
@@ -147,7 +148,7 @@ change the total interest the member pays; it changes when the principal is
 repaid.
 
 **Why the two differ.** The loan's history is replayed by one derivation
-(`src/services/loan_derivation.py`), which charges interest month by month up to
+(`crates/core/src/loans/derivation.rs`), which charges interest month by month up to
 the loan's last entry. Removing a charge from the *middle* would leave a month
 the schedule says was charged and the ledger says was not, and the loan would
 stop reconciling with its own history. Removing it from the *end* is precisely
