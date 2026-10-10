@@ -11,8 +11,9 @@ every place 2.0 behaves differently on purpose, is in
 ## Features
 
 - **Members** — roster with PF/ID numbers and membership status. A member who
-  retires, resigns, is terminated or dies has their savings withdrawn; they
-  can be reinstated. Members List export (Excel / PDF / CSV).
+  retires, resigns, is terminated or dies is paid out their savings and
+  Christmas savings; they can be reinstated. Members List export (Excel /
+  PDF / CSV).
 - **Loans** — issue, monthly deductions, catch-up, top-ups, buy-offs,
   suspensions, and corrections to any entry.
 - **Savings** — deposits, withdrawals, catch-up.

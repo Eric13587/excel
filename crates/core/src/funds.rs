@@ -211,14 +211,15 @@ pub fn payout(journal: &Journal, member_id: i64, amount: f64, date: &str, notes:
     post(journal, Posting::new(Fund::Benevolent, member_id, date, WITHDRAWAL, amount, notes))
 }
 
-/// Withdraw a member's whole savings balance — what retiring does. Returns
+/// Withdraw a member's whole balance in one fund — what leaving does, in any
+/// month: a leaving payout is not held to the Christmas unlock month. Returns
 /// the amount withdrawn (0 when there was nothing).
-pub fn withdraw_all_savings(journal: &Journal, member_id: i64, date: &str, notes: &str) -> Result<f64> {
-    let balance = journal.funds().balance(Fund::Savings, member_id)?;
+pub fn withdraw_all(journal: &Journal, fund: Fund, member_id: i64, date: &str, notes: &str) -> Result<f64> {
+    let balance = journal.funds().balance(fund, member_id)?;
     if balance <= 0.0 {
         return Ok(0.0);
     }
-    post(journal, Posting::new(Fund::Savings, member_id, date, WITHDRAWAL, balance, notes))?;
+    post(journal, Posting::new(fund, member_id, date, WITHDRAWAL, balance, notes))?;
     Ok(balance)
 }
 
@@ -391,7 +392,7 @@ mod tests {
         deposit(&journal, Fund::Savings, ann, 1000.0, "2026-01-01", "").unwrap();
         journal.members().set_status(ann, "Retired", Some("2026-02-01")).unwrap();
         assert!(deposit(&journal, Fund::Savings, ann, 100.0, "2026-01-15", "").is_err());
-        assert_eq!(withdraw_all_savings(&journal, ann, "2026-02-01", "Retirement withdrawal").unwrap(), 1000.0);
+        assert_eq!(withdraw_all(&journal, Fund::Savings, ann, "2026-02-01", "Retirement withdrawal").unwrap(), 1000.0);
     }
 
     #[test]

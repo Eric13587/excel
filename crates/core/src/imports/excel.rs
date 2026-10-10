@@ -246,9 +246,8 @@ pub struct Outcome {
     pub deposits: usize,
     pub total: f64,
     pub warnings: Vec<String>,
-    /// Members the sheet marked as having left, and what was withdrawn from
-    /// their savings because of it.
-    pub left: Vec<(String, f64)>,
+    /// Members the sheet marked as having left, and what they were paid out.
+    pub left: Vec<(String, crate::membership::Payout)>,
     /// The safety copy taken before writing.
     pub backup: Option<std::path::PathBuf>,
 }
@@ -310,12 +309,12 @@ pub fn apply(journal: &Journal, plan: &Plan) -> Result<Outcome> {
                         id_no: id_no.unwrap_or(current.id_no),
                     };
                     journal.members().update(id, &details)?;
-                    // Leaving by the sheet pays the savings out, as leaving
-                    // by any other door does.
+                    // Leaving by the sheet pays the member out, as leaving by
+                    // any other door does.
                     match crate::membership::settle_status_change(journal, id, &current.employment_status, &details.employment_status) {
-                        Ok(withdrawn) if withdrawn > 0.0 => out.left.push((current.name.clone(), withdrawn)),
+                        Ok(paid) if paid.total() > 0.0 => out.left.push((current.name.clone(), paid)),
                         Ok(_) => {}
-                        Err(e) if e.is_user_facing() => out.warnings.push(format!("{}: {e} Their savings were left in place.", current.name)),
+                        Err(e) if e.is_user_facing() => out.warnings.push(format!("{}: {e} Their money was left in place.", current.name)),
                         Err(e) => return Err(e),
                     }
                     if plan.kind == SheetKind::Roster {

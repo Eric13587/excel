@@ -96,16 +96,18 @@ purpose.
 
 ### Members leaving
 
-* **Every way of leaving withdraws the member's savings** — retiring,
-  resigning, termination or death — noted by the reason ("Resignation
-  withdrawal"), on the leaving date, whether it is recorded from the
-  dashboard, by changing the status on the member's form, or by a roster
-  import. 1.x withdrew them only through the Retire button; a status changed
-  on the form, even to Retired, left the savings where they were. A
-  suspended member has not left and keeps their savings.
+* **Every way of leaving pays the member out** — retiring, resigning,
+  termination or death: their savings and their Christmas savings are
+  withdrawn in full on the leaving date, noted by the reason ("Resignation
+  withdrawal"), whether it is recorded from the dashboard, by changing the
+  status on the member's form, or by a roster import. A leaving payout is not
+  held to the Christmas unlock month. Benevolent contributions stay in the
+  pool. 1.x withdrew the savings only, and only through the Retire button; a
+  status changed on the form, even to Retired, left everything where it was.
+  A suspended member has not left and keeps their money.
 * **Leaving is refused on a date still to come, or before the member's last
-  savings entry**: a withdrawal dated before later entries would run the
-  balance below zero in between. 1.x always used today's date.
+  savings or Christmas entry**: a withdrawal dated before later entries would
+  run the balance below zero in between. 1.x always used today's date.
 
 ### Loan references
 

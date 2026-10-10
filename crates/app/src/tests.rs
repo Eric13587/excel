@@ -727,25 +727,33 @@ fn status_of(harness: &Harness<'_, LoanMasterApp>, name: &str) -> String {
     harness.state().workspace.as_ref().unwrap().journal.members().get(id).unwrap().unwrap().employment_status
 }
 
+fn christmas(harness: &Harness<'_, LoanMasterApp>, name: &str) -> f64 {
+    let id = member_id(harness, name);
+    harness.state().workspace.as_ref().unwrap().journal.funds().balance(Fund::Christmas, id).unwrap()
+}
+
 #[test]
-fn a_member_leaving_says_how_and_their_savings_are_withdrawn() {
+fn a_member_leaving_says_how_and_is_paid_out() {
     let mut harness = harness(sample());
+    let peter = member_id(&harness, "PETER MWANGI");
+    let journal = &harness.state().workspace.as_ref().unwrap().journal;
+    funds::post(journal, Posting::new(Fund::Christmas, peter, "2026-02-05", "Deposit", 1000.0, "")).unwrap();
     harness.get_by_label("PETER MWANGI").click_secondary();
     harness.run();
     harness.get_by_label("Retire or Leave…").click();
     harness.run();
     harness.get_by_label("Resigned").click();
     harness.run();
-    harness.get_by_label_contains("noted “Resignation withdrawal”");
+    harness.get_by_label_contains("savings of 22,500 and Christmas savings of 1,000 are paid out in full that day, noted “Resignation withdrawal”");
     shot(&mut harness, "leave");
     harness.get_by_label("Confirm").click();
     harness.run();
     assert_eq!(status_of(&harness, "PETER MWANGI"), "Resigned");
-    assert_eq!(savings(&harness, "PETER MWANGI"), 0.0);
+    assert_eq!((savings(&harness, "PETER MWANGI"), christmas(&harness, "PETER MWANGI")), (0.0, 0.0));
 }
 
 #[test]
-fn the_form_warns_before_a_status_change_withdraws_savings() {
+fn the_form_warns_before_a_status_change_pays_a_member_out() {
     let mut harness = harness(sample());
     let ann = member_id(&harness, "ANN WANJIRU");
     let form = {
@@ -758,8 +766,8 @@ fn the_form_warns_before_a_status_change_withdraws_savings() {
     harness.run();
     harness.get_by_label("Deceased").click();
     harness.run();
-    harness.get_by_label_contains("withdraws their savings of 22,500 in full");
-    harness.get_by_label("Save and Withdraw Savings").click();
+    harness.get_by_label_contains("pays out their savings of 22,500 in full");
+    harness.get_by_label("Save and Pay Out").click();
     harness.run();
     assert_eq!(status_of(&harness, "ANN WANJIRU"), "Deceased");
     assert_eq!(savings(&harness, "ANN WANJIRU"), 0.0);

@@ -4,8 +4,7 @@ use chrono::NaiveDate;
 use eframe::egui::{self, RichText};
 use loanmaster_core::db::members::MemberDetails;
 use loanmaster_core::db::model::{Fund, MEMBER_STATUSES};
-use loanmaster_core::membership::{self, FieldError, LEAVING};
-use loanmaster_core::money::shillings;
+use loanmaster_core::membership::{self, FieldError, LEAVING, Payout};
 use loanmaster_core::{Journal, Result, dates};
 
 use crate::app::{Action, Notice};
@@ -19,10 +18,10 @@ pub struct MemberForm {
     /// The name the user was told is taken: saving it again goes ahead.
     warned_name: Option<String>,
     problem: Option<String>,
-    /// The status the member had when the form opened, and their savings:
+    /// The status the member had when the form opened, and what they hold:
     /// a change of status that takes them out of the society pays it out.
     was: String,
-    savings: f64,
+    holding: Payout,
 }
 
 impl MemberForm {
@@ -34,16 +33,16 @@ impl MemberForm {
             warned_name: None,
             problem: None,
             was: "Active".into(),
-            savings: 0.0,
+            holding: Payout::default(),
         }
     }
 
     pub fn edit(journal: &Journal, id: i64) -> Result<MemberForm> {
         let member = journal.members().get(id)?.ok_or(loanmaster_core::Error::MemberNotFound(id))?;
-        let savings = journal.funds().balance(Fund::Savings, id)?;
+        let holding = holding(journal, id)?;
         Ok(MemberForm {
             was: if member.employment_status.is_empty() { "Active".into() } else { member.employment_status.clone() },
-            savings,
+            holding,
             id: Some(id),
             details: MemberDetails {
                 name: member.name,
@@ -59,9 +58,9 @@ impl MemberForm {
         })
     }
 
-    /// Saving would take the member out of the society, paying out savings.
+    /// Saving would take the member out of the society, paying them out.
     fn pays_out(&self) -> bool {
-        self.id.is_some() && self.savings > 0.0 && membership::is_leaving(&self.details.employment_status) && !membership::is_leaving(&self.was)
+        self.id.is_some() && self.holding.total() > 0.0 && membership::is_leaving(&self.details.employment_status) && !membership::is_leaving(&self.was)
     }
 
     fn error(&self, field: &str) -> Option<&str> {
@@ -80,15 +79,15 @@ impl MemberForm {
             return false;
         }
         let result = match self.id {
-            Some(id) => membership::update(journal, id, &self.details).map(|withdrawn| (id, withdrawn)),
-            None => membership::add(journal, &self.details).map(|id| (id, 0.0)),
+            Some(id) => membership::update(journal, id, &self.details).map(|paid| (id, paid)),
+            None => membership::add(journal, &self.details).map(|id| (id, Payout::default())),
         };
         match result {
-            Ok((id, withdrawn)) => {
+            Ok((id, paid)) => {
                 let verb = if self.id.is_some() { "saved" } else { "added" };
                 let mut status = format!("{name} {verb}.");
-                if withdrawn > 0.0 {
-                    status.push_str(&format!(" Savings of {} were withdrawn.", shillings(withdrawn)));
+                if let Some(paid) = paid.describe() {
+                    status.push_str(&format!(" Paid out {paid}."));
                 }
                 actions.push(Action::Status(status));
                 actions.push(Action::Changed);
@@ -139,9 +138,9 @@ impl MemberForm {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
-                                    "Saving records them as having left today and withdraws their savings of {} in full. \
+                                    "Saving records them as having left today and pays out their {} in full. \
                                      To record another leaving date, use Retire or Leave on the dashboard.",
-                                    shillings(self.savings)
+                                    self.holding.describe().unwrap_or_default()
                                 ))
                                 .small()
                                 .color(p.warning),
@@ -158,7 +157,7 @@ impl MemberForm {
                 ui.label(RichText::new(problem).color(p.warning));
             }
             super::footer(ui, |ui| {
-                let label = if self.pays_out() { "Save and Withdraw Savings" } else if self.id.is_some() { "Save" } else { "Add Member" };
+                let label = if self.pays_out() { "Save and Pay Out" } else if self.id.is_some() { "Save" } else { "Add Member" };
                 if (widgets::solid(ui, label, p.accent).clicked() || submitted) && self.save(journal, actions) {
                     open = false;
                 }
@@ -178,7 +177,7 @@ pub struct Leave {
     name: String,
     status: &'static str,
     date: NaiveDate,
-    savings: f64,
+    holding: Payout,
     loans: bool,
     problem: Option<String>,
 }
@@ -191,7 +190,7 @@ impl Leave {
             name,
             status: LEAVING[0].0,
             date: chrono::Local::now().date_naive(),
-            savings: journal.funds().balance(Fund::Savings, id)?,
+            holding: holding(journal, id)?,
             loans: membership::has_outstanding_loans(journal, id)?,
             problem: None,
         })
@@ -199,10 +198,10 @@ impl Leave {
 
     fn confirm(&mut self, journal: &Journal, actions: &mut Vec<Action>) -> bool {
         match membership::leave(journal, self.id, self.status, Some(&dates::format(self.date))) {
-            Ok(withdrawn) => {
+            Ok(paid) => {
                 let mut status = format!("{} is recorded as {}.", self.name, self.status.to_lowercase());
-                if withdrawn > 0.0 {
-                    status.push_str(&format!(" Savings of {} were withdrawn.", shillings(withdrawn)));
+                if let Some(paid) = paid.describe() {
+                    status.push_str(&format!(" Paid out {paid}."));
                 }
                 actions.push(Action::Status(status));
                 actions.push(Action::Changed);
@@ -238,8 +237,8 @@ impl Leave {
             });
             ui.add_space(6.0);
             let note = LEAVING.iter().find(|(s, _)| *s == self.status).map(|(_, n)| *n).unwrap_or_default();
-            if self.savings > 0.0 {
-                ui.label(format!("• Their savings of {} are withdrawn in full that day, noted “{note}”.", shillings(self.savings)));
+            if let Some(holding) = self.holding.describe() {
+                ui.label(format!("• Their {holding} are paid out in full that day, noted “{note}”."));
             }
             if self.loans {
                 ui.label("• Their loans stay active until they are cleared, and still appear in the loan report.");
@@ -260,4 +259,10 @@ impl Leave {
         });
         open && !response.should_close()
     }
+}
+
+/// What a member holds that leaving pays out: their savings and Christmas
+/// savings, as they stand.
+fn holding(journal: &Journal, id: i64) -> Result<Payout> {
+    Ok(Payout { savings: journal.funds().balance(Fund::Savings, id)?, christmas: journal.funds().balance(Fund::Christmas, id)? })
 }
