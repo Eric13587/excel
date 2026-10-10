@@ -13,6 +13,7 @@ pub mod imports;
 pub mod loans;
 pub mod membership;
 pub mod money;
+pub mod notes;
 pub mod policy;
 pub mod reports;
 pub mod statements;

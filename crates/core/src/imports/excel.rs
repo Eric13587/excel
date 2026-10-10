@@ -341,7 +341,7 @@ pub fn apply(journal: &Journal, plan: &Plan) -> Result<Outcome> {
             };
             for (date, amount) in &row.months {
                 let kind = if plan.fund == Fund::Benevolent { "Contribution" } else { "Deposit" };
-                journal.funds().add(plan.fund, member, date, kind, crate::money::round2(*amount), "Excel import", None)?;
+                journal.funds().add(plan.fund, member, date, kind, crate::money::round2(*amount), "Monthly contribution (Excel import)", None)?;
                 out.deposits += 1;
                 out.total += amount;
                 credited.insert(member);

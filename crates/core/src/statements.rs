@@ -15,6 +15,7 @@ use crate::db::model::{Fund, LedgerRow, Suspension, event};
 use crate::error::{Error, Result};
 use crate::loans::service::loan_rate;
 use crate::money::{ceil, round2, total};
+use crate::notes;
 
 /// The loan columns a statement can show, in their default order.
 pub const LOAN_COLUMNS: [&str; 8] = ["Date", "Type", "Debit", "Interest", "Credit", "Balance", "Gross", "Notes"];
@@ -131,18 +132,6 @@ impl Statement {
     pub fn is_empty(&self) -> bool {
         self.loans.is_empty() && self.savings.is_empty()
     }
-}
-
-/// Notes without the markers the engine adds for itself.
-pub fn clean_notes(note: &str) -> String {
-    let mut out = note.to_string();
-    for marker in ["(Auto)", "(Catch-up)"] {
-        while let Some(at) = out.find(marker) {
-            let start = out[..at].trim_end().len();
-            out.replace_range(start..at + marker.len(), "");
-        }
-    }
-    out.trim().to_string()
 }
 
 /// A member's name made safe for a file name: letters, digits, spaces, `-`
@@ -312,13 +301,13 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                     [event::LOAN_ISSUED, event::TOP_UP, event::REPAYMENT, event::BUYOFF].contains(&row.event_type.as_str());
                 lines.push(LoanLine {
                     date: row.date.clone(),
-                    event_type: row.event_type.clone(),
+                    event_type: notes::loan_entry(&row.event_type).to_string(),
                     debit: ceil(row.added),
                     interest: ceil(row.interest_amount),
                     credit: ceil(row.deducted),
                     balance: ceil(row.balance),
                     gross: shows_gross.then(|| ceil(gross)),
-                    notes: clean_notes(&row.notes),
+                    notes: notes::loan_note(&row.notes),
                     annotation: None,
                     brought_forward: false,
                 });
@@ -382,7 +371,7 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                 kind: row.transaction_type.clone(),
                 amount: row.signed(),
                 balance: running,
-                notes: clean_notes(&row.notes),
+                notes: notes::fund_note(&row.transaction_type, &row.notes),
                 brought_forward: false,
             });
         }

@@ -498,11 +498,14 @@ impl BatchResult {
     }
 }
 
+/// What an entry made in the grid is noted as: a month's money in is the
+/// member's monthly contribution — the grid's usual entry. The marker says
+/// where it was made; statements leave it out.
 fn grid_note(fund: Fund, transaction_type: &str) -> String {
-    if fund == Fund::Benevolent && transaction_type == WITHDRAWAL {
-        "Benevolent Payout (grid entry)".into()
-    } else {
-        format!("{} (grid entry)", fund.label())
+    match transaction_type {
+        WITHDRAWAL if fund == Fund::Benevolent => "Benevolent payout (grid entry)".into(),
+        WITHDRAWAL => "Withdrawal (grid entry)".into(),
+        _ => "Monthly contribution (grid entry)".into(),
     }
 }
 

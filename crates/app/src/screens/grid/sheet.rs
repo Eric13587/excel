@@ -212,7 +212,8 @@ impl Sheet for FundSheet {
         Some(
             rows.iter()
                 .map(|r| {
-                    let notes = if r.notes.is_empty() { String::new() } else { format!(" — {}", r.notes) };
+                    let notes = loanmaster_core::notes::fund_note(&r.transaction_type, &r.notes);
+                    let notes = if notes.is_empty() { String::new() } else { format!(" — {notes}") };
                     format!("{} of {} on {}{notes}", r.transaction_type, shillings(r.amount), dates::date_part(&r.date))
                 })
                 .collect::<Vec<_>>()
@@ -425,7 +426,8 @@ impl Sheet for LoanSheet {
         (!rows.is_empty()).then(|| {
             rows.iter()
                 .map(|r| {
-                    let notes = if r.notes.is_empty() { String::new() } else { format!(" — {}", r.notes) };
+                    let notes = loanmaster_core::notes::loan_note(&r.notes);
+                    let notes = if notes.is_empty() { String::new() } else { format!(" — {notes}") };
                     format!("{} of {} on {}{notes}", r.kind, shillings(r.amount), dates::date_part(&r.date))
                 })
                 .collect::<Vec<_>>()

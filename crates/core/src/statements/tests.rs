@@ -33,9 +33,9 @@ fn a_loan_is_replayed_from_its_start_and_shown_for_the_period() {
         lines,
         [
             ("2026-03-01", BROUGHT_FORWARD, 0.0, 0.0, Some(109250.0)),
-            ("2026-03-01", event::INTEREST, 750.0, 0.0, None),
+            ("2026-03-01", "Interest Charged", 750.0, 0.0, None),
             ("2026-03-01", event::REPAYMENT, 0.0, 5750.0, Some(103500.0)),
-            ("2026-04-01", event::INTEREST, 750.0, 0.0, None),
+            ("2026-04-01", "Interest Charged", 750.0, 0.0, None),
             ("2026-04-01", event::REPAYMENT, 0.0, 5750.0, Some(97750.0)),
         ]
     );
@@ -97,8 +97,8 @@ fn an_empty_period_is_empty_and_a_bad_one_is_refused() {
 
 #[test]
 fn notes_lose_the_engines_markers_and_names_become_file_names() {
-    assert_eq!(clean_notes("Monthly Deduction (Auto)"), "Monthly Deduction");
-    assert_eq!(clean_notes("Monthly Interest Accrual  (Catch-up) (Auto)"), "Monthly Interest Accrual");
+    assert_eq!(crate::notes::without_markers("Monthly Deduction (Auto)"), "Monthly Deduction");
+    assert_eq!(crate::notes::without_markers("Monthly Interest Accrual  (Catch-up) (Auto)"), "Monthly Interest Accrual");
     assert_eq!(safe_file_name("ANN W. O'NEIL / Jr."), "ANN W ONEIL  Jr");
     assert_eq!(safe_file_name("///"), "Statement");
     assert_eq!(safe_file_name(""), "Unknown");

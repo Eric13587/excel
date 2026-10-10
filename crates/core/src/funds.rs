@@ -207,7 +207,7 @@ pub fn withdraw(
 /// A benevolent claim paid out of the pool. Does not touch the contribution
 /// schedule; contributions continue.
 pub fn payout(journal: &Journal, member_id: i64, amount: f64, date: &str, notes: &str) -> Result<f64> {
-    let notes = if notes.trim().is_empty() { "Benevolent Payout" } else { notes };
+    let notes = if notes.trim().is_empty() { "Benevolent payout" } else { notes };
     post(journal, Posting::new(Fund::Benevolent, member_id, date, WITHDRAWAL, amount, notes))
 }
 
@@ -285,7 +285,7 @@ pub fn catch_up_pot(journal: &Journal, fund: Fund, member_id: i64, monthly: Opti
     };
     let limit = dates::add_months(target, 1).with_day(1).unwrap_or(target);
     let mut next = dates::add_months(last_date, 1).with_day(1).unwrap_or(last_date);
-    let notes = if fund == Fund::Savings { "Monthly Increment (Auto)" } else { "Monthly Christmas Contribution (Auto)" };
+    let notes = "Monthly contribution (Auto)";
     journal.transaction(|| {
         let mut count = 0;
         while next < limit {
@@ -320,7 +320,7 @@ pub fn contribute_once(journal: &Journal, member_id: i64) -> Result<usize> {
         return Ok(0);
     }
     journal.transaction(|| {
-        post(journal, Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Benevolent Contribution"))?;
+        post(journal, Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Monthly contribution"))?;
         journal.funds().set_next_due(member_id, &dates::add_months_str(&due, 1).unwrap_or(due.clone()))?;
         Ok(1)
     })
@@ -341,7 +341,7 @@ pub fn catch_up_benevolent(journal: &Journal, member_id: i64, target: Option<&st
         while due <= limit {
             post(
                 journal,
-                Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Benevolent Contribution (Auto)"),
+                Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Monthly contribution (Auto)"),
             )?;
             count += 1;
             match dates::add_months_str(&due, 1) {

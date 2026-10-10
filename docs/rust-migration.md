@@ -166,6 +166,16 @@ purpose.
   page wide. 1.x's workbook had neither.
 * **The default logo is built into the program**, so it prints however the
   program was installed. 1.x read it from a file beside the program.
+* **Entries are worded for the member.** A loan's interest is "Interest
+  Charged" (1.x printed the society's "Interest Earned"), and notes say what
+  an entry is: "Monthly contribution" rather than "Savings / Shares (grid
+  entry)" or "Monthly Increment (Auto)", "Principal 100,000; interest 15,000
+  over 20 months" rather than "Principal: 100000.0, Total Interest: 15000.0",
+  "Remaining interest, due on settlement" rather than "Buyoff: Realizing
+  unearned interest". A note that only repeats the entry's type is left out,
+  and a note someone typed is printed as typed. The journal keeps every note
+  as written; the member's ledger shows the same wording, with the note as
+  written on hover, and new entries are noted in these words.
 * **Two members of the same name get a file each.** 1.x wrote both
   statements to one file name, so the second replaced the first.
 

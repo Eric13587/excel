@@ -487,7 +487,7 @@ fn table(ui: &mut egui::Ui, p: &Palette, member: i64, view: &LoanView, actions: 
                         widgets::money_or_dash(payment),
                         shillings(entry.principal_balance),
                         shillings(view.gross[*i]),
-                        entry.notes.clone(),
+                        loanmaster_core::notes::loan_note(&entry.notes),
                     ];
                     for (column, value) in cells.into_iter().enumerate() {
                         row.col(|ui| {
@@ -502,6 +502,10 @@ fn table(ui: &mut egui::Ui, p: &Palette, member: i64, view: &LoanView, actions: 
                     let mut tip = format!("Entry #{}", entry.id);
                     if entry.is_edited != 0.0 {
                         tip.push_str(" · edited by hand");
+                    }
+                    // The note as it was written, where the screen words it for the member.
+                    if !entry.notes.trim().is_empty() && loanmaster_core::notes::loan_note(&entry.notes) != entry.notes.trim() {
+                        tip.push_str(&format!("\nNoted as written: {}", entry.notes.trim()));
                     }
                     let response = response.on_hover_text(tip);
                     response.context_menu(|ui| entry_menu(ui, member, &reference, entry, actions));

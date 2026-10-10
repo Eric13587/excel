@@ -161,7 +161,12 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
                     });
                     table_row.col(|ui| widgets::right(ui, shillings(row.balance)));
                     table_row.col(|ui| {
-                        ui.label(RichText::new(&row.notes).color(p.muted));
+                        // Worded as the member's statement words it; as written on hover.
+                        let shown = loanmaster_core::notes::fund_note(&row.transaction_type, &row.notes);
+                        let label = ui.label(RichText::new(&shown).color(p.muted));
+                        if shown != row.notes.trim() && !row.notes.trim().is_empty() {
+                            label.on_hover_text(format!("Noted as written: {}", row.notes.trim()));
+                        }
                     });
                     let response = table_row.response();
                     if response.double_clicked() {

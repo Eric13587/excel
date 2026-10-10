@@ -109,7 +109,6 @@ impl Movement {
                         let result = match kind {
                             Kind::Deposit => funds::deposit(&ws.journal, fund, member, value, &day, &notes),
                             Kind::Withdraw => {
-                                let notes = if notes.is_empty() { "Withdrawal".to_string() } else { notes };
                                 funds::withdraw(&ws.journal, fund, member, value, &day, &notes, override_lock)
                             }
                             Kind::Payout => funds::payout(&ws.journal, member, value, &day, &notes),

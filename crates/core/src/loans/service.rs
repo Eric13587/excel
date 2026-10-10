@@ -19,15 +19,6 @@ use crate::error::{Error, Result};
 use crate::money::round2;
 use crate::policy::{self, Operation};
 
-/// A float as LoanMaster 1.x wrote it into notes (`15000.0`, `0.5`), so the
-/// notes of either version read alike.
-pub(crate) fn py_float(value: f64) -> String {
-    if value.is_finite() && value == value.trunc() && value.abs() < 1e16 {
-        format!("{value:.1}")
-    } else {
-        format!("{value}")
-    }
-}
 
 /// What a loan is written at: its own rate, else the journal's default.
 pub fn loan_rate(journal: &Journal, loan: &Loan) -> f64 {
@@ -151,11 +142,7 @@ pub fn issue(
             loan_ref: reference.clone(),
             added: principal,
             balance: principal,
-            notes: format!(
-                "Principal: {}, Total Interest: {}, Duration: {duration_months}m",
-                py_float(principal),
-                py_float(terms.interest_total)
-            ),
+            notes: crate::notes::issued(principal, terms.interest_total, duration_months),
             installment_amount: terms.installment,
             principal_balance: principal,
             ..NewEntry::default()
@@ -210,7 +197,7 @@ pub fn deduct(journal: &Journal, member_id: i64, reference: &str) -> Result<()> 
                 loan_ref: reference.into(),
                 added: accrual,
                 balance: running,
-                notes: "Monthly Interest Accrual".into(),
+                notes: "Monthly interest".into(),
                 interest_amount: accrual,
                 principal_balance: position.principal_balance,
                 interest_balance: running_interest,
@@ -233,7 +220,7 @@ pub fn deduct(journal: &Journal, member_id: i64, reference: &str) -> Result<()> 
             loan_ref: reference.into(),
             deducted: payment,
             balance: running - payment,
-            notes: "Monthly Deduction".into(),
+            notes: "Monthly deduction".into(),
             principal_balance: position.principal_balance - principal_pay,
             interest_balance: running_interest - interest_pay,
             principal_portion: principal_pay,
@@ -336,7 +323,7 @@ pub fn catch_up(journal: &Journal, member_id: i64, reference: &str, target: Opti
                     loan_ref: reference.into(),
                     added: accrual,
                     balance: running,
-                    notes: "Monthly Interest Accrual".into(),
+                    notes: "Monthly interest".into(),
                     interest_amount: accrual,
                     principal_balance: running_principal,
                     interest_balance: running_interest,
@@ -361,7 +348,7 @@ pub fn catch_up(journal: &Journal, member_id: i64, reference: &str, target: Opti
                 loan_ref: reference.into(),
                 deducted: payment,
                 balance: running,
-                notes: "Monthly Deduction".into(),
+                notes: "Monthly deduction".into(),
                 installment_amount: amount,
                 principal_balance: running_principal,
                 interest_balance: running_interest,
@@ -438,7 +425,7 @@ pub fn deduct_range(journal: &Journal, member_id: i64, reference: &str, from: &s
                     loan_ref: reference.into(),
                     added: accrual,
                     balance: running,
-                    notes: "Monthly Interest Accrual (Auto)".into(),
+                    notes: "Monthly interest (Auto)".into(),
                     interest_amount: accrual,
                     principal_balance: running_principal,
                     interest_balance: running_interest,
@@ -462,7 +449,7 @@ pub fn deduct_range(journal: &Journal, member_id: i64, reference: &str, from: &s
                 loan_ref: reference.into(),
                 deducted: payment,
                 balance: running,
-                notes: "Monthly Deduction (Auto)".into(),
+                notes: "Monthly deduction (Auto)".into(),
                 principal_balance: running_principal,
                 interest_balance: running_interest,
                 principal_portion: principal_pay,
@@ -544,11 +531,7 @@ pub fn top_up(
             loan_ref: reference.into(),
             added: amount,
             balance: position.balance + amount,
-            notes: format!(
-                "Top-Up: {}, Add'l Interest: {}, Duration: {new_duration}m",
-                py_float(amount),
-                py_float(top_up_interest)
-            ),
+            notes: crate::notes::topped_up(amount, top_up_interest, new_duration),
             installment_amount: new_installment,
             interest_amount: new_monthly,
             principal_balance: position.principal_balance + amount,
@@ -589,7 +572,7 @@ pub fn buyoff(journal: &Journal, member_id: i64, reference: &str, date: Option<&
                 loan_ref: reference.into(),
                 added: future,
                 balance,
-                notes: "Buyoff: Realizing unearned interest".into(),
+                notes: "Remaining interest, due on settlement".into(),
                 interest_amount: future,
                 principal_balance: principal,
                 interest_balance: interest,
@@ -605,7 +588,7 @@ pub fn buyoff(journal: &Journal, member_id: i64, reference: &str, date: Option<&
             loan_ref: reference.into(),
             deducted: amount,
             balance: balance - amount,
-            notes: "Full Loan Settlement (Buyoff)".into(),
+            notes: "Loan settled in full".into(),
             principal_portion: principal,
             interest_portion: interest,
             previous_state: Some(previous),
@@ -715,12 +698,6 @@ mod tests {
         // Numbers are each member's own.
         let ben = journal.members().add(&MemberDetails { name: "Ben".into(), ..MemberDetails::default() }).unwrap();
         assert_eq!(journal.loans().next_reference(ben).unwrap(), "L-001");
-    }
-
-    #[test]
-    fn notes_read_like_the_first_version() {
-        assert_eq!(py_float(100000.0), "100000.0");
-        assert_eq!(py_float(15000.5), "15000.5");
     }
 
     #[test]

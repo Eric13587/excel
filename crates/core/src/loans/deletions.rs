@@ -243,7 +243,7 @@ pub fn record_missed(journal: &Journal, member_id: i64, reference: &str, month: 
         event_type: event::REPAYMENT.into(),
         loan_ref: reference.into(),
         deducted: amount,
-        notes: "Monthly Deduction (grid entry, recorded late)".into(),
+        notes: "Monthly deduction, recorded late (grid entry)".into(),
         ..NewEntry::default()
     })?;
     project_loan(journal, member_id, reference)?;
