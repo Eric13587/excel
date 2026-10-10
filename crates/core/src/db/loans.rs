@@ -2,6 +2,8 @@
 //!
 //! A loan's `ref` (`L-001`) is generated per member, so it is **unique per
 //! member only**: every read and write that takes a ref also takes the member.
+//! A reference is never given out twice for one member, not even after the
+//! loan that had it is deleted.
 //!
 //! `loans.is_suspended` / `suspend_until` hold only the *current* state; the
 //! history of spans lives in `loan_suspensions`, which is what lets a past
@@ -188,14 +190,31 @@ impl Loans<'_> {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// The next reference for a member: one past the highest `L-nnn` they hold.
+    /// Every reference the member has held: their loans now, and the loans
+    /// deleted since, as the audit trail recorded their ledger rows going.
+    pub fn references_ever(&self, member_id: i64) -> Result<std::collections::BTreeSet<String>> {
+        let mut stmt = self.0.prepare(
+            "SELECT ref FROM loans WHERE individual_id = ?1 \
+             UNION SELECT json_extract(before_image, '$.loan_id') FROM audit_log \
+             WHERE entity = 'ledger' AND operation = 'DELETE' AND before_image IS NOT NULL \
+             AND json_extract(before_image, '$.individual_id') = ?1",
+        )?;
+        let references = stmt.query_map([member_id], |r| r.get::<_, Option<String>>(0))?;
+        let mut out = std::collections::BTreeSet::new();
+        for reference in references {
+            if let Some(reference) = reference?.filter(|r| !r.trim().is_empty()) {
+                out.insert(reference);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The next reference for a member: one past the highest `L-nnn` they
+    /// have ever held. A deleted loan's number is not given out again, so a
+    /// reference in the activity log, a backup or a printed statement always
+    /// means one loan, and undoing a deletion cannot collide with a newer loan.
     pub fn next_reference(&self, member_id: i64) -> Result<String> {
-        let highest = self
-            .for_member(member_id)?
-            .iter()
-            .filter_map(|l| l.reference.split('-').nth(1)?.parse::<u32>().ok())
-            .max()
-            .unwrap_or(0);
+        let highest = self.references_ever(member_id)?.iter().filter_map(|r| r.split('-').nth(1)?.parse::<u32>().ok()).max().unwrap_or(0);
         Ok(format!("L-{:03}", highest + 1))
     }
 

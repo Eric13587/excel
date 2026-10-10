@@ -89,6 +89,19 @@ fn everything_comes_across_into_an_empty_journal() {
 }
 
 #[test]
+fn an_incoming_loan_does_not_take_a_deleted_loans_number() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = Source::open(&source_journal(dir.path())).unwrap();
+    let journal = Journal::open_in_memory().unwrap();
+    let ann = member(&journal, "Ann", "PF9");
+    issue(&journal, ann, 50000.0, 10, "2025-06-01", Some(0.15)).unwrap();
+    crate::loans::service::delete_loan(&journal, ann, "L-001").unwrap();
+    let ids: Vec<i64> = source.members().unwrap().iter().filter(|m| m.name == "Ann").map(|m| m.id).collect();
+    let pre = preview(&journal, &source, &ids, &all_options(), &HashMap::new()).unwrap();
+    assert_eq!(pre.renamed, [("Ann".to_string(), "L-001".to_string(), "L-002".to_string())]);
+}
+
+#[test]
 fn a_member_on_record_is_merged_into_and_undo_leaves_them_as_they_were() {
     let dir = tempfile::tempdir().unwrap();
     let source = Source::open(&source_journal(dir.path())).unwrap();

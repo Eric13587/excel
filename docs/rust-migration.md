@@ -94,6 +94,17 @@ purpose.
   month.** 1.x stored the state after the month's interest accrual, so
   restoring from it lost a month of interest.
 
+### Loan references
+
+* **A deleted loan's reference is never given out again.** 1.x numbered a
+  new loan one past the highest reference the member still held, so
+  deleting their latest loan freed its number for the next one. 2.0 also
+  counts the loans the audit trail shows were deleted, so `L-003` in the
+  Activity Log, a backup or a statement already handed to the member always
+  means one loan, and undoing a deletion cannot collide with a newer loan.
+  Imported loans follow the same rule. On the production journal this moves
+  one member's next loan from L-003 to L-004.
+
 ### Undo
 
 * **Undo puts the whole loan back**: the loan, every ledger row on it with its

@@ -702,6 +702,22 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_loans_number_is_not_given_out_again() {
+        let (journal, ann) = journal_with_member();
+        issue(&journal, ann, 10000.0, 10, "2026-01-01", Some(0.15)).unwrap();
+        delete_loan(&journal, ann, "L-001").unwrap();
+        issue(&journal, ann, 20000.0, 10, "2026-02-01", Some(0.15)).unwrap();
+        assert!(journal.loans().by_ref(ann, "L-001").unwrap().is_none());
+        assert_eq!(journal.loans().by_ref(ann, "L-002").unwrap().unwrap().principal, 20000.0);
+        // The newest loan's number is kept back too.
+        delete_loan(&journal, ann, "L-002").unwrap();
+        assert_eq!(journal.loans().next_reference(ann).unwrap(), "L-003");
+        // Numbers are each member's own.
+        let ben = journal.members().add(&MemberDetails { name: "Ben".into(), ..MemberDetails::default() }).unwrap();
+        assert_eq!(journal.loans().next_reference(ben).unwrap(), "L-001");
+    }
+
+    #[test]
     fn notes_read_like_the_first_version() {
         assert_eq!(py_float(100000.0), "100000.0");
         assert_eq!(py_float(15000.5), "15000.5");

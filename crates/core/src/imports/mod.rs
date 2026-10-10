@@ -301,8 +301,10 @@ fn free_reference(held: &mut HashSet<String>, wanted: &str) -> String {
     }
 }
 
+/// The references a member has ever held — deleted loans' included — which
+/// an incoming loan may not take.
 fn held_references(journal: &Journal, member: i64) -> Result<HashSet<String>> {
-    Ok(journal.loans().for_member(member)?.into_iter().map(|l| l.reference).collect())
+    Ok(journal.loans().references_ever(member)?.into_iter().collect())
 }
 
 /// What importing `ids` would do, given the decisions made so far.
