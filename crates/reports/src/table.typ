@@ -28,7 +28,7 @@
   }
 }
 #if data.logo != none {
-  grid(columns: (auto, 1fr), column-gutter: 12pt, align: horizon, image(data.logo, height: 44pt), words)
+  grid(columns: (auto, 1fr), column-gutter: 10pt, align: horizon, image(data.logo, height: 40pt), words)
 } else {
   words
 }

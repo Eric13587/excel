@@ -19,44 +19,37 @@
 )
 #set text(font: "Liberation Sans", size: 8pt)
 
-// The letterhead: the society's logo at the top left with its name beside
-// it, and the statement's date and period on the right.
+// The letterhead, kept low so the statement keeps the page: the society's
+// logo at the top left with its name beside it, and the statement's date and
+// period on the right.
 #grid(
   columns: (auto, 1fr, auto),
-  column-gutter: 14pt,
+  column-gutter: 10pt,
   align: (left + horizon, left + horizon, right + horizon),
-  if data.logo != none { image(data.logo, height: 58pt) } else [],
+  if data.logo != none { image(data.logo, height: 40pt) } else [],
   {
     if data.org != "" {
-      text(size: 16pt, weight: "bold", fill: rgb("#0f172a"))[#data.org]
+      text(size: 13pt, weight: "bold", fill: rgb("#0f172a"))[#data.org]
       linebreak()
     }
-    text(size: 12pt, weight: "bold", fill: accent, tracking: 0.6pt)[#upper(data.title)]
+    text(size: 10pt, weight: "bold", fill: accent, tracking: 0.5pt)[#upper(data.title)]
   },
-  {
-    text(size: 7pt, fill: grey, tracking: 0.4pt)[STATEMENT DATE]
-    linebreak()
-    text(size: 9pt, weight: "bold")[#data.statement_date]
-    linebreak()
-    text(size: 7pt, fill: grey, tracking: 0.4pt)[PERIOD]
-    linebreak()
-    text(size: 9pt, weight: "bold")[#data.period]
-  },
+  text(size: 8pt)[
+    #text(fill: grey)[Statement date:] *#data.statement_date* \
+    #text(fill: grey)[Period:] *#data.period*
+  ],
 )
-#v(4pt)
-#line(length: 100%, stroke: 2.5pt + accent)
-#v(4pt)
+#v(2pt)
+#line(length: 100%, stroke: 2pt + accent)
+#v(2pt)
 
-#block(fill: rgb("#f5f5f5"), inset: 7pt, radius: 4pt, width: 100%)[
-  #grid(
-    columns: (1fr, 1fr),
-    [*Member:* #data.name #if data.pf_no != "" [#h(10pt) *PF No:* #data.pf_no] \ *Contact:* #data.phone],
-    align(right)[
-      *Account Status:* #text(fill: if data.active { green } else { red }, weight: "bold")[#data.status]
-    ],
-  )
+#block(fill: rgb("#f5f5f5"), inset: (x: 7pt, y: 5pt), radius: 3pt, width: 100%)[
+  *Member:* #data.name
+  #if data.pf_no != "" [#h(12pt) *PF No:* #data.pf_no]
+  #if data.phone != "" [#h(12pt) *Contact:* #data.phone]
+  #h(1fr) *Account Status:* #text(fill: if data.active { green } else { red }, weight: "bold")[#data.status]
 ]
-#v(6pt)
+#v(5pt)
 
 #let band(body, fill) = block(fill: fill, inset: 5pt, width: 100%, below: 0pt, text(fill: white, weight: "bold", size: 9pt, body))
 #let nothing(what) = block(inset: 8pt, text(fill: grey)[No #what transactions in this period])
