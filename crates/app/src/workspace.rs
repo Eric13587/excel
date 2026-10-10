@@ -119,6 +119,15 @@ impl Workspace {
         }
     }
 
+    /// Save the Ledger Grid's staged changes. True when none are left.
+    pub fn save_unsaved(&mut self, actions: &mut Vec<Action>) -> bool {
+        let Workspace { screen, journal, .. } = self;
+        match screen {
+            Screen::Grid(grid) => grid.save_all(journal, actions),
+            _ => true,
+        }
+    }
+
     pub fn discard_unsaved(&mut self) {
         if let Screen::Grid(grid) = &mut self.screen {
             grid.discard();

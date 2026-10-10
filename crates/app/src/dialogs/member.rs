@@ -112,7 +112,6 @@ impl MemberForm {
             ui.set_width(460.0);
             ui.heading(if self.id.is_some() { "Edit Member" } else { "New Member" });
             ui.add_space(8.0);
-            let mut submitted = false;
             egui::Grid::new("member_fields").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
                 let name_error = self.error("name").map(String::from);
                 let name = widgets::field(ui, "Name", &mut self.details.name, "Full name", name_error.as_deref());
@@ -150,7 +149,6 @@ impl MemberForm {
                         ui.end_row();
                     }
                 }
-                submitted = ui.input(|i| i.key_pressed(egui::Key::Enter));
             });
             if let Some(problem) = &self.problem {
                 ui.add_space(6.0);
@@ -158,7 +156,7 @@ impl MemberForm {
             }
             super::footer(ui, |ui| {
                 let label = if self.pays_out() { "Save and Pay Out" } else if self.id.is_some() { "Save" } else { "Add Member" };
-                if (widgets::solid(ui, label, p.accent).clicked() || submitted) && self.save(journal, actions) {
+                if widgets::primary(ui, label, p.accent) && self.save(journal, actions) {
                     open = false;
                 }
                 if ui.button("Cancel").clicked() {
@@ -249,7 +247,7 @@ impl Leave {
                 ui.add(egui::Label::new(RichText::new(problem).color(p.danger)).wrap());
             }
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Confirm", p.warning).clicked() && self.confirm(journal, actions) {
+                if widgets::primary(ui, "Confirm", p.warning) && self.confirm(journal, actions) {
                     open = false;
                 }
                 if ui.button("Cancel").clicked() {

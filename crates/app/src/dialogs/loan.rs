@@ -74,7 +74,7 @@ impl PrincipalCalculator {
                 }
             }
             footer(ui, |ui| {
-                if widgets::solid_enabled(ui, found.is_some(), "Use This", p.success, "Enter the figures first.").clicked()
+                if widgets::primary_enabled(ui, found.is_some(), "Use This", p.success, "Enter the figures first.")
                     && let Some((principal, months, rate)) = found
                 {
                     actions.push(Action::run(move |ws, _| {
@@ -152,7 +152,7 @@ impl CatchUp {
                 .color(p.muted),
             );
             footer(ui, |ui| {
-                if widgets::solid(ui, "Catch Up", p.info).clicked() {
+                if widgets::primary(ui, "Catch Up", p.info) {
                     let to = dates::format(month_end(self.month));
                     let job = match &self.target {
                         Target::Loan { member, reference } => {
@@ -259,7 +259,7 @@ impl TopUp {
             }
             footer(ui, |ui| {
                 let ready = amount(&self.amount).is_some() && months.is_some() && !too_early;
-                if widgets::solid_enabled(ui, ready, "Top Up", p.success, "Enter the amount, the term and a date after the last entry.").clicked()
+                if widgets::primary_enabled(ui, ready, "Top Up", p.success, "Enter the amount, the term and a date after the last entry.")
                     && let (Some(value), Some(months)) = (amount(&self.amount), months)
                 {
                     let (member, reference, date) = (self.member, self.reference.clone(), self.date);
@@ -373,7 +373,7 @@ impl Suspend {
                             .color(p.muted),
                     );
                     footer(ui, |ui| {
-                        if widgets::solid(ui, "Suspend", p.warning).clicked() {
+                        if widgets::primary(ui, "Suspend", p.warning) {
                             let start = dates::format(self.start);
                             let end = self.end();
                             match suspensions::deductions_in_period(journal, self.member, &self.reference, &start, end.as_deref()) {
@@ -416,11 +416,12 @@ impl Suspend {
                     }
                     ui.label(RichText::new("Recording it only as a note leaves those deductions in place; statements will show both.").color(p.muted));
                     footer(ui, |ui| {
+                        // Enter only records it: rebuilding a schedule takes a click.
                         if rebuildable && widgets::solid(ui, "Rebuild the Schedule", p.danger).clicked() {
                             actions.push(self.job(true));
                             open = false;
                         }
-                        if ui.button("Only Record It").clicked() {
+                        if ui.button("Only Record It").clicked() || widgets::enter(ui) {
                             actions.push(self.job(false));
                             open = false;
                         }
@@ -556,7 +557,8 @@ impl ClearSuspension {
                     actions.push(self.job(true));
                     open = false;
                 }
-                if widgets::solid(ui, "Leave Them Skipped", p.accent).clicked() {
+                // Enter leaves them skipped: deducting rebuilds the schedule, which takes a click.
+                if widgets::primary(ui, "Leave Them Skipped", p.accent) {
                     actions.push(self.job(false));
                     open = false;
                 }
@@ -599,7 +601,7 @@ impl EntryDate {
                     .color(p.muted),
             );
             footer(ui, |ui| {
-                if widgets::solid_enabled(ui, self.date != self.old, "Move", p.accent, "Choose a different date.").clicked() {
+                if widgets::primary_enabled(ui, self.date != self.old, "Move", p.accent, "Choose a different date.") {
                     let (member, row_id, date, cascade) = (self.member, self.row_id, dates::format(self.date), self.cascade);
                     actions.push(Action::run(move |ws, actions| {
                         let result = edits::move_date(&ws.journal, member, row_id, &date, cascade);
@@ -696,7 +698,7 @@ impl EntryAmount {
                 let value = amount(&self.amount);
                 let months = self.months.trim().parse::<i64>().ok().filter(|m| *m >= 1);
                 let ready = value.is_some() && (kind != event::TOP_UP || months.is_some());
-                if widgets::solid_enabled(ui, ready, "Save", p.accent, "Enter an amount above zero (and a term).").clicked()
+                if widgets::primary_enabled(ui, ready, "Save", p.accent, "Enter an amount above zero (and a term).")
                     && let Some(value) = value
                 {
                     let (member, row, notes, date) = (self.member, self.row.clone(), self.notes.clone(), dates::format(self.date));
@@ -742,7 +744,7 @@ impl EntryNotes {
             ui.label(RichText::new(format!("{} · {} · {}", self.row.loan_ref, self.row.event_type, dates::date_part(&self.row.date))).color(p.muted));
             ui.add(egui::TextEdit::multiline(&mut self.notes).desired_rows(3).desired_width(f32::INFINITY));
             footer(ui, |ui| {
-                if widgets::solid(ui, "Save", p.accent).clicked() {
+                if widgets::primary(ui, "Save", p.accent) {
                     let (member, row, notes) = (self.member, self.row.clone(), self.notes.clone());
                     actions.push(Action::run(move |ws, actions| {
                         let result = edits::edit_entry(&ws.journal, member, row.id, &row.date, row.added, row.deducted, notes.trim(), false);

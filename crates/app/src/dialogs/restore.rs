@@ -114,7 +114,7 @@ impl Restore {
                 };
                 ui.label(detail);
                 super::footer(ui, |ui| {
-                    if ui.button("Close").clicked() {
+                    if ui.button("Close").clicked() || widgets::escape(ui) {
                         close = true;
                     }
                     let usable = self.selected.and_then(|i| candidates.get(i)).filter(|c| c.info.ok).map(|c| c.path.clone());
@@ -206,7 +206,7 @@ impl Restore {
                 .color(p.muted),
             );
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Restore", p.danger).clicked() {
+                if widgets::primary(ui, "Restore", p.danger) {
                     go = true;
                 }
                 if ui.button("Cancel").clicked() {

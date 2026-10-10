@@ -98,6 +98,21 @@ impl GridScreen {
         self.loans.set_range(from, to);
     }
 
+    /// Save every tab's staged changes. True when nothing is left unsaved;
+    /// otherwise the first tab still holding a refused change is shown.
+    pub fn save_all(&mut self, journal: &Journal, actions: &mut Vec<Action>) -> bool {
+        let saved = [
+            self.savings.save(journal, actions),
+            self.christmas.save(journal, actions),
+            self.benevolent.save(journal, actions),
+            self.loans.save(journal, actions),
+        ];
+        if let Some((tab, _, _)) = self.counts().into_iter().find(|(_, _, n)| *n > 0) {
+            self.tab = tab;
+        }
+        saved.iter().all(|s| *s)
+    }
+
     pub fn discard(&mut self) {
         self.savings.discard_all();
         self.christmas.discard_all();
@@ -149,7 +164,7 @@ impl GridScreen {
             };
             help::show(&ctx, &mut self.help, self.tab.help(), label, ops);
         }
-        self.confirm_leaving(&ctx, actions);
+        self.confirm_leaving(&ctx, journal, actions);
     }
 
     fn header(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -197,18 +212,23 @@ impl GridScreen {
         });
     }
 
-    fn confirm_leaving(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+    fn confirm_leaving(&mut self, ctx: &egui::Context, journal: &Journal, actions: &mut Vec<Action>) {
         let Some((_, what)) = &self.leaving else { return };
         let what = *what;
         let detail = self.unsaved().unwrap_or_default();
-        let (mut discard, mut cancel) = (false, false);
+        let p = theme::palette(ctx);
+        let (mut save, mut discard, mut cancel) = (false, false, false);
         let response = egui::Modal::new(egui::Id::new("grid_leaving")).show(ctx, |ui| {
             ui.set_max_width(480.0);
             ui.heading("Unsaved Changes");
             ui.add_space(4.0);
-            ui.label(format!("There are unsaved changes ({detail}).\n\nDiscard them and {what}?"));
+            ui.label(format!("There are unsaved changes ({detail}).\n\nSave them before you {what}?"));
             crate::dialogs::footer(ui, |ui| {
-                if crate::widgets::solid(ui, "Discard", theme::palette(ui.ctx()).danger).clicked() {
+                // Enter saves: the answer that loses nothing.
+                if crate::widgets::primary(ui, "Save Changes", p.success) {
+                    save = true;
+                }
+                if ui.button(RichText::new("Discard").color(p.danger)).clicked() {
                     discard = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -216,7 +236,15 @@ impl GridScreen {
                 }
             });
         });
-        if discard {
+        if save {
+            // A refused change keeps the grid open, its reason in red.
+            if self.save_all(journal, actions)
+                && let Some((action, _)) = self.leaving.take()
+            {
+                actions.push(action);
+            }
+            self.leaving = None;
+        } else if discard {
             self.discard();
             if let Some((action, _)) = self.leaving.take() {
                 actions.push(action);

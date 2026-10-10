@@ -41,7 +41,7 @@ impl Confirm {
             ui.add_space(6.0);
             ui.label(&self.body);
             super::footer(ui, |ui| {
-                if widgets::solid(ui, &self.confirm, if self.danger { p.danger } else { p.accent }).clicked() {
+                if widgets::primary(ui, &self.confirm, if self.danger { p.danger } else { p.accent }) {
                     if let Some(job) = self.job.take() {
                         actions.push(Action::Run(job));
                     }

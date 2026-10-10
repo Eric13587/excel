@@ -772,3 +772,112 @@ fn the_form_warns_before_a_status_change_pays_a_member_out() {
     assert_eq!(status_of(&harness, "ANN WANJIRU"), "Deceased");
     assert_eq!(savings(&harness, "ANN WANJIRU"), 0.0);
 }
+
+// --------------------------------------------------------------- keyboard
+
+fn reinstate_samuel(harness: &mut Harness<'_, LoanMasterApp>) {
+    harness.get_by_label("SAMUEL KARIUKI").click_secondary();
+    harness.run();
+    harness.get_by_label("Reinstate…").click();
+    harness.run();
+    // The question is in front from the next frame.
+    harness.run();
+}
+
+#[test]
+fn enter_answers_yes() {
+    let mut harness = harness(sample());
+    reinstate_samuel(&mut harness);
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(status_of(&harness, "SAMUEL KARIUKI"), "Active");
+}
+
+#[test]
+fn tab_to_cancel_then_enter_cancels() {
+    let mut harness = harness(sample());
+    reinstate_samuel(&mut harness);
+    for _ in 0..2 {
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+    }
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(status_of(&harness, "SAMUEL KARIUKI"), "Retired");
+    assert!(harness.query_by_label("Reinstate Member").is_none(), "the question closed");
+}
+
+#[test]
+fn a_held_down_enter_answers_nothing() {
+    let mut harness = harness(sample());
+    // Enter goes down before the question opens and stays down: the key's
+    // repeats must not answer it.
+    harness.key_down(egui::Key::Enter);
+    harness.run();
+    reinstate_samuel(&mut harness);
+    harness.event(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: true, modifiers: egui::Modifiers::NONE });
+    harness.run();
+    assert_eq!(status_of(&harness, "SAMUEL KARIUKI"), "Retired");
+    harness.get_by_label("Reinstate Member");
+    harness.key_up(egui::Key::Enter);
+    harness.run();
+}
+
+#[test]
+fn enter_goes_to_the_dialog_in_front_only() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Tools", "Settings…");
+    harness.state_mut().notices.push(crate::app::Notice::info("Note", "Something to read."));
+    harness.run();
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(harness.state().notices.is_empty(), "the note was answered");
+    assert_eq!(harness.state().workspace.as_ref().unwrap().dialogs.len(), 1, "Settings stayed open, unsaved");
+}
+
+#[test]
+fn escape_closes_a_window() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Reports", "Members List (Excel / PDF)…");
+    harness.run();
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(harness.state().workspace.as_ref().unwrap().dialogs.is_empty());
+}
+
+#[test]
+fn enter_saves_unsaved_grid_changes_on_the_way_out() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    type_into(&mut harness, "ANN WANJIRU, Oct 2026", "3000");
+    harness.get_by_label("⬅ Dashboard").click();
+    harness.run();
+    harness.run();
+    harness.get_by_label("Unsaved Changes");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(!on_grid(&harness));
+    assert_eq!(savings(&harness, "ANN WANJIRU"), 25_500.0);
+}
+
+#[test]
+fn enter_in_a_filter_box_only_finishes_the_typing() {
+    let mut harness = harness(sample());
+    menu(&mut harness, "Reports", "Statements…");
+    // With members ticked, Generate would go ahead — if Enter pressed it.
+    harness.get_by_label("Select All").click();
+    harness.run();
+    // The window's filter box: narrower than the dashboard's search behind it.
+    harness.get_all_by_role(egui::accesskit::Role::TextInput).min_by_key(|n| n.rect().width() as i32).unwrap().focus();
+    harness.run();
+    harness.get_all_by_role(egui::accesskit::Role::TextInput).min_by_key(|n| n.rect().width() as i32).unwrap().type_text("ann");
+    harness.run();
+    // Were Enter to press Generate, the folder question would take the
+    // answer queued here and the window would close.
+    crate::dialogs::files::ask::answer(std::env::temp_dir());
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().workspace.as_ref().unwrap().dialogs.len(), 1, "Statements is still open");
+    assert!(harness.state().workspace.as_ref().unwrap().task.is_none());
+}

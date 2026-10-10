@@ -99,7 +99,7 @@ impl Movement {
                     Kind::Payout => "Pay Out",
                 };
                 let ready = value.is_some() && problem.is_none();
-                if widgets::solid_enabled(ui, ready, label, p.accent, problem.as_deref().unwrap_or("Enter an amount above zero.")).clicked()
+                if widgets::primary_enabled(ui, ready, label, p.accent, problem.as_deref().unwrap_or("Enter an amount above zero."))
                     && let Some(value) = value
                 {
                     let (kind, fund, member, date, notes, override_lock) =
@@ -173,7 +173,7 @@ impl EditRow {
             });
             footer(ui, |ui| {
                 let value = amount(&self.amount);
-                if widgets::solid_enabled(ui, value.is_some(), "Save", p.accent, "Enter an amount above zero.").clicked()
+                if widgets::primary_enabled(ui, value.is_some(), "Save", p.accent, "Enter an amount above zero.")
                     && let Some(value) = value
                 {
                     let (fund, id, date, notes) = (self.fund, self.row.id, dates::format(self.date), self.notes.clone());
@@ -228,7 +228,7 @@ impl Enrol {
             ui.label(RichText::new("Contributions are then due on the same day each month.").small().color(p.muted));
             footer(ui, |ui| {
                 let value = amount(&self.monthly);
-                if widgets::solid_enabled(ui, value.is_some(), "Save", p.accent, "Enter a monthly amount above zero.").clicked()
+                if widgets::primary_enabled(ui, value.is_some(), "Save", p.accent, "Enter a monthly amount above zero.")
                     && let Some(value) = value
                 {
                     let (member, start) = (self.member, dates::format(self.start));

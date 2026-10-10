@@ -184,10 +184,10 @@ impl FundReport {
             self.columns.show(ui, "fund_report_columns", 200.0);
             ui.label(RichText::new("Workbook colours are set in Tools › Settings.").small().color(p.muted));
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Save Report…", p.accent).clicked() && self.generate(ctx, journal, actions) {
+                if widgets::primary(ui, "Save Report…", p.accent) && self.generate(ctx, journal, actions) {
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || widgets::escape(ui) {
                     close = true;
                 }
             });
@@ -254,10 +254,10 @@ impl LoanReport {
             self.columns.show(ui, "loan_report_columns", 200.0);
             ui.label(RichText::new("Workbook colours are set in Tools › Settings.").small().color(p.muted));
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Save Report…", p.accent).clicked() && self.generate(ctx, journal, actions) {
+                if widgets::primary(ui, "Save Report…", p.accent) && self.generate(ctx, journal, actions) {
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || widgets::escape(ui) {
                     close = true;
                 }
             });
@@ -303,10 +303,10 @@ impl MembersList {
             ui.add_space(4.0);
             self.columns.show(ui, "members_list_columns", 300.0);
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Export…", p.accent).clicked() && self.generate(ctx, journal, actions) {
+                if widgets::primary(ui, "Export…", p.accent) && self.generate(ctx, journal, actions) {
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || widgets::escape(ui) {
                     close = true;
                 }
             });

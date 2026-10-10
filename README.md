@@ -34,6 +34,9 @@ every place 2.0 behaves differently on purpose, is in
   Grid has its own Undo Last Save.
 - **Activity log** — the audit trail, with what a changed or deleted money row
   said before.
+- **Keyboard** — in any dialog, Enter presses the highlighted button and Esc
+  cancels; Tab moves between buttons, and Enter then presses the one chosen.
+  Leaving the Ledger Grid with unsaved edits, Enter saves them.
 
 ## Getting started (development)
 

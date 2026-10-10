@@ -419,9 +419,11 @@ impl<S: Sheet> Page<S> {
         }
     }
 
-    fn save(&mut self, journal: &Journal, actions: &mut Vec<Action>) {
+    /// Write everything staged as one batch. True when nothing is left
+    /// unsaved: a refused change stays staged, red, with its reason.
+    pub(super) fn save(&mut self, journal: &Journal, actions: &mut Vec<Action>) -> bool {
         if self.staged.is_empty() {
-            return;
+            return true;
         }
         let changes: Vec<S::Change> = self.staged.values().cloned().collect();
         match self.sheet.apply(journal, &changes) {
@@ -447,9 +449,11 @@ impl<S: Sheet> Page<S> {
                     self.say(format!("Saved — {summary}. Hover a red cell for why it was refused (e.g. {first})"), Tone::Danger);
                 }
                 actions.push(Action::Changed);
+                self.staged.is_empty()
             }
             Err(e) => {
                 actions.push(Action::Notice(Notice::from_error("Nothing was saved — the journal is unchanged", &e)));
+                false
             }
         }
     }
@@ -548,7 +552,7 @@ impl<S: Sheet> Page<S> {
         // grid: egui would otherwise walk its focus through the buttons, and
         // Enter would press whichever one it landed on.
         let editing = self.editing.is_some();
-        if keys && self.anchor.is_some() && !editing && self.pending.is_none() && !ctx.egui_wants_keyboard_input() {
+        if keys && self.anchor.is_some() && !editing && self.pending.is_none() && !ctx.text_edit_focused() {
             ctx.memory_mut(|m| {
                 m.move_focus(egui::FocusDirection::None);
                 if let Some(id) = m.focused() {
@@ -591,7 +595,7 @@ impl<S: Sheet> Page<S> {
             self.from = self.from.with_day(1).unwrap_or(self.from);
             self.to = self.to.with_day(1).unwrap_or(self.to);
             ui.label(RichText::new(format!("{} month(s)", self.months().len())).small().color(theme::palette(ui.ctx()).muted));
-            ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Filter members…").desired_width(200.0));
+            widgets::filter_box(ui, &mut self.search, "Filter members…", 200.0);
             ui.add_enabled(!locked, egui::Checkbox::new(&mut self.include_inactive, "Include past members"))
                 .on_hover_text("Members who have retired, resigned or been terminated. They can still have withdrawals recorded, but not new contributions.")
                 .on_disabled_hover_text(why);
@@ -684,7 +688,7 @@ impl<S: Sheet> Page<S> {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let staged = !self.staged.is_empty();
                 if widgets::solid_enabled(ui, staged, "Save Changes", p.success, "Nothing to save.").clicked() {
-                    self.save(journal, actions);
+                    let _ = self.save(journal, actions);
                 }
                 if ui.add_enabled(staged, egui::Button::new("Discard Changes")).clicked() {
                     self.pending = Some(Pending::Discard);
@@ -1092,7 +1096,7 @@ impl<S: Sheet> Page<S> {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context, journal: &Journal) {
-        if self.editing.is_some() || self.pending.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.editing.is_some() || self.pending.is_some() || ctx.text_edit_focused() {
             return;
         }
         let shortcut = |key: Key| ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key)));
@@ -1241,11 +1245,12 @@ impl<S: Sheet> Page<S> {
                     Pending::UndoSave => ("Undo Save", true, p.warning),
                     Pending::OpenLedger { .. } => ("Open Ledger", true, p.accent),
                 };
-                if enabled && widgets::solid(ui, label, colour).clicked() {
+                if enabled && widgets::primary(ui, label, colour) {
                     go = true;
                     keep = false;
                 }
-                if ui.button(if enabled { "Cancel" } else { "Close" }).clicked() {
+                // With nothing to do, Enter closes the note.
+                if ui.button(if enabled { "Cancel" } else { "Close" }).clicked() || (!enabled && widgets::enter(ui)) {
                     keep = false;
                 }
             });

@@ -68,7 +68,7 @@ impl ActivityLog {
             egui::Panel::bottom("activity_footer").show(ui, |ui| {
                 ui.label(RichText::new("“Previous values” is what a changed or deleted row said before; hover it for the full record.").small().color(p.muted));
                 super::footer(ui, |ui| {
-                    if ui.button("Close").clicked() {
+                    if ui.button("Close").clicked() || crate::widgets::escape(ui) {
                         close = true;
                     }
                 });

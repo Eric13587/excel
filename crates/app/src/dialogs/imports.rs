@@ -187,6 +187,9 @@ impl JournalImport {
         let mut close = false;
         egui::Window::new("Import From Another Journal").open(&mut open).collapsible(false).auto_sized().show(ctx, |ui| {
             ui.set_width(560.0);
+            if widgets::escape(ui) {
+                close = true;
+            }
             match self.step {
                 Step::Source => self.source_step(ui, actions, &mut close),
                 Step::Members => self.members_step(ui, journal, actions),
@@ -238,7 +241,7 @@ impl JournalImport {
                 .color(p.muted),
         );
         super::footer(ui, |ui| {
-            if widgets::solid_enabled(ui, self.source.is_some(), "Choose Members ›", p.accent, "Select a journal first").clicked() {
+            if widgets::primary_enabled(ui, self.source.is_some(), "Choose Members ›", p.accent, "Select a journal first") {
                 self.step = Step::Members;
             }
             if ui.button("Cancel").clicked() {
@@ -250,7 +253,7 @@ impl JournalImport {
     fn members_step(&mut self, ui: &mut egui::Ui, journal: &Journal, actions: &mut Vec<Action>) {
         let p = theme::palette(ui.ctx());
         ui.label(format!("Found {} member(s). Choose who to import:", self.members.len()));
-        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter by name…").desired_width(f32::INFINITY));
+        widgets::filter_box(ui, &mut self.filter, "Filter by name…", f32::INFINITY);
         let needle = self.filter.trim().to_lowercase();
         let shown: Vec<usize> = (0..self.members.len())
             .filter(|&i| needle.is_empty() || format!("{} {}", self.members[i].name, self.members[i].phone).to_lowercase().contains(&needle))
@@ -281,7 +284,7 @@ impl JournalImport {
             ui.label(RichText::new(format!("{} selected", self.chosen.len())).color(p.muted));
         });
         super::footer(ui, |ui| {
-            if widgets::solid_enabled(ui, !self.chosen.is_empty(), "Preview ›", p.accent, "Choose at least one member").clicked() {
+            if widgets::primary_enabled(ui, !self.chosen.is_empty(), "Preview ›", p.accent, "Choose at least one member") {
                 self.start_preview(journal, actions);
             }
             if ui.button("‹ Back").clicked() {
@@ -372,7 +375,7 @@ impl JournalImport {
         }
         super::footer(ui, |ui| {
             let moving = preview.new.len() + preview.merged.len();
-            if widgets::solid_enabled(ui, moving > 0, "Start Import", p.accent, "Everybody is skipped").clicked() {
+            if widgets::primary_enabled(ui, moving > 0, "Start Import", p.accent, "Everybody is skipped") {
                 go = true;
             }
             if ui.button("‹ Back").clicked() {
@@ -586,10 +589,10 @@ impl ExcelImport {
             }
             super::footer(ui, |ui| {
                 let ready = self.plan.as_ref().is_some_and(|plan| plan.rows.iter().any(|r| r.action != excel::Action::Skip));
-                if widgets::solid_enabled(ui, ready, "Import", p.accent, "Preview the sheet first").clicked() {
+                if widgets::primary_enabled(ui, ready, "Import", p.accent, "Preview the sheet first") {
                     self.confirming = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || widgets::escape(ui) {
                     close = true;
                 }
             });
@@ -601,7 +604,7 @@ impl ExcelImport {
                 ui.heading("Confirm Import");
                 ui.label("Apply this import? A copy of the journal is saved first.");
                 super::footer(ui, |ui| {
-                    if widgets::solid(ui, "Import", p.accent).clicked() {
+                    if widgets::primary(ui, "Import", p.accent) {
                         go = true;
                     }
                     if ui.button("Cancel").clicked() {
@@ -674,7 +677,7 @@ impl ImportHistory {
                         .color(p.muted),
                 );
                 super::footer(ui, |ui| {
-                    if ui.button("Close").clicked() {
+                    if ui.button("Close").clicked() || widgets::escape(ui) {
                         close = true;
                     }
                     if widgets::solid_enabled(ui, self.selected.is_some(), "Undo Selected Import", p.danger, "Choose an import first").clicked() {
@@ -756,7 +759,7 @@ impl ImportHistory {
                 run.timestamp, run.source_file
             ));
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Undo Import", p.danger).clicked() {
+                if widgets::primary(ui, "Undo Import", p.danger) {
                     go = true;
                 }
                 if ui.button("Cancel").clicked() {

@@ -297,7 +297,7 @@ impl LoanMasterApp {
             ui.label(&notice.body);
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("OK").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                if ui.button("OK").clicked() || crate::widgets::enter(ui) {
                     done = true;
                 }
             });
@@ -313,14 +313,18 @@ impl LoanMasterApp {
         let what = if matches!(action, Action::CloseJournal) { "close the journal" } else { "quit" };
         let detail = self.workspace.as_ref().and_then(|ws| ws.unsaved()).unwrap_or_default();
         let p = theme::palette(ctx);
-        let (mut discard, mut cancel) = (false, false);
+        let (mut save, mut discard, mut cancel) = (false, false, false);
         let response = egui::Modal::new(egui::Id::new("app_leaving")).show(ctx, |ui| {
             ui.set_max_width(480.0);
             ui.heading("Unsaved Changes");
             ui.add_space(4.0);
-            ui.label(format!("The Ledger Grid has unsaved changes ({detail}).\n\nDiscard them and {what}?"));
+            ui.label(format!("The Ledger Grid has unsaved changes ({detail}).\n\nSave them before you {what}?"));
             crate::dialogs::footer(ui, |ui| {
-                if crate::widgets::solid(ui, "Discard", p.danger).clicked() {
+                // Enter saves: the answer that loses nothing.
+                if crate::widgets::primary(ui, "Save Changes", p.success) {
+                    save = true;
+                }
+                if ui.button(egui::RichText::new("Discard").color(p.danger)).clicked() {
                     discard = true;
                 }
                 if ui.button("Cancel").clicked() {
@@ -328,7 +332,16 @@ impl LoanMasterApp {
                 }
             });
         });
-        if discard {
+        if save {
+            let saved = self.workspace.as_mut().is_none_or(|ws| ws.save_unsaved(&mut self.actions));
+            match self.leaving.take() {
+                Some(action) if saved => self.actions.push(action),
+                _ => self.notices.push(Notice::warning(
+                    "Not everything was saved",
+                    "Some changes were refused, so LoanMaster stayed open. The Ledger Grid shows each one in red with its reason.",
+                )),
+            }
+        } else if discard {
             if let Some(ws) = &mut self.workspace {
                 ws.discard_unsaved();
             }

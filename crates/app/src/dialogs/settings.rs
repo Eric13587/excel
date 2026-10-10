@@ -239,10 +239,10 @@ impl SettingsForm {
                 }
             });
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Save", p.accent).clicked() && self.save(actions) {
+                if widgets::primary(ui, "Save", p.accent) && self.save(actions) {
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || widgets::escape(ui) {
                     close = true;
                 }
             });

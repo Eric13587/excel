@@ -29,6 +29,65 @@ pub fn solid_enabled(ui: &mut Ui, enabled: bool, text: &str, fill: Color32, why_
     if enabled { response } else { response.on_disabled_hover_text(why_not) }
 }
 
+/// Is this dialog the one in front — the top modal, or with no modal open
+/// the frontmost window? Only it hears Enter and Escape.
+fn in_front(ui: &Ui) -> bool {
+    let ctx = ui.ctx();
+    match ctx.memory(|m| m.top_modal_layer()) {
+        Some(top) => top == ui.layer_id(),
+        None => ctx.top_layer_id() == Some(ui.layer_id()),
+    }
+}
+
+/// A fresh press of `key` — not one held down, no modifier — for the dialog
+/// in front, taken so that nothing behind it hears it as well.
+fn take_key(ui: &Ui, key: egui::Key) -> bool {
+    if !in_front(ui) {
+        return false;
+    }
+    ui.ctx().input_mut(|i| {
+        let at = i.events.iter().position(|e| {
+            matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, modifiers, .. } if *k == key && modifiers.is_none())
+        });
+        at.map(|at| i.events.remove(at)).is_some()
+    })
+}
+
+/// Enter, for the dialog in front: its main button. Not while a list is
+/// dropped down, nor while another button has the keyboard focus — Tab to
+/// Cancel and Enter presses Cancel.
+pub fn enter(ui: &Ui) -> bool {
+    let ctx = ui.ctx();
+    // A typed field hands Enter on to the dialog; a focused button keeps it.
+    let elsewhere = ctx.memory(|m| m.focused()).is_some() && !ctx.text_edit_focused();
+    !elsewhere && !egui::Popup::is_any_open(ctx) && take_key(ui, egui::Key::Enter)
+}
+
+/// Escape, for the dialog in front: close it. (A modal hears its own.)
+pub fn escape(ui: &Ui) -> bool {
+    !egui::Popup::is_any_open(ui.ctx()) && take_key(ui, egui::Key::Escape)
+}
+
+/// A filter box. Enter in it only finishes the typing: it is taken here, so
+/// it neither presses the dialog's main button nor reaches the grid.
+pub fn filter_box(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> egui::Response {
+    let response = ui.add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(width));
+    if response.lost_focus() {
+        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    }
+    response
+}
+
+/// A dialog's main button: solid, and pressed by Enter as well as a click.
+pub fn primary(ui: &mut Ui, text: &str, fill: Color32) -> bool {
+    solid(ui, text, fill).clicked() || enter(ui)
+}
+
+/// The same, greyed and deaf to Enter while `enabled` is false.
+pub fn primary_enabled(ui: &mut Ui, enabled: bool, text: &str, fill: Color32, why_not: &str) -> bool {
+    solid_enabled(ui, enabled, text, fill, why_not).clicked() || (enabled && enter(ui))
+}
+
 /// A KPI tile: a large figure over a small caption. A tile that does
 /// something says so with an arrow and lights up under the pointer.
 pub fn stat_tile(ui: &mut Ui, p: &Palette, value: &str, caption: &str, value_colour: Color32, clickable: bool) -> egui::Response {

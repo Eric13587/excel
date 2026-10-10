@@ -145,7 +145,7 @@ impl Statements {
                 ui.vertical(|ui| {
                     ui.set_width(330.0);
                     ui.label(RichText::new("Members").strong());
-                    ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter list…").desired_width(f32::INFINITY));
+                    widgets::filter_box(ui, &mut self.filter, "Filter list…", f32::INFINITY);
                     let needle = self.filter.trim().to_lowercase();
                     let shown: Vec<usize> = (0..self.people.len())
                         .filter(|&i| needle.is_empty() || format!("{} {}", self.people[i].name, self.people[i].phone).to_lowercase().contains(&needle))
@@ -240,10 +240,10 @@ impl Statements {
                 });
             }));
             super::footer(ui, |ui| {
-                if widgets::solid(ui, "Generate…", p.accent).on_hover_text("Choose a folder; one file is written per member").clicked() && self.generate(ctx, journal, actions) {
+                if widgets::primary(ui, "Generate…", p.accent) && self.generate(ctx, journal, actions) {
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || widgets::escape(ui) {
                     close = true;
                 }
                 ui.add_space(12.0);

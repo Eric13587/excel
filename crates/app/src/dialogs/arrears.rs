@@ -176,7 +176,7 @@ impl Arrears {
                         .color(p.muted),
                     );
                     super::footer(ui, |ui| {
-                        if ui.button("Close").clicked() {
+                        if ui.button("Close").clicked() || widgets::escape(ui) {
                             close = true;
                         }
                         if widgets::solid(ui, "Print / Export…", p.accent).on_hover_text("Save the list shown here as PDF, Excel or CSV").clicked() {
