@@ -71,6 +71,21 @@ fn a_roster_fills_in_members_and_adds_new_ones() {
 }
 
 #[test]
+fn a_roster_that_marks_a_member_as_retired_withdraws_their_savings() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open_in_memory().unwrap();
+    let ann = member(&journal, "ANN WANJIRU", "");
+    crate::funds::deposit(&journal, Fund::Savings, ann, 5000.0, "2026-01-05", "").unwrap();
+    let path = workbook(dir.path(), "roster.xlsx", &[&["Name", "Employment Status"], &["Ann Wanjiru", "Retired"]]);
+    let sheet = read_sheet(&path).unwrap();
+    let plan = build_plan(&journal, &sheet, &detect_mapping(&sheet.headers), Fund::Christmas, 2026).unwrap();
+    let out = apply(&journal, &plan).unwrap();
+    assert_eq!(out.left, [("ANN WANJIRU".to_string(), 5000.0)]);
+    assert_eq!(journal.funds().balance(Fund::Savings, ann).unwrap(), 0.0);
+    assert_eq!(journal.members().get(ann).unwrap().unwrap().employment_status, "Retired");
+}
+
+#[test]
 fn a_clashing_pf_number_never_clears_the_members_own() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open_in_memory().unwrap();

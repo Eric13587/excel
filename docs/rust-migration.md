@@ -94,6 +94,19 @@ purpose.
   month.** 1.x stored the state after the month's interest accrual, so
   restoring from it lost a month of interest.
 
+### Members leaving
+
+* **Every way of leaving withdraws the member's savings** — retiring,
+  resigning, termination or death — noted by the reason ("Resignation
+  withdrawal"), on the leaving date, whether it is recorded from the
+  dashboard, by changing the status on the member's form, or by a roster
+  import. 1.x withdrew them only through the Retire button; a status changed
+  on the form, even to Retired, left the savings where they were. A
+  suspended member has not left and keeps their savings.
+* **Leaving is refused on a date still to come, or before the member's last
+  savings entry**: a withdrawal dated before later entries would run the
+  balance below zero in between. 1.x always used today's date.
+
 ### Loan references
 
 * **A deleted loan's reference is never given out again.** 1.x numbered a

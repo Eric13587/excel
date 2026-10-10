@@ -10,7 +10,7 @@ use loanmaster_core::{Journal, Result, dates, membership};
 
 use crate::app::{Action, Notice};
 use crate::dialogs::confirm::Confirm;
-use crate::dialogs::member::MemberForm;
+use crate::dialogs::member::{Leave, MemberForm};
 use crate::theme;
 use crate::widgets;
 
@@ -274,36 +274,16 @@ fn member_menu(ui: &mut egui::Ui, journal: &Journal, line: &Line, actions: &mut 
         if ui.button("Reinstate…").clicked() {
             actions.push(Action::dialog(reinstate(line)));
         }
-    } else if ui.button("Retire…").clicked() {
-        actions.push(Action::dialog(retire(journal, line)));
+    } else if ui.button("Retire or Leave…").on_hover_text("Retired, resigned, terminated or deceased: their savings are withdrawn").clicked() {
+        match Leave::new(journal, line.id) {
+            Ok(dialog) => actions.push(Action::dialog(dialog)),
+            Err(e) => actions.push(Action::Notice(Notice::from_error("The member could not be read", &e))),
+        }
     }
     ui.separator();
     if ui.button(RichText::new("Delete…").color(theme::palette(ui.ctx()).danger)).clicked() {
         actions.push(Action::dialog(delete(journal, line)));
     }
-}
-
-fn retire(journal: &Journal, line: &Line) -> Confirm {
-    let (id, name) = (line.id, line.name.clone());
-    let mut body = format!("Retire {name}?\n");
-    if line.savings > 0.0 {
-        body.push_str(&format!("\n• Their savings of {} are withdrawn in full.", shillings(line.savings)));
-    }
-    if membership::has_outstanding_loans(journal, id).unwrap_or(false) {
-        body.push_str("\n• Their loans stay active until they are cleared, and still appear in the loan report.");
-    }
-    body.push_str("\n• They take on nothing new — no loans, deposits or contributions.");
-    Confirm::new("Retire Member", body, "Retire", move |ws, actions| match membership::retire(&ws.journal, id, None) {
-        Ok(withdrawn) => {
-            let mut status = format!("{name} has retired.");
-            if withdrawn > 0.0 {
-                status.push_str(&format!(" Savings of {} were withdrawn.", shillings(withdrawn)));
-            }
-            actions.push(Action::Status(status));
-            actions.push(Action::Changed);
-        }
-        Err(e) => actions.push(Action::Notice(Notice::from_error("The member could not be retired", &e))),
-    })
 }
 
 fn reinstate(line: &Line) -> Confirm {

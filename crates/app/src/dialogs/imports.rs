@@ -454,6 +454,10 @@ impl ExcelImport {
                 if plan.kind == SheetKind::Contribution {
                     parts.push(format!("{} deposit(s) for {} member(s), {} in all", out.deposits, out.members_credited, shillings(out.total)));
                 }
+                if !out.left.is_empty() {
+                    let who = out.left.iter().map(|(name, amount)| format!("{name} ({})", shillings(*amount))).collect::<Vec<_>>().join(", ");
+                    parts.push(format!("{} member(s) marked as having left, their savings withdrawn: {who}", out.left.len()));
+                }
                 let backup = out.backup.as_ref().map(|b| format!("\n\nThe journal as it was is saved at:\n{}", b.display())).unwrap_or_default();
                 actions.push(Action::Changed);
                 actions.push(Action::Status(format!("Spreadsheet imported: {}.", parts.join(", "))));

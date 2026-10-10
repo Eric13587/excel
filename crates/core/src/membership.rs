@@ -1,11 +1,12 @@
 //! Members: who belongs to the SACCO, and what joining, leaving and being
 //! deleted do.
 //!
-//! Leaving is a status, not a deletion: a member who retires keeps their
-//! history, may still repay and withdraw, and may not take on anything new
-//! (see [`crate::policy`]). Retiring withdraws their savings. Deleting is the
-//! irreversible act — everything they own goes with them — so it is preceded
-//! by a backup the caller can point to.
+//! Leaving is a status, not a deletion: a member who retires, resigns, is
+//! terminated or dies keeps their history, may still repay and withdraw, and
+//! may not take on anything new (see [`crate::policy`]). Leaving, however it
+//! is recorded, withdraws their savings. Deleting is the irreversible act —
+//! everything they own goes with them — so it is preceded by a backup the
+//! caller can point to.
 
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -15,7 +16,7 @@ use regex::Regex;
 use crate::Journal;
 use crate::dates;
 use crate::db::members::MemberDetails;
-use crate::db::model::{MEMBER_ACTIVE, MEMBER_STATUSES};
+use crate::db::model::{Fund, MEMBER_ACTIVE, MEMBER_STATUSES};
 use crate::error::{Error, Result};
 use crate::funds;
 
@@ -95,7 +96,9 @@ pub fn add(journal: &Journal, details: &MemberDetails) -> Result<i64> {
     journal.transaction(|| journal.members().add(&details))
 }
 
-pub fn update(journal: &Journal, id: i64, details: &MemberDetails) -> Result<()> {
+/// Change a member's details. A status that takes them out of the society
+/// withdraws their savings, as [`leave`] does; returns the amount withdrawn.
+pub fn update(journal: &Journal, id: i64, details: &MemberDetails) -> Result<f64> {
     let details = normalise(details);
     if let Some(error) = validate(&details).into_iter().next() {
         return Err(Error::Invalid(error.message));
@@ -103,18 +106,74 @@ pub fn update(journal: &Journal, id: i64, details: &MemberDetails) -> Result<()>
     if let Some(clash) = number_clash(journal, &details, Some(id))? {
         return Err(Error::Invalid(clash));
     }
-    journal.transaction(|| journal.members().update(id, &details))
+    journal.transaction(|| {
+        let before = journal.members().get(id)?.ok_or(Error::MemberNotFound(id))?.employment_status;
+        journal.members().update(id, &details)?;
+        settle_status_change(journal, id, &before, &details.employment_status)
+    })
 }
 
-/// Retire a member: their savings are withdrawn in full and they stop taking
-/// on new obligations. Returns the amount withdrawn.
-pub fn retire(journal: &Journal, id: i64, date: Option<&str>) -> Result<f64> {
+/// The statuses that mean a member has left the society, and how the
+/// withdrawal of their savings is noted for each. A suspended member has not
+/// left: their savings stay.
+pub const LEAVING: [(&str, &str); 4] = [
+    ("Retired", "Retirement withdrawal"),
+    ("Resigned", "Resignation withdrawal"),
+    ("Terminated", "Termination withdrawal"),
+    ("Deceased", "Withdrawal on death"),
+];
+
+pub fn is_leaving(status: &str) -> bool {
+    LEAVING.iter().any(|(s, _)| *s == status.trim())
+}
+
+/// Withdraw a leaving member's savings in full on the day they left. Refused
+/// when savings entries are dated later: a withdrawal before them would run
+/// the balance below zero in between.
+fn pay_out(journal: &Journal, id: i64, status: &str, date: &str) -> Result<f64> {
+    let latest = journal.funds().rows(Fund::Savings, id, None, None)?.iter().map(|r| dates::date_part(&r.date).to_string()).max();
+    if let Some(latest) = latest.filter(|latest| latest.as_str() > date) {
+        let name = journal.members().name_of(id)?.unwrap_or_default();
+        return Err(Error::invalid(format!(
+            "{name} has savings entries up to {latest}, after {date}. Record the leaving on or after {latest}, or correct those entries first."
+        )));
+    }
+    let note = LEAVING.iter().find(|(s, _)| *s == status.trim()).map(|(_, note)| *note).unwrap_or("Withdrawal on leaving");
+    funds::withdraw_all_savings(journal, id, date, note)
+}
+
+/// A member leaves the society — retires, resigns, is terminated or has
+/// died: their savings are withdrawn in full on the leaving date, and they
+/// stop taking on new obligations. Returns the amount withdrawn.
+pub fn leave(journal: &Journal, id: i64, status: &str, date: Option<&str>) -> Result<f64> {
+    if !is_leaving(status) {
+        return Err(Error::invalid(format!("{status} is not a way of leaving the society.")));
+    }
     let date = date.map(str::to_string).unwrap_or_else(dates::today);
+    if dates::parse(&date).is_none() {
+        return Err(Error::invalid(format!("{date} is not a date (use YYYY-MM-DD).")));
+    }
+    if date > dates::today() {
+        return Err(Error::invalid("A member cannot be recorded as leaving on a date still to come."));
+    }
     journal.transaction(|| {
-        let withdrawn = funds::withdraw_all_savings(journal, id, &date, "Retirement withdrawal")?;
-        journal.members().set_status(id, "Retired", Some(&date))?;
+        let withdrawn = pay_out(journal, id, status, &date)?;
+        journal.members().set_status(id, status, Some(&date))?;
         Ok(withdrawn)
     })
+}
+
+/// After a member's status was changed from `before` by other means — the
+/// form, a roster import: when the change took them out of the society, they
+/// leave today, savings and all. Returns the amount withdrawn.
+pub(crate) fn settle_status_change(journal: &Journal, id: i64, before: &str, status: &str) -> Result<f64> {
+    if !is_leaving(status) || is_leaving(before) {
+        return Ok(0.0);
+    }
+    let today = dates::today();
+    let withdrawn = pay_out(journal, id, status, &today)?;
+    journal.members().set_status(id, status, Some(&today))?;
+    Ok(withdrawn)
 }
 
 /// Bring a member back into active membership.
@@ -161,15 +220,67 @@ mod tests {
         assert!(matches!(add(&journal, &details("Dee", "100")), Err(Error::Invalid(m)) if m.contains("Ann")));
     }
 
+    fn saver(journal: &Journal, name: &str) -> i64 {
+        let id = add(journal, &details(name, "")).unwrap();
+        funds::deposit(journal, Fund::Savings, id, 5000.0, "2026-01-01", "").unwrap();
+        id
+    }
+
+    fn last_note(journal: &Journal, id: i64) -> String {
+        journal.funds().rows(Fund::Savings, id, None, None).unwrap().last().unwrap().notes.clone()
+    }
+
     #[test]
     fn retiring_withdraws_savings_and_reinstating_restores_membership() {
         let journal = Journal::open_in_memory().unwrap();
-        let ann = add(&journal, &details("Ann", "")).unwrap();
-        funds::deposit(&journal, crate::db::model::Fund::Savings, ann, 5000.0, "2026-01-01", "").unwrap();
-        assert_eq!(retire(&journal, ann, Some("2026-02-01")).unwrap(), 5000.0);
+        let ann = saver(&journal, "Ann");
+        assert_eq!(leave(&journal, ann, "Retired", Some("2026-02-01")).unwrap(), 5000.0);
         let member = journal.members().get(ann).unwrap().unwrap();
         assert!(!member.is_active() && member.retired_date.as_deref() == Some("2026-02-01"));
+        assert_eq!(last_note(&journal, ann), "Retirement withdrawal");
         reinstate(&journal, ann).unwrap();
         assert!(journal.members().get(ann).unwrap().unwrap().is_active());
+    }
+
+    #[test]
+    fn every_way_of_leaving_withdraws_the_savings() {
+        let journal = Journal::open_in_memory().unwrap();
+        for (status, note) in LEAVING {
+            let id = saver(&journal, status);
+            assert_eq!(leave(&journal, id, status, Some("2026-03-01")).unwrap(), 5000.0, "{status}");
+            assert_eq!(journal.funds().balance(Fund::Savings, id).unwrap(), 0.0, "{status}");
+            assert_eq!(last_note(&journal, id), note);
+            assert_eq!(journal.members().get(id).unwrap().unwrap().employment_status, status);
+        }
+        // A suspension is not leaving.
+        let id = saver(&journal, "Sam");
+        assert!(leave(&journal, id, "Suspended", None).is_err());
+    }
+
+    #[test]
+    fn leaving_before_savings_entries_or_in_the_future_is_refused() {
+        let journal = Journal::open_in_memory().unwrap();
+        let ann = saver(&journal, "Ann");
+        let err = leave(&journal, ann, "Resigned", Some("2025-12-31")).unwrap_err().to_string();
+        assert!(err.contains("2026-01-01"), "{err}");
+        assert!(leave(&journal, ann, "Resigned", Some("2999-01-01")).is_err());
+        let member = journal.members().get(ann).unwrap().unwrap();
+        assert!(member.is_active() && journal.funds().balance(Fund::Savings, ann).unwrap() == 5000.0, "nothing changed");
+    }
+
+    #[test]
+    fn changing_the_status_on_the_form_withdraws_the_savings_once() {
+        let journal = Journal::open_in_memory().unwrap();
+        let ann = saver(&journal, "Ann");
+        let mut form = MemberDetails { name: "Ann".into(), employment_status: "Suspended".into(), ..Default::default() };
+        assert_eq!(update(&journal, ann, &form).unwrap(), 0.0, "a suspension keeps the savings");
+        form.employment_status = "Deceased".into();
+        assert_eq!(update(&journal, ann, &form).unwrap(), 5000.0);
+        assert_eq!(last_note(&journal, ann), "Withdrawal on death");
+        let member = journal.members().get(ann).unwrap().unwrap();
+        assert_eq!(member.retired_date, Some(dates::today()));
+        // Already gone: a further change takes nothing more.
+        form.employment_status = "Retired".into();
+        assert_eq!(update(&journal, ann, &form).unwrap(), 0.0);
     }
 }

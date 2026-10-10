@@ -37,6 +37,7 @@ macro_rules! dialogs {
 dialogs! {
     Confirm(confirm::Confirm),
     Member(member::MemberForm),
+    Leave(member::Leave),
     Arrears(arrears::Arrears),
     Principal(loan::PrincipalCalculator),
     CatchUp(loan::CatchUp),
@@ -68,6 +69,7 @@ impl Dialog {
         match self {
             Dialog::Confirm(d) => d.show(ctx, actions),
             Dialog::Member(d) => d.show(ctx, journal, actions),
+            Dialog::Leave(d) => d.show(ctx, journal, actions),
             Dialog::Arrears(d) => d.show(ctx, journal, actions),
             Dialog::Principal(d) => d.show(ctx, actions),
             Dialog::CatchUp(d) => d.show(ctx, actions),
