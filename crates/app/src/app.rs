@@ -449,7 +449,9 @@ impl eframe::App for LoanMasterApp {
             egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
             egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
             if let Some(ws) = &mut self.workspace {
-                screens::show(ui, ws, &mut self.actions);
+                // A window or a question in front of the screen has the keys.
+                let keys = self.notices.is_empty() && self.leaving.is_none() && ws.dialogs.is_empty() && ws.task.is_none();
+                screens::show(ui, ws, keys, &mut self.actions);
                 ws.show_dialogs(&ctx, &mut self.actions);
             }
         }

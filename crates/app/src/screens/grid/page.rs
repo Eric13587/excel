@@ -488,7 +488,7 @@ impl<S: Sheet> Page<S> {
 
     // ---------------------------------------------------------------- drawing
 
-    pub fn show(&mut self, ui: &mut egui::Ui, journal: &Journal, revision: u64, actions: &mut Vec<Action>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, journal: &Journal, revision: u64, keys: bool, actions: &mut Vec<Action>) {
         self.ensure_loaded(journal, revision);
         let p = theme::palette(ui.ctx());
         let ctx = ui.ctx().clone();
@@ -496,7 +496,7 @@ impl<S: Sheet> Page<S> {
         // grid: egui would otherwise walk its focus through the buttons, and
         // Enter would press whichever one it landed on.
         let editing = self.editing.is_some();
-        if self.anchor.is_some() && !editing && self.pending.is_none() && !ctx.egui_wants_keyboard_input() {
+        if keys && self.anchor.is_some() && !editing && self.pending.is_none() && !ctx.egui_wants_keyboard_input() {
             ctx.memory_mut(|m| {
                 m.move_focus(egui::FocusDirection::None);
                 if let Some(id) = m.focused() {
@@ -518,7 +518,7 @@ impl<S: Sheet> Page<S> {
             self.table(ui, journal, actions);
         });
         // The keys that closed an edit this frame are the edit's, not the grid's.
-        if !editing {
+        if keys && !editing {
             self.keyboard(&ctx, journal);
         }
         self.pending(&ctx, journal, actions);

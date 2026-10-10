@@ -320,6 +320,26 @@ fn leaving_the_grid_asks_before_dropping_unsaved_work() {
 }
 
 #[test]
+fn keys_pressed_in_front_of_the_grid_stay_with_the_window() {
+    let mut harness = harness(sample());
+    open_grid(&mut harness);
+    harness.get_by_label("ANN WANJIRU, Sep 2026").click();
+    harness.run();
+    let window = crate::dialogs::activity::ActivityLog::default();
+    harness.state_mut().workspace.as_mut().unwrap().dialogs.push(window.into());
+    harness.run();
+    harness.key_press(egui::Key::Delete);
+    harness.run();
+    assert_eq!(harness.state().workspace.as_ref().unwrap().unsaved(), None, "Delete went to the window, not the grid");
+    // With the window gone, the grid has the keys again.
+    harness.state_mut().workspace.as_mut().unwrap().dialogs.clear();
+    harness.run();
+    harness.key_press(egui::Key::Delete);
+    harness.run();
+    assert!(harness.state().workspace.as_ref().unwrap().unsaved().is_some());
+}
+
+#[test]
 fn the_loans_tab_lists_each_loan_and_its_missed_months() {
     let mut harness = harness(sample());
     open_grid(&mut harness);

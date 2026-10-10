@@ -114,7 +114,7 @@ impl GridScreen {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, journal: &Journal, revision: u64, actions: &mut Vec<Action>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, journal: &Journal, revision: u64, keys: bool, actions: &mut Vec<Action>) {
         let p = theme::palette(ui.ctx());
         let ctx = ui.ctx().clone();
         egui::Panel::top("grid_header").frame(egui::Frame::new().fill(p.card).inner_margin(egui::Margin::symmetric(18, 10))).show(ui, |ui| {
@@ -123,10 +123,10 @@ impl GridScreen {
         let mut local = Vec::new();
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background).inner_margin(egui::Margin::symmetric(14, 8))).show(ui, |ui| {
             match self.tab {
-                Tab::Savings => self.savings.show(ui, journal, revision, &mut local),
-                Tab::Christmas => self.christmas.show(ui, journal, revision, &mut local),
-                Tab::Benevolent => self.benevolent.show(ui, journal, revision, &mut local),
-                Tab::Loans => self.loans.show(ui, journal, revision, &mut local),
+                Tab::Savings => self.savings.show(ui, journal, revision, keys, &mut local),
+                Tab::Christmas => self.christmas.show(ui, journal, revision, keys, &mut local),
+                Tab::Benevolent => self.benevolent.show(ui, journal, revision, keys, &mut local),
+                Tab::Loans => self.loans.show(ui, journal, revision, keys, &mut local),
             }
         });
         // A page opening a member's ledger leaves the grid, so it is asked
@@ -137,7 +137,7 @@ impl GridScreen {
                 other => actions.push(other),
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+        if keys && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
             self.help = !self.help;
         }
         if self.help {
