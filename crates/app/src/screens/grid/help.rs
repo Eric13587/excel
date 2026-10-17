@@ -25,6 +25,12 @@ const FUND_EXAMPLES: &[(&str, &str)] = &[
     ("(empty)  or  -", "Clears the whole month."),
 ];
 
+const SAVINGS_SUSPEND: (&str, &str) = (
+    "@S=3",
+    "Suspends the member's contributions for 3 months from this one. Those months show ⏸, take no deposit, and \
+     Fill Forward passes over them; resume early or remove it in the member's Savings tab.",
+);
+
 const CHRISTMAS_NOTE: &str = "Withdrawals are refused outside the unlock month set in Settings; use the member's Christmas tab to override.";
 
 const BENEVOLENT_EXAMPLES: &[(&str, &str)] = &[
@@ -132,6 +138,9 @@ pub fn show(ctx: &egui::Context, open: &mut bool, kind: Kind, label: &str, ops: 
                 });
                 if kind == Kind::Christmas {
                     examples.push((String::new(), CHRISTMAS_NOTE.to_string()));
+                }
+                if kind == Kind::Savings {
+                    examples.push((SAVINGS_SUSPEND.0.to_string(), SAVINGS_SUSPEND.1.to_string()));
                 }
                 pairs(ui, "grid_help_examples", &examples, true);
 

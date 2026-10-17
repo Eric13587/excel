@@ -122,6 +122,21 @@ fn a_contribution_sheet_posts_each_month_on_the_first() {
 }
 
 #[test]
+fn a_savings_sheet_is_imported_through_a_suspension_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open_in_memory().unwrap();
+    let ann = member(&journal, "ANN KAMAU", "");
+    crate::funds::suspensions::suspend(&journal, ann, "2025-12-01", Some(1)).unwrap();
+    let path = workbook(dir.path(), "s.xlsx", &[&["Name", "NOV", "DEC", "JAN"], &["Ann Kamau", "2500", "2500", "2500"]]);
+    let sheet = read_sheet(&path).unwrap();
+    let plan = build_plan(&journal, &sheet, &detect_mapping(&sheet.headers), Fund::Savings, 2025).unwrap();
+    let out = apply(&journal, &plan).unwrap();
+    assert_eq!(out.deposits, 3);
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].contains("2,500 recorded for Dec 2025, although their savings are suspended for December 2025"), "{}", out.warnings[0]);
+}
+
+#[test]
 fn a_benevolent_sheet_moves_the_schedule_past_what_it_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open_in_memory().unwrap();

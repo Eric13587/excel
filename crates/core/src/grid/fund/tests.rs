@@ -208,3 +208,49 @@ fn deleting_under_a_withdrawal_it_would_overdraw_is_refused_per_member() {
     assert!(plan.fund_changes.iter().all(|c| c.member_id == ben));
     assert_eq!(plan.tally_of("deposits"), (2, 4000.0));
 }
+
+#[test]
+fn a_suspension_typed_in_a_month_pauses_the_months_after_it_and_undoes() {
+    let journal = Journal::open_in_memory().unwrap();
+    let ann = member(&journal, "Ann");
+    put(&journal, Fund::Savings, ann, "2025-12-01", "Deposit", 2000.0);
+    let g = grid(&journal, Fund::Savings);
+    let change = stage(&g, row(&g, ann), "2026-02", "@s=2").unwrap().unwrap();
+    assert_eq!((change.kind, change.months, change.effect()), (ChangeKind::Suspend, Some(2), 0.0));
+    assert_eq!(describe(&change), "Suspends the member's savings contributions for 2 months from Feb 2026.");
+    assert_eq!(operations(Fund::Savings).format(&change_entries(&change)), "@S=2");
+    let result = apply_changes(&journal, Fund::Savings, &[change]).unwrap();
+    assert_eq!(result.summary(), "1 suspended");
+
+    // February and March are closed to the grid; January is not.
+    let g = grid(&journal, Fund::Savings);
+    let ann_row = row(&g, ann);
+    assert!(stage(&g, ann_row, "2026-01", "2,000").unwrap().is_some());
+    let closed = stage(&g, ann_row, "2026-03", "2,000").unwrap_err();
+    assert!(closed.contains("suspended from February 2026 to March 2026"), "{closed}");
+    assert!(cell_refusal(&g, ann_row, "2026-02").is_some());
+    // Fill Forward offers January only.
+    let plan = plan_fill(&journal, &g, &[ann_row], &months(), Some("2026-03-20")).unwrap();
+    assert_eq!(plan.changes.iter().map(|c| c.month.as_str()).collect::<Vec<_>>(), ["2026-01"]);
+    assert_eq!(plan.suspended, 2);
+    assert!(plan.notes().contains(&"2 suspended month(s) were skipped.".to_string()));
+
+    revert(&journal, Fund::Savings, &result).unwrap();
+    assert!(journal.funds().suspensions(ann).unwrap().is_empty());
+}
+
+#[test]
+fn a_suspension_is_refused_over_a_deposit_or_beside_other_entries() {
+    let journal = Journal::open_in_memory().unwrap();
+    let ann = member(&journal, "Ann");
+    put(&journal, Fund::Savings, ann, "2026-02-01", "Deposit", 2000.0);
+    let g = grid(&journal, Fund::Savings);
+    let over = stage(&g, row(&g, ann), "2026-01", "@S=3").unwrap_err();
+    assert!(over.contains("deposit in Feb 2026"), "{over}");
+    assert!(stage(&g, row(&g, ann), "2026-03", "2,000, @S=2").is_err());
+    assert_eq!(stage(&g, row(&g, ann), "2026-03", "@S=0").unwrap(), None);
+    assert!(stage(&g, row(&g, ann), "2026-03", "@S=61").is_err());
+    // Only savings suspends.
+    let christmas = grid(&journal, Fund::Christmas);
+    assert!(stage(&christmas, row(&christmas, ann), "2026-03", "@S=2").is_err());
+}

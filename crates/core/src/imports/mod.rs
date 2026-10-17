@@ -2,7 +2,8 @@
 //! journal (here), or a spreadsheet ([`excel`]).
 //!
 //! An import from a journal copies the chosen members — and, as asked, their
-//! loans and ledger, savings, Christmas and benevolent funds and suspensions.
+//! loans and ledger with the loans' suspensions, savings with the savings
+//! suspensions, and Christmas and benevolent funds.
 //! A member whose name is already on record exactly is merged into; one who
 //! only resembles somebody is a conflict the user decides. Every row is
 //! normalised by [`rules`]; what cannot be read is refused and reported.
@@ -25,6 +26,7 @@ use crate::Journal;
 use crate::dates;
 use crate::db::model::Fund;
 use crate::error::{Error, Result};
+use crate::funds::suspensions;
 use crate::loans::projection::project_member;
 use crate::loans::service::recalculate_default_deduction;
 
@@ -48,8 +50,17 @@ pub struct Source {
     pub path: PathBuf,
 }
 
-const TABLES: [&str; 8] =
-    ["individuals", "loans", "ledger", "savings", "christmas_savings", "benevolent_ledger", "benevolent_accounts", "loan_suspensions"];
+const TABLES: [&str; 9] = [
+    "individuals",
+    "loans",
+    "ledger",
+    "savings",
+    "christmas_savings",
+    "benevolent_ledger",
+    "benevolent_accounts",
+    "loan_suspensions",
+    "savings_suspensions",
+];
 
 fn rows_of(stmt: &mut rusqlite::Statement<'_>, params: impl rusqlite::Params) -> Result<Vec<SourceRow>> {
     let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
@@ -170,6 +181,7 @@ impl Source {
 pub struct Options {
     /// Loans, their ledger and their suspensions.
     pub loans: bool,
+    /// Savings and the savings suspensions.
     pub savings: bool,
     /// Christmas and benevolent funds, and benevolent enrolments.
     pub funds: bool,
@@ -368,6 +380,7 @@ pub struct Outcome {
     pub benevolent: usize,
     pub enrolments: usize,
     pub suspensions: usize,
+    pub savings_suspensions: usize,
     /// Rows refused by the normalisation rules, each with its reason among
     /// the warnings.
     pub rejected: usize,
@@ -385,7 +398,8 @@ impl Outcome {
             (self.savings, "savings entries"),
             (self.christmas, "Christmas entries"),
             (self.benevolent, "benevolent entries"),
-            (self.suspensions, "suspension(s)"),
+            (self.suspensions, "loan suspension(s)"),
+            (self.savings_suspensions, "savings suspension(s)"),
             (self.rejected, "refused"),
         ] {
             if n > 0 {
@@ -628,6 +642,38 @@ pub fn run(
         };
         if options.savings {
             out.savings = copy_fund(Fund::Savings, &rules::SAVINGS_TYPES, &rules::SAVINGS_SYNONYMS, "savings", &mut out, &mut added)?;
+            for span in source.rows_for("savings_suspensions", &moving, None)? {
+                let Some(source_member) = id_of(&span, "individual_id") else { continue };
+                let member = member_map[&source_member];
+                let read = rules::normalise_savings_suspension(&span);
+                let Some(v) = read.values else {
+                    out.warnings.push(format!("Skipped a savings suspension: {}", read.reason.unwrap_or_default()));
+                    out.rejected += 1;
+                    continue;
+                };
+                // A member merged into keeps their own suspensions.
+                let window = (v.start_date.clone(), v.resumed_date.clone());
+                if let Some(theirs) =
+                    suspensions::windows(journal, member)?.into_iter().find(|w| suspensions::overlaps(w, &window))
+                {
+                    let name = journal.members().name_of(member)?.unwrap_or_default();
+                    out.warnings.push(format!(
+                        "{name}'s savings are already suspended {}; the imported suspension {} was not brought across.",
+                        suspensions::describe(&theirs),
+                        suspensions::describe(&window)
+                    ));
+                    continue;
+                }
+                conn.execute(
+                    "INSERT INTO savings_suspensions (individual_id, start_date, suspend_until, resumed_date, status, \
+                     created_at) VALUES (?, ?, ?, ?, ?, COALESCE(?, datetime('now')))",
+                    params![member, v.start_date, v.suspend_until, v.resumed_date, v.status, v.created_at],
+                )?;
+                if merged.contains(&member) {
+                    added.note("savings_suspensions", conn.last_insert_rowid());
+                }
+                out.savings_suspensions += 1;
+            }
         }
         if options.funds {
             out.christmas = copy_fund(Fund::Christmas, &rules::SAVINGS_TYPES, &rules::SAVINGS_SYNONYMS, "Christmas", &mut out, &mut added)?;
@@ -680,10 +726,18 @@ pub fn run(
             "benevolent": out.benevolent,
             "benevolent_accounts": out.enrolments,
             "suspensions": out.suspensions,
+            "savings_suspensions": out.savings_suspensions,
             "rejected": out.rejected,
             "added": added.rows,
         });
-        let items = out.members + out.loans + out.ledger + out.savings + out.christmas + out.benevolent + out.suspensions;
+        let items = out.members
+            + out.loans
+            + out.ledger
+            + out.savings
+            + out.christmas
+            + out.benevolent
+            + out.suspensions
+            + out.savings_suspensions;
         journal.imports().finish(import_id, &details.to_string(), items as i64)?;
         Ok(())
     })?;
@@ -716,7 +770,9 @@ pub fn undo(journal: &Journal, import_id: i64) -> Result<Option<PathBuf>> {
         // them is re-derived afterwards.
         let mut touched: BTreeSet<i64> = BTreeSet::new();
         for (table, ids) in &added {
-            if !["christmas_savings", "benevolent_ledger", "loan_suspensions", "benevolent_accounts"].contains(&table.as_str()) {
+            if !["christmas_savings", "benevolent_ledger", "loan_suspensions", "savings_suspensions", "benevolent_accounts"]
+                .contains(&table.as_str())
+            {
                 continue;
             }
             for id in ids {

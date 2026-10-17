@@ -62,6 +62,9 @@
   range(columns.len()).map(i => if i == at { 1fr } else { auto })
 }
 
+// A greyed note across a table: a suspension.
+#let note_row(n, body) = (table.cell(colspan: n, fill: rgb("#f0f0f0"), text(fill: rgb("#888888"), style: "italic", body)),)
+
 #let loan_table(loan) = {
   let n = data.loan_columns.len()
   table(
@@ -75,7 +78,7 @@
     ..loan
       .rows
       .map(r => if "note" in r {
-        (table.cell(colspan: n, fill: rgb("#f0f0f0"), text(fill: rgb("#888888"), style: "italic")[#r.note]),)
+        note_row(n, r.note)
       } else {
         r.cells.enumerate().map(((i, v)) => carried(r, cell(v, data.loan_numeric.at(i))))
       })
@@ -90,10 +93,12 @@
   table.header(..data.savings_columns.map(c => table.cell(fill: rgb("#e0e0e0"), text(size: 7pt, weight: "bold")[#c]))),
   ..data
     .savings
-    .map(r => r.cells.enumerate().map(((i, v)) => {
-      let body = carried(r, cell(v, data.savings_numeric.at(i)))
-      if r.withdrawal and data.savings_columns.at(i) == "Amount" { text(fill: red, body) } else { body }
-    }))
+    .map(r => if "note" in r { note_row(data.savings_columns.len(), r.note) } else {
+      r.cells.enumerate().map(((i, v)) => {
+        let body = carried(r, cell(v, data.savings_numeric.at(i)))
+        if r.withdrawal and data.savings_columns.at(i) == "Amount" { text(fill: red, body) } else { body }
+      })
+    })
     .flatten(),
 )
 

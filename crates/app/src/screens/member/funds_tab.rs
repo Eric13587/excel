@@ -1,10 +1,12 @@
 //! The Savings, Christmas and Benevolent tabs: the balance, what can be done
-//! to the fund, and every movement.
+//! to the fund, and every movement — on Savings, with the months its
+//! contributions were suspended.
 
 use chrono::{Datelike, NaiveDate};
 use eframe::egui::{self, RichText};
 use egui_extras::{Column, TableBuilder};
-use loanmaster_core::db::model::{Fund, FundRow};
+use loanmaster_core::db::model::{Fund, FundRow, SavingsSuspension};
+use loanmaster_core::funds::suspensions::{self, Window};
 use loanmaster_core::money::shillings;
 use loanmaster_core::{dates, funds};
 
@@ -24,16 +26,34 @@ fn title(fund: Fund) -> &'static str {
     }
 }
 
+/// What a suspension window says on a badge: when it ends.
+fn badge_text(window: &Window) -> String {
+    match window.1.as_deref().and_then(dates::parse) {
+        Some(resume) => format!("⏸ SUSPENDED — RESUMES {}", resume.format("%B %Y").to_string().to_uppercase()),
+        None => "⏸ SUSPENDED UNTIL RESUMED".into(),
+    }
+}
+
 pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &MemberData, last_date: NaiveDate, actions: &mut Vec<Action>) {
     let p = theme::palette(ui.ctx());
     let member = screen.id;
     let i = slot(fund);
     let rows = &data.funds[i];
+    // Savings: the suspension in force this month, the next one to come, and
+    // every window, for the deposit dialog and "+ One Month".
+    let spans: &[SavingsSuspension] = if fund == Fund::Savings { &data.savings_suspensions } else { &[] };
+    let paused: Vec<Window> = spans.iter().map(suspensions::window).collect();
+    let this_month = dates::format(suspensions::month_start(chrono::Local::now().date_naive()));
+    let now = spans.iter().find(|s| suspensions::covering(&this_month, &[suspensions::window(s)]).is_some());
+    let upcoming = spans.iter().filter(|s| dates::date_part(&s.start_date) > this_month.as_str()).min_by(|a, b| a.start_date.cmp(&b.start_date));
     egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(10).inner_margin(12).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(RichText::new(title(fund)).size(17.0).strong());
             ui.label(RichText::new(format!("Balance {}", shillings(data.balances[i]))).size(17.0).color(p.accent));
+            if let Some(span) = now {
+                widgets::badge(ui, &badge_text(&suspensions::window(span)), p.warning);
+            }
         });
         match fund {
             Fund::Christmas => {
@@ -56,7 +76,16 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
                 };
                 ui.label(RichText::new(text).small().color(p.muted));
             }
-            Fund::Savings => {}
+            Fund::Savings => {
+                let note = match (now, upcoming) {
+                    (Some(span), _) => Some(format!("No savings deposit is taken {}.", suspensions::describe(&suspensions::window(span)))),
+                    (None, Some(span)) => Some(format!("Contributions will be suspended {}.", suspensions::describe(&suspensions::window(span)))),
+                    (None, None) => None,
+                };
+                if let Some(note) = note {
+                    ui.label(RichText::new(note).small().color(p.muted));
+                }
+            }
         }
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -89,7 +118,12 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
                 }
                 _ => {
                     if widgets::solid(ui, "Deposit…", p.success).clicked() {
-                        actions.push(Action::dialog(fund_dialogs::Movement::deposit(fund, member, monthly, last_date)));
+                        let dialog = if fund == Fund::Savings {
+                            fund_dialogs::Movement::savings_deposit(member, monthly, last_date, paused.clone())
+                        } else {
+                            fund_dialogs::Movement::deposit(fund, member, monthly, last_date)
+                        };
+                        actions.push(Action::dialog(dialog));
                     }
                     if widgets::solid(ui, "Withdraw…", p.warning).clicked() {
                         actions.push(Action::dialog(fund_dialogs::Movement::withdraw(fund, member, data.balances[i], data.unlock_month, last_date)));
@@ -103,7 +137,26 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
                     if widgets::solid_enabled(ui, monthly.is_some(), "+ One Month", p.accent, why).on_hover_text("One deposit of the monthly amount, in the month after the last one").clicked()
                         && let Some(monthly) = monthly
                     {
-                        actions.push(quick(fund, member, monthly, rows));
+                        actions.push(quick(fund, member, monthly, rows, paused.clone()));
+                    }
+                    if fund == Fund::Savings {
+                        match now {
+                            Some(span) => {
+                                if widgets::solid(ui, "▶ Resume…", p.success).on_hover_text("Take contributions again from this month").clicked() {
+                                    actions.push(Action::dialog(resume(member, &data.member.name, span)));
+                                }
+                            }
+                            None => {
+                                let why = format!("{} has left the SACCO.", data.member.name);
+                                if widgets::solid_enabled(ui, data.member.is_active(), "⏸ Suspend…", p.warning, &why)
+                                    .on_hover_text("Pause the monthly contribution for some months")
+                                    .clicked()
+                                {
+                                    let start = first_free_month(rows, &paused);
+                                    actions.push(Action::dialog(fund_dialogs::SuspendSavings::new(member, &data.member.name, start)));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -120,11 +173,12 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
         });
     });
     ui.add_space(10.0);
-    if rows.is_empty() {
+    if rows.is_empty() && spans.is_empty() {
         ui.add_space(30.0);
         ui.vertical_centered(|ui| ui.label(RichText::new("Nothing recorded yet.").color(p.muted)));
         return;
     }
+    let lines = lines(rows, spans);
     egui::Frame::new().fill(p.card).stroke(egui::Stroke::new(1.0, p.border)).corner_radius(10).inner_margin(6).show(ui, |ui| {
         TableBuilder::new(ui)
             .id_salt(("fund_table", i))
@@ -146,8 +200,14 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
                 }
             })
             .body(|body| {
-                body.rows(24.0, rows.len(), |mut table_row| {
-                    let row = &rows[table_row.index()];
+                body.rows(24.0, lines.len(), |mut table_row| {
+                    let row = match lines[table_row.index()] {
+                        Line::Entry(row) => row,
+                        Line::Band(span) => {
+                            band(&mut table_row, p, &data.member.name, span, actions);
+                            return;
+                        }
+                    };
                     let out = row.is_withdrawal();
                     table_row.col(|ui| {
                         ui.label(dates::date_part(&row.date));
@@ -185,15 +245,112 @@ pub fn show(screen: &mut MemberScreen, ui: &mut egui::Ui, fund: Fund, data: &Mem
     });
 }
 
+/// A row of a fund's table: one of its entries, or a savings suspension.
+enum Line<'a> {
+    Entry(&'a FundRow),
+    Band(&'a SavingsSuspension),
+}
+
+/// The entries in date order, each suspension placed where it begins.
+fn lines<'a>(rows: &'a [FundRow], spans: &'a [SavingsSuspension]) -> Vec<Line<'a>> {
+    let mut out: Vec<Line<'a>> = rows.iter().map(Line::Entry).collect();
+    let mut spans: Vec<&SavingsSuspension> = spans.iter().collect();
+    spans.sort_by(|a, b| b.start_date.cmp(&a.start_date));
+    for span in spans {
+        let start = dates::date_part(&span.start_date);
+        let at = out.iter().position(|l| matches!(l, Line::Entry(r) if dates::date_part(&r.date) >= start)).unwrap_or(out.len());
+        out.insert(at, Line::Band(span));
+    }
+    out
+}
+
+/// A suspension across the table, with a way to remove it.
+fn band(table_row: &mut egui_extras::TableRow<'_, '_>, p: &theme::Palette, name: &str, span: &SavingsSuspension, actions: &mut Vec<Action>) {
+    let window = suspensions::window(span);
+    for column in 0..5 {
+        table_row.col(|ui| {
+            widgets::fill_cell(ui, p.warning_bg);
+            match column {
+                0 => {
+                    ui.label(RichText::new(dates::date_part(&span.start_date)).color(p.warning));
+                }
+                1 => {
+                    ui.label(RichText::new("⏸ Suspended").strong().color(p.warning));
+                }
+                4 => {
+                    ui.label(RichText::new(format!("No contributions {}", suspensions::describe(&window))).italics().color(p.muted));
+                    if ui.small_button("Remove…").on_hover_text("Remove this suspension: its months become ordinary months again").clicked() {
+                        actions.push(Action::dialog(remove(name, span)));
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+/// The month a new suspension most likely starts in: this month, or the
+/// next if this one already has its deposit — stepped past any suspension.
+fn first_free_month(rows: &[FundRow], paused: &[Window]) -> NaiveDate {
+    let today = chrono::Local::now().date_naive();
+    let this_month = dates::format(today).get(..7).unwrap_or_default().to_string();
+    let deposited = rows.iter().any(|r| r.transaction_type == Fund::Savings.credit() && r.date.starts_with(&this_month));
+    let from = if deposited { dates::add_months(suspensions::month_start(today), 1) } else { today };
+    suspensions::first_unpaused_month(from, paused).unwrap_or(from)
+}
+
+fn resume(member: i64, name: &str, span: &SavingsSuspension) -> Confirm {
+    let name = name.to_string();
+    let month = chrono::Local::now().date_naive().format("%B %Y").to_string();
+    Confirm::new(
+        "Resume Savings Contributions",
+        format!(
+            "Resume {name}'s savings contributions from {month}?\n\nThey have been suspended {}. The months before stay \
+             without contributions; deposits are taken again from {month}.",
+            suspensions::describe(&suspensions::window(span))
+        ),
+        "Resume",
+        move |ws, actions| {
+            let result = suspensions::resume(&ws.journal, member, &dates::today());
+            outcome(actions, "The contributions could not be resumed", result, |_| format!("{name}'s savings contributions resume from {month}."));
+        },
+    )
+}
+
+fn remove(name: &str, span: &SavingsSuspension) -> Confirm {
+    let (id, name) = (span.id, name.to_string());
+    Confirm::new(
+        "Remove Savings Suspension",
+        format!(
+            "Remove the suspension of {name}'s contributions {}?\n\nIt is taken as never having applied: its months become \
+             ordinary months, which Catch Up and the Ledger Grid's Fill Forward will offer deposits for. Nothing already \
+             recorded changes.",
+            suspensions::describe(&suspensions::window(span))
+        ),
+        "Remove",
+        move |ws, actions| {
+            let result = suspensions::remove(&ws.journal, id);
+            outcome(actions, "The suspension could not be removed", result, |_| format!("The suspension of {name}'s contributions was removed."));
+        },
+    )
+}
+
 /// One deposit of the monthly amount: on the 1st of the month after the
-/// last deposit, or today when there is none.
-fn quick(fund: Fund, member: i64, monthly: f64, rows: &[FundRow]) -> Action {
+/// last deposit — the first such month the member's savings are not
+/// suspended in — or today when there is none.
+fn quick(fund: Fund, member: i64, monthly: f64, rows: &[FundRow], paused: Vec<Window>) -> Action {
     let last = rows.iter().filter(|r| r.transaction_type == fund.credit()).filter_map(|r| dates::parse(dates::date_part(&r.date))).max();
     Action::run(move |ws, actions| {
         let result = match last {
             Some(last) => {
-                let month = dates::add_months(last.with_day(1).unwrap_or(last), 1);
-                funds::catch_up_pot(&ws.journal, fund, member, Some(monthly), Some(&dates::format(month))).map(|_| month)
+                let after = dates::add_months(last.with_day(1).unwrap_or(last), 1);
+                match suspensions::first_unpaused_month(after, &paused) {
+                    Some(month) => funds::catch_up_pot(&ws.journal, fund, member, Some(monthly), Some(&dates::format(month))).map(|_| month),
+                    None => Err(loanmaster_core::Error::invalid(format!(
+                        "Savings contributions are suspended {}; resume them first.",
+                        suspensions::covering(&dates::format(after), &paused).map(suspensions::describe).unwrap_or_default()
+                    ))),
+                }
             }
             None => {
                 let today = chrono::Local::now().date_naive();

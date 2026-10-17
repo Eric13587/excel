@@ -87,6 +87,33 @@ fn a_suspension_is_noted_with_the_months_inside_the_period() {
 }
 
 #[test]
+fn a_savings_suspension_is_noted_in_months_among_the_savings() {
+    let journal = Journal::open_in_memory().unwrap();
+    let ann = member(&journal, "Ann");
+    funds::deposit(&journal, Fund::Savings, ann, 2500.0, "2026-06-01", "").unwrap();
+    funds::suspensions::suspend(&journal, ann, "2026-07-01", Some(3)).unwrap();
+    funds::deposit(&journal, Fund::Savings, ann, 2500.0, "2026-10-01", "").unwrap();
+
+    let s = statement(&journal, ann, "2026-06-01", "2026-08-31");
+    let lines: Vec<(&str, Option<&str>)> = s.savings.iter().map(|l| (l.date.as_str(), l.annotation.as_deref())).collect();
+    assert_eq!(
+        lines,
+        [("2026-06-01", None), ("2026-07-01", Some("Savings suspended — no contributions for Jul, Aug 2026 (they resume in October 2026)"))]
+    );
+    let s = statement(&journal, ann, "2026-08-01", "2026-12-31");
+    assert_eq!(s.savings[1].annotation.as_deref(), Some("Savings suspended — no contributions for Aug, Sep 2026"));
+    assert_eq!(s.savings[1].date, "2026-08-01");
+    assert!(!s.savings[1].is_withdrawal());
+
+    funds::suspensions::suspend(&journal, ann, "2027-01-01", None).unwrap();
+    let s = statement(&journal, ann, "2026-11-01", "2027-10-31");
+    assert_eq!(
+        s.savings.last().unwrap().annotation.as_deref(),
+        Some("Savings suspended from January 2027 — contributions paused until further notice")
+    );
+}
+
+#[test]
 fn an_empty_period_is_empty_and_a_bad_one_is_refused() {
     let journal = Journal::open_in_memory().unwrap();
     let ann = member(&journal, "Ann");

@@ -16,7 +16,8 @@ every place 2.0 behaves differently on purpose, is in
   PDF / CSV).
 - **Loans** — issue, monthly deductions, catch-up, top-ups, buy-offs,
   suspensions, and corrections to any entry.
-- **Savings** — deposits, withdrawals, catch-up.
+- **Savings** — deposits, withdrawals, catch-up, and suspending a member's
+  contributions for some months or until resumed, as a loan can be suspended.
 - **Christmas & Benevolent funds** — separate ledgers with enrolment,
   contributions and welfare payouts.
 - **Ledger Grid** — every member and month in one table for bulk work: type,
@@ -49,7 +50,8 @@ cargo run --release -p loanmaster -- path/to/journal.db
 
 On first launch, create a new journal (`.db` file) or open an existing one.
 A 1.x journal must be at schema version 12: if 2.0 refuses one, open it once
-in LoanMaster 1.x, which brings it up to date.
+in LoanMaster 1.x, which brings it up to date. 2.0 then adds the savings
+suspensions table to it on opening (version 13); 1.x still opens it.
 
 `--software` (or `LOANMASTER_SOFTWARE_RENDERING=1`) draws without the graphics
 card, for machines whose drivers misbehave. LoanMaster falls back to it by

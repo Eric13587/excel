@@ -13,6 +13,7 @@ use crate::Journal;
 use crate::dates;
 use crate::db::model::{Fund, LedgerRow, Suspension, event};
 use crate::error::{Error, Result};
+use crate::funds::suspensions::{self as savings_suspensions, Window};
 use crate::loans::service::loan_rate;
 use crate::money::{ceil, round2, total};
 use crate::notes;
@@ -97,6 +98,8 @@ pub struct SavingsLine {
     pub notes: String,
     /// The savings as they stood when the period began, carried in.
     pub brought_forward: bool,
+    /// A note spanning the row — a suspension — instead of an entry.
+    pub annotation: Option<String>,
 }
 
 impl SavingsLine {
@@ -247,6 +250,48 @@ fn suspension_lines(reference: &str, spans: &[Suspension], from: &str, to: &str,
     lines
 }
 
+/// Greyed lines for the savings suspensions that touch the period, each
+/// naming only the months inside it. A suspension is whole months, so it is
+/// written in months.
+fn savings_pause_lines(windows: &[Window], from: &str, to: &str) -> Vec<SavingsLine> {
+    let (Some(lo), Some(hi)) = (dates::parse(from), dates::parse(to)) else { return Vec::new() };
+    let period = ((lo.year(), lo.month()), (hi.year(), hi.month()));
+    let in_words = |date: NaiveDate| date.format("%B %Y").to_string();
+    let mut lines = Vec::new();
+    for (start_text, end_text) in windows {
+        let Some(start) = dates::parse(start_text) else { continue };
+        if start_text.as_str() > to || end_text.as_deref().is_some_and(|e| e <= from) {
+            continue;
+        }
+        let text = match end_text.as_deref().and_then(dates::parse) {
+            Some(end) => {
+                let mut months = months_spanned(start, end, false);
+                months.retain(|m| *m >= period.0 && *m <= period.1);
+                if months.is_empty() {
+                    continue;
+                }
+                let list = month_list(&months);
+                if end_text.as_deref().is_some_and(|e| e > to) {
+                    format!("Savings suspended — no contributions for {list} (they resume in {})", in_words(end))
+                } else {
+                    format!("Savings suspended — no contributions for {list}")
+                }
+            }
+            None => format!("Savings suspended from {} — contributions paused until further notice", in_words(start)),
+        };
+        lines.push(SavingsLine {
+            date: start_text.as_str().max(from).to_string(),
+            kind: "Savings Suspended".into(),
+            amount: 0.0,
+            balance: 0.0,
+            notes: String::new(),
+            brought_forward: false,
+            annotation: Some(text),
+        });
+    }
+    lines
+}
+
 /// A member's statement from `from` to `to` (inclusive, `YYYY-MM-DD`).
 pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: &StatementConfig) -> Result<Statement> {
     let member = journal.members().get(member_id)?.ok_or(Error::MemberNotFound(member_id))?;
@@ -373,7 +418,15 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
                 balance: running,
                 notes: notes::fund_note(&row.transaction_type, &row.notes),
                 brought_forward: false,
+                annotation: None,
             });
+        }
+    }
+    if config.show_savings {
+        let paused = savings_pause_lines(&savings_suspensions::windows(journal, member_id)?, &from, &to);
+        if !paused.is_empty() {
+            savings.extend(paused);
+            savings.sort_by(|a, b| dates::date_part(&a.date).cmp(dates::date_part(&b.date)));
         }
     }
     if config.show_savings
@@ -381,7 +434,15 @@ pub fn prepare(journal: &Journal, member_id: i64, from: &str, to: &str, config: 
     {
         savings.insert(
             0,
-            SavingsLine { date: from.clone(), kind: BROUGHT_FORWARD.into(), amount: 0.0, balance, notes: String::new(), brought_forward: true },
+            SavingsLine {
+                date: from.clone(),
+                kind: BROUGHT_FORWARD.into(),
+                amount: 0.0,
+                balance,
+                notes: String::new(),
+                brought_forward: true,
+                annotation: None,
+            },
         );
     }
 

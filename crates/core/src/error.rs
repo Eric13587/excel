@@ -5,7 +5,10 @@
 //! is. Only `Db` and `Io` are failures of the machine rather than of the input.
 
 /// The version of the journal schema this application reads and writes.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
+/// The oldest journal it opens: 1.x's last version, which it brings up to
+/// [`SCHEMA_VERSION`] on opening.
+pub const OLDEST_SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -16,10 +19,16 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error(
-        "This journal is on schema version {found}. LoanMaster {app} opens version \
-         {expected} journals only — update it once with LoanMaster 1.x, then open it here."
+        "This journal is on schema version {found}. LoanMaster {app} opens journals from version \
+         {expected} on — open it once in LoanMaster 1.x, which brings it up to date, then open it here."
     )]
     OutdatedSchema { found: i64, expected: i64, app: &'static str },
+
+    #[error(
+        "This journal was written by a newer LoanMaster (schema version {found}); LoanMaster {app} \
+         reads up to version {newest}. Install the newer LoanMaster to open it."
+    )]
+    NewerSchema { found: i64, newest: i64, app: &'static str },
 
     #[error("This file is not a LoanMaster journal.")]
     NotAJournal,

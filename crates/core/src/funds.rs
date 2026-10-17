@@ -6,9 +6,10 @@
 //! type, never in the amount: only a `Withdrawal` takes money out.
 //!
 //! Savings and Christmas are pots with a monthly contribution that catch-up
-//! fills forward from the last deposit. Christmas withdrawals are locked
-//! outside the unlock month. Benevolent is a perpetual contribution on a
-//! due-date schedule, like a loan's; payouts are welfare claims on the pool.
+//! fills forward from the last deposit; savings contributions can be
+//! suspended for some months ([`suspensions`]). Christmas withdrawals are
+//! locked outside the unlock month. Benevolent is a perpetual contribution on
+//! a due-date schedule, like a loan's; payouts are welfare claims on the pool.
 
 use std::collections::HashMap;
 
@@ -20,6 +21,8 @@ use crate::db::model::{Fund, FundRow, WITHDRAWAL};
 use crate::error::{Error, Result};
 use crate::money::round2;
 use crate::policy::{self, Operation};
+
+pub mod suspensions;
 
 /// One fund transaction before it is written.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +108,13 @@ pub fn check(journal: &Journal, posting: Posting) -> Result<(Posting, Vec<String
     if tidy.kind != WITHDRAWAL {
         let op = Operation::new(policy_kind(tidy.fund), tidy.member_id).on(&tidy.date);
         problems.extend(policy::check(journal, &op)?.into_iter().map(|r| r.reason));
+        // A suspension pauses the monthly contribution; interest still lands.
+        if tidy.fund == Fund::Savings
+            && tidy.kind == tidy.fund.credit()
+            && let Some(reason) = suspensions::deposit_refusal(journal, tidy.member_id, &tidy.date)?
+        {
+            problems.push(reason);
+        }
     } else if journal.members().get(tidy.member_id)?.is_none() {
         problems.push(format!("Member {} no longer exists.", tidy.member_id));
     }
@@ -223,7 +233,8 @@ pub fn withdraw_all(journal: &Journal, fund: Fund, member_id: i64, date: &str, n
     Ok(balance)
 }
 
-/// Correct a row's date, amount and notes; balances follow.
+/// Correct a row's date, amount and notes; balances follow. A savings
+/// deposit is not moved into a month the member's savings are suspended in.
 pub fn edit_row(journal: &Journal, fund: Fund, row_id: i64, date: &str, amount: f64, notes: &str) -> Result<()> {
     if dates::parse(date).is_none() {
         return Err(Error::invalid(format!("{date} is not a date (use YYYY-MM-DD).")));
@@ -233,6 +244,13 @@ pub fn edit_row(journal: &Journal, fund: Fund, row_id: i64, date: &str, amount: 
     }
     journal.transaction(|| {
         let row = journal.funds().get(fund, row_id)?.ok_or_else(|| Error::invalid("That entry no longer exists."))?;
+        if fund == Fund::Savings
+            && row.transaction_type == fund.credit()
+            && dates::month_key(date) != dates::month_key(&row.date)
+            && let Some(reason) = suspensions::deposit_refusal(journal, row.individual_id, date)?
+        {
+            return Err(Error::NotAllowed(vec![reason]));
+        }
         journal.funds().update(fund, row_id, dates::date_part(date), round2(amount), notes.trim())?;
         journal.funds().recalculate(fund, row.individual_id)
     })
@@ -260,25 +278,37 @@ pub fn delete_all(journal: &Journal, fund: Fund, member_id: i64) -> Result<()> {
     })
 }
 
+/// What a catch-up did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaughtUp {
+    pub added: usize,
+    /// Months passed over because the member's savings were suspended.
+    pub suspended: usize,
+}
+
 /// Add the monthly contribution from the month after the member's last
 /// deposit through the target month (default: this month), on the 1st of
-/// each. Savings and Christmas only. Returns how many were added.
-pub fn catch_up_pot(journal: &Journal, fund: Fund, member_id: i64, monthly: Option<f64>, target: Option<&str>) -> Result<usize> {
+/// each, stepping over months the member's savings are suspended. Savings and
+/// Christmas only.
+pub fn catch_up_pot(journal: &Journal, fund: Fund, member_id: i64, monthly: Option<f64>, target: Option<&str>) -> Result<CaughtUp> {
     assert!(fund != Fund::Benevolent, "benevolent catches up on its schedule");
     let kind = if fund == Fund::Savings { "savings.catch_up" } else { "christmas.catch_up" };
     policy::enforce(journal, &Operation::new(kind, member_id))?;
     let rows = rows(journal, fund, member_id)?;
     let Some(last) = rows.iter().rev().find(|r| r.transaction_type == fund.credit()).or(rows.last()) else {
-        return Ok(0);
+        return Ok(CaughtUp::default());
     };
-    let Some(last_date) = dates::parse(last.date.split_whitespace().next().unwrap_or("")) else { return Ok(0) };
+    let Some(last_date) = dates::parse(last.date.split_whitespace().next().unwrap_or("")) else {
+        return Ok(CaughtUp::default());
+    };
     let monthly = match monthly.filter(|m| *m > 0.0) {
         Some(m) => m,
         None => suggested_increment(journal, fund, member_id)?,
     };
     if monthly <= 0.0 {
-        return Ok(0);
+        return Ok(CaughtUp::default());
     }
+    let paused = if fund == Fund::Savings { suspensions::windows(journal, member_id)? } else { Vec::new() };
     let target = match target {
         Some(t) => dates::parse(t).ok_or_else(|| Error::invalid(format!("{t} is not a date.")))?,
         None => chrono::Local::now().date_naive(),
@@ -287,13 +317,18 @@ pub fn catch_up_pot(journal: &Journal, fund: Fund, member_id: i64, monthly: Opti
     let mut next = dates::add_months(last_date, 1).with_day(1).unwrap_or(last_date);
     let notes = "Monthly contribution (Auto)";
     journal.transaction(|| {
-        let mut count = 0;
+        let mut done = CaughtUp::default();
         while next < limit {
-            post(journal, Posting::new(fund, member_id, &dates::format(next), fund.credit(), monthly, notes))?;
-            count += 1;
+            let date = dates::format(next);
+            if suspensions::covering(&date, &paused).is_some() {
+                done.suspended += 1;
+            } else {
+                post(journal, Posting::new(fund, member_id, &date, fund.credit(), monthly, notes))?;
+                done.added += 1;
+            }
             next = dates::add_months(next, 1);
         }
-        Ok(count)
+        Ok(done)
     })
 }
 
@@ -412,10 +447,37 @@ mod tests {
         deposit(&journal, Fund::Savings, ann, 1000.0, "2025-01-01", "").unwrap();
         deposit(&journal, Fund::Savings, ann, 2000.0, "2025-02-01", "").unwrap();
         deposit(&journal, Fund::Savings, ann, 2000.0, "2025-03-01", "").unwrap();
-        assert_eq!(catch_up_pot(&journal, Fund::Savings, ann, None, Some("2025-05-15")).unwrap(), 2);
+        assert_eq!(catch_up_pot(&journal, Fund::Savings, ann, None, Some("2025-05-15")).unwrap().added, 2);
         let dates: Vec<String> = rows(&journal, Fund::Savings, ann).unwrap().iter().map(|r| r.date.clone()).collect();
         assert_eq!(dates.last().map(String::as_str), Some("2025-05-01"));
         assert_eq!(balance(&journal, Fund::Savings, ann).unwrap(), 9000.0);
+    }
+
+    #[test]
+    fn catch_up_steps_over_suspended_months() {
+        let journal = Journal::open_in_memory().unwrap();
+        let ann = member(&journal, "Ann");
+        deposit(&journal, Fund::Savings, ann, 2000.0, "2025-01-01", "").unwrap();
+        suspensions::suspend(&journal, ann, "2025-03-01", Some(2)).unwrap();
+        let done = catch_up_pot(&journal, Fund::Savings, ann, None, Some("2025-06-30")).unwrap();
+        assert_eq!(done, CaughtUp { added: 3, suspended: 2 });
+        let months: Vec<String> = rows(&journal, Fund::Savings, ann).unwrap().iter().map(|r| r.date.clone()).collect();
+        assert_eq!(months, ["2025-01-01", "2025-02-01", "2025-05-01", "2025-06-01"]);
+        // Christmas keeps its own months.
+        deposit(&journal, Fund::Christmas, ann, 500.0, "2025-02-01", "").unwrap();
+        assert_eq!(catch_up_pot(&journal, Fund::Christmas, ann, None, Some("2025-04-30")).unwrap().added, 2);
+    }
+
+    #[test]
+    fn a_deposit_is_not_moved_into_a_suspended_month() {
+        let journal = Journal::open_in_memory().unwrap();
+        let ann = member(&journal, "Ann");
+        deposit(&journal, Fund::Savings, ann, 2000.0, "2025-02-01", "").unwrap();
+        suspensions::suspend(&journal, ann, "2025-03-01", Some(2)).unwrap();
+        let id = rows(&journal, Fund::Savings, ann).unwrap()[0].id;
+        assert!(matches!(edit_row(&journal, Fund::Savings, id, "2025-03-10", 2000.0, ""), Err(Error::NotAllowed(_))));
+        edit_row(&journal, Fund::Savings, id, "2025-02-20", 2500.0, "corrected").unwrap();
+        assert_eq!(balance(&journal, Fund::Savings, ann).unwrap(), 2500.0);
     }
 
     #[test]

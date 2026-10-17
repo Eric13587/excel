@@ -3,12 +3,14 @@
 //! [`Journal`] owns the connection and the rules for opening one safely:
 //!
 //! * **a new journal** is created whole from `schema.sql` — the version-12
-//!   schema, byte-identical to what LoanMaster 1.x creates, so a journal can
-//!   move between the two;
-//! * **an existing journal** is never altered on open. It must already be at
-//!   [`SCHEMA_VERSION`]; older ones are refused with the remedy named. (The 1.x
-//!   migration chain is not carried forward: existing journals are sanitized
-//!   and brought up to date by hand.)
+//!   schema, byte-identical to what LoanMaster 1.x creates — and then given
+//!   2.0's own additions ([`UPGRADES`]);
+//! * **an existing journal** must be at version 12 or later. A version-12
+//!   journal is given the additions on open, after the on-open backup; they
+//!   only add tables 1.x never reads, so the journal still opens in 1.x.
+//!   Nothing else is altered. Older journals are refused with the remedy
+//!   named — the 1.x migration chain is not carried forward — and so are
+//!   journals from a newer LoanMaster.
 //! * **WAL** only on storage positively identified as local. SQLite's locking
 //!   is unreliable on network shares and WAL needs shared memory they do not
 //!   provide, so anything else keeps the rollback journal.
@@ -34,9 +36,16 @@ use std::path::{Path, PathBuf};
 use log::{info, warn};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::error::{Error, Result, SCHEMA_VERSION};
+use crate::error::{Error, OLDEST_SCHEMA_VERSION, Result, SCHEMA_VERSION};
 
 const SCHEMA: &str = include_str!("../schema.sql");
+
+/// What 2.0 adds to 1.x's version 12, in order: `(version, name, script)`.
+/// Each only adds a table 1.x never reads, and is recorded in
+/// `schema_migrations` as 1.x records its own; 1.x passes over versions it
+/// does not know.
+const UPGRADES: [(i64, &str, &str); 1] =
+    [(13, "savings_suspensions", include_str!("../upgrades/013_savings_suspensions.sql"))];
 
 /// How many dated on-open backups to keep per journal.
 pub const BACKUP_KEEP_COUNT: usize = 10;
@@ -77,6 +86,8 @@ pub struct OpenReport {
     pub orphaned_rows: usize,
     /// Where the on-open backup went, if one was taken.
     pub backup: Option<PathBuf>,
+    /// The version the journal was brought up from by this open, if it was.
+    pub upgraded_from: Option<i64>,
 }
 
 pub struct Journal {
@@ -255,35 +266,56 @@ impl Journal {
         )?)
     }
 
-    /// Create a new journal whole, or check an existing one is current.
+    /// Create a new journal whole, or check an existing one and bring a
+    /// version-12 journal up to date.
     fn ensure_schema(&mut self) -> Result<()> {
         if self.table_count()? == 0 {
-            self.transaction(|| Ok(self.conn.execute_batch(SCHEMA)?))?;
+            self.transaction(|| {
+                self.conn.execute_batch(SCHEMA)?;
+                self.upgrade_from(OLDEST_SCHEMA_VERSION)
+            })?;
             self.report.created = true;
             info!("Created a new journal at {}", self.display_path());
             return Ok(());
         }
-        let has_versions: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'",
-            [],
-            |r| r.get(0),
-        )?;
-        let found: i64 = if has_versions == 1 {
-            self.conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| {
-                r.get(0)
-            })?
-        } else {
-            0
-        };
-        if found != SCHEMA_VERSION {
+        let found = self.schema_version()?;
+        if found > SCHEMA_VERSION {
+            return Err(Error::NewerSchema { found, newest: SCHEMA_VERSION, app: env!("CARGO_PKG_VERSION") });
+        }
+        if found < OLDEST_SCHEMA_VERSION {
             if found == 0 && !self.has_table("individuals")? {
                 return Err(Error::NotAJournal);
             }
             return Err(Error::OutdatedSchema {
                 found,
-                expected: SCHEMA_VERSION,
+                expected: OLDEST_SCHEMA_VERSION,
                 app: env!("CARGO_PKG_VERSION"),
             });
+        }
+        if found < SCHEMA_VERSION {
+            self.transaction(|| self.upgrade_from(found))?;
+            self.report.upgraded_from = Some(found);
+            info!("Brought {} from schema version {found} to {SCHEMA_VERSION}", self.display_path());
+        }
+        Ok(())
+    }
+
+    /// The highest version `schema_migrations` records; 0 without the table.
+    fn schema_version(&self) -> Result<i64> {
+        if !self.has_table("schema_migrations")? {
+            return Ok(0);
+        }
+        Ok(self.conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| r.get(0))?)
+    }
+
+    /// Apply every addition past `from`, recording each one.
+    fn upgrade_from(&self, from: i64) -> Result<()> {
+        for (version, name, script) in UPGRADES.into_iter().filter(|(v, _, _)| *v > from) {
+            self.conn.execute_batch(script)?;
+            self.conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at, statements) VALUES (?, ?, ?, ?)",
+                rusqlite::params![version, name, crate::dates::now_stamp(), script.matches(';').count() as i64],
+            )?;
         }
         Ok(())
     }
@@ -558,6 +590,42 @@ mod tests {
         match Journal::open(&path, OpenOptions::default()) {
             Err(Error::OutdatedSchema { found: 11, .. }) => {}
             other => panic!("expected OutdatedSchema, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn a_version_12_journal_is_brought_up_to_date_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v12.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute("INSERT INTO individuals (name) VALUES ('Ann')", []).unwrap();
+        }
+        let journal = Journal::open(&path, OpenOptions::default()).unwrap();
+        assert_eq!(journal.report().upgraded_from, Some(12));
+        assert!(journal.has_table("savings_suspensions").unwrap());
+        assert_eq!(journal.schema_version().unwrap(), SCHEMA_VERSION);
+        let names: i64 = journal.conn().query_row("SELECT COUNT(*) FROM individuals", [], |r| r.get(0)).unwrap();
+        assert_eq!(names, 1);
+        drop(journal);
+        // Opening it again finds nothing to do.
+        let journal = Journal::open(&path, OpenOptions::default()).unwrap();
+        assert_eq!(journal.report().upgraded_from, None);
+    }
+
+    #[test]
+    fn a_journal_from_a_newer_loanmaster_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.db");
+        drop(Journal::open(&path, OpenOptions::default()).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute("INSERT INTO schema_migrations VALUES (?, 'later', '', 0)", [SCHEMA_VERSION + 1])
+            .unwrap();
+        match Journal::open(&path, OpenOptions::default()) {
+            Err(Error::NewerSchema { found, .. }) => assert_eq!(found, SCHEMA_VERSION + 1),
+            other => panic!("expected NewerSchema, got {:?}", other.map(|_| ())),
         }
     }
 

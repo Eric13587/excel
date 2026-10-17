@@ -16,12 +16,19 @@ from 1.x on purpose.
 ## The journal
 
 * The schema in `crates/core/src/schema.sql` is byte-identical to the one 1.x
-  creates at version 12, so 1.x and 2.0 can open the same file. Loan snapshots
-  (`ledger.previous_state`) are written as the same JSON, so either version can
-  restore from rows the other wrote.
-* 2.0 opens only version-12 journals. It refuses an older journal instead of
-  migrating it, and says so: open the journal once in 1.x first, which brings
-  it up to date. A backup older than version 12 is refused for the same reason.
+  creates at version 12. 2.0 adds one table to it, as version 13:
+  `savings_suspensions` (see [Savings suspensions](#savings-suspensions)). A
+  version-12 journal is given it the first time 2.0 opens it, after the
+  on-open backup. 1.x passes over migration versions it does not know and
+  never reads the table, so 1.x and 2.0 can still open the same file; 1.x
+  just takes savings deposits in suspended months as it always did. Loan
+  snapshots (`ledger.previous_state`) are written as the same JSON, so either
+  version can restore from rows the other wrote.
+* 2.0 opens journals from version 12 on. It refuses an older journal instead
+  of migrating it, and says so: open the journal once in 1.x first, which
+  brings it up to date. A backup older than version 12 is refused for the
+  same reason; a version-12 backup is restored and given the new table. A
+  journal or backup from a newer LoanMaster is refused.
 * Money stays in `REAL` columns. `money::round2` matches Python's
   `round(x, 2)` exactly, including round-half-even on the binary value.
 
@@ -108,6 +115,31 @@ purpose.
 * **Leaving is refused on a date still to come, or before the member's last
   savings or Christmas entry**: a withdrawal dated before later entries would
   run the balance below zero in between. 1.x always used today's date.
+
+### Savings suspensions
+
+* **A member's savings contributions can be suspended**, as a loan's
+  deductions can: for a number of months or until resumed, from the member's
+  Savings tab (Suspend…, Resume…, and Remove on the suspension's line), or by
+  typing `@S=3` in a month of the Ledger Grid's Savings tab. 1.x had no such
+  thing.
+* **A suspension covers whole months.** Inside it a savings deposit is
+  refused wherever it is made; Catch Up, + One Month and Fill Forward pass
+  over its months; and the Ledger Grid shows them as ⏸ and closed, as it
+  closes a suspended loan's months. Withdrawals, interest and corrections go
+  on as before — the money is still the member's — and the Christmas fund is
+  not affected.
+* **It cannot be recorded over months that already hold a savings deposit,
+  or overlap another suspension**; asking for longer than one already running
+  extends it. Resuming ends it from this month (one that begins this month is
+  simply removed). Removing it treats it as never having applied, so its
+  months are offered for deposits again.
+* **Statements show it among the savings, in months**: "Savings suspended — no
+  contributions for Nov, Dec 2026 (they resume in January 2027)".
+* **Imports**: a journal import brings a member's savings suspensions with
+  their savings, leaving out one that overlaps a merged member's own and
+  saying so. A contribution spreadsheet records money received, so a deposit
+  it holds for a suspended month is imported, with a warning.
 
 ### Loan references
 
@@ -198,7 +230,7 @@ purpose.
 * **The date filter applies to every kind of transaction.** 1.x applied it
   to the ledger and savings only.
 * **Undo also removes what was added to merged members**: their Christmas and
-  benevolent rows, suspensions and new benevolent enrolment. The schema has no
+  benevolent rows, loan and savings suspensions and new benevolent enrolment. The schema has no
   `import_id` on those tables, so 2.0 lists them in the run's details. A
   merged member's existing benevolent enrolment is kept, not replaced.
 * **Conflicts compare names and emails exactly, ignoring case.** 1.x used

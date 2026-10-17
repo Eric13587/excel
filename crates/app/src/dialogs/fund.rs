@@ -1,14 +1,15 @@
-//! Dialogs for a member's funds: money in and out, corrections, and the
-//! benevolent enrolment.
+//! Dialogs for a member's funds: money in and out, corrections, the
+//! benevolent enrolment, and suspending savings contributions.
 
 use chrono::{Datelike, NaiveDate};
 use eframe::egui::{self, RichText};
 use loanmaster_core::db::model::{Enrolment, Fund, FundRow};
+use loanmaster_core::funds::suspensions::{self, Window};
 use loanmaster_core::money::{figure, shillings};
-use loanmaster_core::{dates, funds};
+use loanmaster_core::{Journal, dates, funds};
 
 use super::footer;
-use crate::app::{Action, outcome};
+use crate::app::{Action, Notice, outcome};
 use crate::theme;
 use crate::widgets::{self, amount};
 
@@ -30,11 +31,19 @@ pub struct Movement {
     balance: f64,
     unlock_month: u32,
     override_lock: bool,
+    /// Savings deposits: when the member's contributions are suspended.
+    paused: Vec<Window>,
 }
 
 impl Movement {
     pub fn deposit(fund: Fund, member: i64, monthly: Option<f64>, date: NaiveDate) -> Movement {
         Movement::new(Kind::Deposit, fund, member, monthly.map(figure).unwrap_or_default(), date, 0.0, 12)
+    }
+
+    /// A savings deposit, warned off the months the member's contributions
+    /// are suspended in.
+    pub fn savings_deposit(member: i64, monthly: Option<f64>, date: NaiveDate, paused: Vec<Window>) -> Movement {
+        Movement { paused, ..Movement::deposit(Fund::Savings, member, monthly, date) }
     }
 
     pub fn withdraw(fund: Fund, member: i64, balance: f64, unlock_month: u32, date: NaiveDate) -> Movement {
@@ -46,7 +55,7 @@ impl Movement {
     }
 
     fn new(kind: Kind, fund: Fund, member: i64, amount: String, date: NaiveDate, balance: f64, unlock_month: u32) -> Movement {
-        Movement { kind, fund, member, amount, date, notes: String::new(), balance, unlock_month, override_lock: false }
+        Movement { kind, fund, member, amount, date, notes: String::new(), balance, unlock_month, override_lock: false, paused: Vec::new() }
     }
 
     pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) -> bool {
@@ -79,6 +88,14 @@ impl Movement {
             let mut problem = None;
             if self.kind == Kind::Withdraw && value.is_some_and(|v| v > self.balance + 0.005) {
                 problem = Some(format!("That is more than the balance of {}.", shillings(self.balance)));
+            }
+            if self.kind == Kind::Deposit
+                && let Some(window) = suspensions::covering(&dates::format(self.date), &self.paused)
+            {
+                problem = Some(format!(
+                    "Savings contributions are suspended {}. Choose a date outside it, or resume them first.",
+                    suspensions::describe(window)
+                ));
             }
             let locked = self.kind == Kind::Withdraw && self.fund == Fund::Christmas && self.date.month() != self.unlock_month;
             if locked {
@@ -237,6 +254,117 @@ impl Enrol {
                             format!("Enrolled at {} a month from {start}.", shillings(value))
                         });
                     }));
+                    open = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    open = false;
+                }
+            });
+        });
+        open && !response.should_close()
+    }
+}
+
+/// Suspend a member's savings contributions for some months, or until they
+/// are resumed.
+pub struct SuspendSavings {
+    member: i64,
+    name: String,
+    /// Any day of the first month paused.
+    start: NaiveDate,
+    open_ended: bool,
+    months: u32,
+    problem: Option<String>,
+}
+
+impl SuspendSavings {
+    pub fn new(member: i64, name: &str, start: NaiveDate) -> SuspendSavings {
+        SuspendSavings { member, name: name.into(), start, open_ended: false, months: 3, problem: None }
+    }
+
+    fn window(&self) -> Window {
+        let first = suspensions::month_start(self.start);
+        let end = (!self.open_ended).then(|| dates::format(dates::add_months(first, self.months as i32)));
+        (dates::format(first), end)
+    }
+
+    fn save(&mut self, journal: &Journal, actions: &mut Vec<Action>) -> bool {
+        let months = (!self.open_ended).then_some(self.months);
+        match suspensions::suspend(journal, self.member, &dates::format(self.start), months) {
+            Ok(_) => {
+                let span = suspensions::in_force(journal, self.member, &dates::format(self.start)).ok().flatten();
+                let when = span.map(|s| suspensions::describe(&suspensions::window(&s))).unwrap_or_else(|| suspensions::describe(&self.window()));
+                actions.push(Action::Status(format!("{}'s savings contributions are suspended {when}.", self.name)));
+                actions.push(Action::Changed);
+                true
+            }
+            Err(e) if e.is_user_facing() => {
+                self.problem = Some(e.to_string());
+                false
+            }
+            Err(e) => {
+                actions.push(Action::Notice(Notice::from_error("The suspension could not be recorded", &e)));
+                true
+            }
+        }
+    }
+
+    pub fn show(&mut self, ctx: &egui::Context, journal: &Journal, actions: &mut Vec<Action>) -> bool {
+        let p = theme::palette(ctx);
+        let mut open = true;
+        let response = egui::Modal::new(egui::Id::new("suspend_savings")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading("Suspend Savings Contributions");
+            ui.label(RichText::new(&self.name).color(p.muted));
+            ui.add_space(6.0);
+            egui::Grid::new("suspend_savings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                ui.label("From");
+                ui.horizontal(|ui| {
+                    if widgets::date(ui, "suspend_savings_start", &mut self.start).changed() {
+                        self.problem = None;
+                    }
+                    ui.label(RichText::new(self.start.format("%B %Y").to_string()).strong());
+                });
+                ui.end_row();
+                ui.label("For");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.open_ended, false, "");
+                    ui.add_enabled(!self.open_ended, egui::DragValue::new(&mut self.months).range(1..=suspensions::MAX_MONTHS).suffix(" month(s)"));
+                });
+                ui.end_row();
+                ui.label("");
+                ui.radio_value(&mut self.open_ended, true, "Until I resume them");
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            let window = self.window();
+            let effect = match window.1.as_deref().and_then(dates::parse) {
+                Some(resume) => format!(
+                    "⏸ No savings deposit is taken {}; contributions resume in {} by themselves.",
+                    suspensions::describe(&window),
+                    resume.format("%B %Y")
+                ),
+                None => format!("⏸ No savings deposit is taken {} — until you press Resume.", suspensions::describe(&window)),
+            };
+            ui.add(egui::Label::new(RichText::new(effect).color(p.muted)).wrap());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Withdrawals are still allowed. Catch Up and the Ledger Grid's Fill Forward pass over these months, \
+                         and the member's statement says they were suspended. A past month records a suspension that \
+                         already happened.",
+                    )
+                    .small()
+                    .color(p.muted),
+                )
+                .wrap(),
+            );
+            if let Some(problem) = &self.problem {
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(problem).color(p.danger)).wrap());
+            }
+            footer(ui, |ui| {
+                if widgets::primary(ui, "Suspend", p.warning) && self.save(journal, actions) {
                     open = false;
                 }
                 if ui.button("Cancel").clicked() {

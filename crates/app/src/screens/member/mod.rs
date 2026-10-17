@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use chrono::NaiveDate;
 use eframe::egui::{self, RichText};
-use loanmaster_core::db::model::{Enrolment, Fund, FundRow, LOAN_ACTIVE, LedgerRow, Loan, Member, Suspension, event};
+use loanmaster_core::db::model::{Enrolment, Fund, FundRow, LOAN_ACTIVE, LedgerRow, Loan, Member, SavingsSuspension, Suspension, event};
 use loanmaster_core::loans::service::loan_rate;
 use loanmaster_core::money::{round2, shillings, total};
 use loanmaster_core::{Journal, Result, dates, funds};
@@ -45,6 +45,8 @@ pub struct MemberData {
     pub funds: [Vec<FundRow>; 3],
     pub balances: [f64; 3],
     pub enrolment: Option<Enrolment>,
+    /// When the member's savings contributions are, or were, suspended.
+    pub savings_suspensions: Vec<SavingsSuspension>,
     pub suggested: [f64; 3],
     pub unlock_month: u32,
     pub default_rate: f64,
@@ -93,6 +95,7 @@ pub fn load(journal: &Journal, id: i64) -> Result<MemberData> {
     Ok(MemberData {
         suggested: Fund::ALL.map(|f| funds::suggested_increment(journal, f, id).unwrap_or(0.0)),
         enrolment: journal.funds().enrolment(id)?,
+        savings_suspensions: journal.funds().suspensions(id)?,
         unlock_month: journal.settings().christmas_unlock_month(),
         default_rate: journal.settings().default_interest_rate(),
         funds: fund_rows,

@@ -62,9 +62,11 @@ fn every_report_format_is_written() {
 #[test]
 fn a_statement_is_written_as_pdf_and_workbook() {
     let (journal, id) = journal_with("Ann");
+    funds::suspensions::suspend(&journal, id, "2026-04-01", Some(2)).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let config = StatementConfig::default();
     let statement = prepare(&journal, id, "2026-01-01", "2026-06-30", &config).unwrap();
+    assert!(statement.savings.iter().any(|l| l.annotation.is_some()));
     // With the letterhead's logo, as printed, and without.
     let branded = Branding::of(&journal);
     write_statement_pdf(&statement, &config, &branded, &dir.path().join("s.pdf")).unwrap();

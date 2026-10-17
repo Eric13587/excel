@@ -5,8 +5,10 @@
 -- byte-for-byte the schema of a production journal migrated through 001–012.
 -- Keeping it identical is what lets a journal move between the two versions.
 --
--- A new journal gets this whole script. An existing journal is never altered:
--- it must already be at version 12 (see Journal::open).
+-- A new journal gets this whole script, then 2.0's own additions from
+-- upgrades/. An existing journal must be at version 12 or later, and a
+-- version-12 journal is given the additions when it is opened (see
+-- Journal::open). They only add tables 1.x never reads.
 -- =============================================================================
 
 

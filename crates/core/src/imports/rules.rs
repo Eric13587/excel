@@ -446,6 +446,43 @@ pub fn normalise_suspension(row: &SourceRow) -> Normalised<SuspensionValues> {
     out
 }
 
+/// A savings suspension: whole months, as this version records them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SavingsSuspensionValues {
+    pub start_date: String,
+    pub suspend_until: Option<String>,
+    pub resumed_date: Option<String>,
+    pub status: &'static str,
+    pub created_at: Option<String>,
+}
+
+/// A savings suspension: its dates on the 1st of their months, an end that
+/// is after the start, and the status its end implies — one with an end has
+/// one, as a suspension that ran its course is recorded.
+pub fn normalise_savings_suspension(row: &SourceRow) -> Normalised<SavingsSuspensionValues> {
+    let mut out = Normalised::default();
+    let first = |key: &str| {
+        date_of(row, key)
+            .and_then(|d| crate::dates::parse(&d))
+            .map(|d| crate::dates::format(crate::funds::suspensions::month_start(d)))
+    };
+    let raw = text(row, "start_date");
+    let Some(start) = first("start_date") else {
+        return out.reject(format!("savings suspension has an unreadable start date ({raw:?})"));
+    };
+    let after = |date: Option<String>| date.filter(|d| *d > start);
+    let until = after(first("suspend_until"));
+    let resumed = after(first("resumed_date")).or_else(|| until.clone());
+    out.values = Some(SavingsSuspensionValues {
+        start_date: start.clone(),
+        status: if resumed.is_some() { "resumed" } else { "active" },
+        suspend_until: until,
+        resumed_date: resumed,
+        created_at: Some(text(row, "created_at")).filter(|c| !c.is_empty()),
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +539,16 @@ mod tests {
         );
         let v = l.values.unwrap();
         assert_eq!((v.start_date.as_str(), v.status.as_str(), v.interest_rate, v.duration_months), ("2026-02-01", "Active", Some(0.1), Some(10)));
+    }
+
+    #[test]
+    fn a_savings_suspension_keeps_to_whole_months() {
+        let s = normalise_savings_suspension(&row(&[("start_date", t("2026-11-17")), ("suspend_until", t("2027-02-03"))]));
+        let v = s.values.unwrap();
+        assert_eq!((v.start_date.as_str(), v.suspend_until.as_deref(), v.resumed_date.as_deref(), v.status), ("2026-11-01", Some("2027-02-01"), Some("2027-02-01"), "resumed"));
+        let open = normalise_savings_suspension(&row(&[("start_date", t("2026-11-01")), ("suspend_until", t("2026-11-20"))])).values.unwrap();
+        assert_eq!((open.suspend_until, open.status), (None, "active"));
+        assert!(normalise_savings_suspension(&row(&[("start_date", t("soon"))])).values.is_none());
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! The three member funds — savings, Christmas, benevolent — and benevolent
-//! enrolments. One shape, one repository, the table chosen by [`Fund`].
+//! The three member funds — savings, Christmas, benevolent — benevolent
+//! enrolments and savings suspensions. One shape, one repository, the table
+//! chosen by [`Fund`].
 //!
 //! A balance is **summed** from the rows, never read off the latest one: the
 //! stored `balance` column is a per-row running total for display, and it goes
@@ -10,7 +11,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::ledger::{Snapshot, reinstate_row, snapshot_row};
-use super::model::{Enrolment, FromRow, Fund, FundRow, WITHDRAWAL, collect};
+use super::model::{Enrolment, FromRow, Fund, FundRow, SavingsSuspension, WITHDRAWAL, collect};
 use crate::error::Result;
 use crate::money::round2;
 
@@ -265,5 +266,71 @@ impl Funds<'_> {
             params![next_due, member_id],
         )?;
         Ok(())
+    }
+
+    // ------------------------------------------------- savings suspensions
+
+    /// A member's savings suspensions, earliest first.
+    pub fn suspensions(&self, member_id: i64) -> Result<Vec<SavingsSuspension>> {
+        let mut stmt =
+            self.0.prepare("SELECT * FROM savings_suspensions WHERE individual_id=? ORDER BY start_date, id")?;
+        Ok(collect(&mut stmt, [member_id])?)
+    }
+
+    /// Every member's savings suspensions, earliest first.
+    pub fn all_suspensions(&self) -> Result<HashMap<i64, Vec<SavingsSuspension>>> {
+        let mut stmt = self.0.prepare("SELECT * FROM savings_suspensions ORDER BY individual_id, start_date, id")?;
+        let mut out: HashMap<i64, Vec<SavingsSuspension>> = HashMap::new();
+        for span in collect::<SavingsSuspension>(&mut stmt, [])? {
+            out.entry(span.individual_id).or_default().push(span);
+        }
+        Ok(out)
+    }
+
+    pub fn suspension(&self, id: i64) -> Result<Option<SavingsSuspension>> {
+        Ok(self
+            .0
+            .query_row("SELECT * FROM savings_suspensions WHERE id=?", [id], SavingsSuspension::from_row)
+            .optional()?)
+    }
+
+    /// Record a span; one with a `resumed` date is recorded as resumed.
+    pub fn add_suspension(&self, member_id: i64, start: &str, until: Option<&str>, resumed: Option<&str>) -> Result<i64> {
+        self.0.execute(
+            "INSERT INTO savings_suspensions (individual_id, start_date, suspend_until, resumed_date, status) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![member_id, start, until, resumed, if resumed.is_some() { "resumed" } else { "active" }],
+        )?;
+        Ok(self.0.last_insert_rowid())
+    }
+
+    /// Move an open span's intended end; `None` leaves it open-ended.
+    pub fn set_suspension_until(&self, id: i64, until: Option<&str>) -> Result<()> {
+        self.0.execute("UPDATE savings_suspensions SET suspend_until=? WHERE id=?", params![until, id])?;
+        Ok(())
+    }
+
+    /// Mark a span resumed on `resumed`.
+    pub fn close_suspension(&self, id: i64, resumed: &str) -> Result<()> {
+        self.0.execute(
+            "UPDATE savings_suspensions SET resumed_date=?, status='resumed' WHERE id=?",
+            params![resumed, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_suspension(&self, id: i64) -> Result<()> {
+        self.0.execute("DELETE FROM savings_suspensions WHERE id=?", [id])?;
+        Ok(())
+    }
+
+    /// The savings deposits dated within `[start, end)`; `end` `None` is
+    /// open-ended.
+    pub fn deposits_between(&self, member_id: i64, start: &str, end: Option<&str>) -> Result<Vec<FundRow>> {
+        let mut stmt = self.0.prepare(
+            "SELECT * FROM savings WHERE individual_id=?1 AND transaction_type='Deposit' AND date >= ?2 \
+             AND (?3 IS NULL OR date < ?3) ORDER BY date, id",
+        )?;
+        Ok(collect(&mut stmt, params![member_id, start, end])?)
     }
 }

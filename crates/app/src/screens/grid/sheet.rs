@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use loanmaster_core::db::model::{Fund, LOAN_ACTIVE};
+use loanmaster_core::funds::suspensions;
 use loanmaster_core::grid::ops::OpSet;
 use loanmaster_core::grid::{DeletePlan, fund, loan};
 use loanmaster_core::money::shillings;
@@ -181,21 +182,17 @@ impl Sheet for FundSheet {
         !row.cell(month).rows.is_empty()
     }
 
-    fn refusal(&self, _: &fund::Grid, row: &fund::MemberRow, month: &str) -> Option<String> {
-        let cell = row.cell(month);
-        if fund::cell_entries(self.0, cell).is_some() {
-            return None;
-        }
-        Some(format!(
-            "{} transactions this month, netting {}, including one no grid operation describes — double-click to open {}'s ledger.",
-            cell.rows.len(),
-            shillings(cell.net),
-            row.name
-        ))
+    fn refusal(&self, grid: &fund::Grid, row: &fund::MemberRow, month: &str) -> Option<String> {
+        fund::cell_refusal(grid, row, month)
     }
 
     fn display_text(&self, row: &fund::MemberRow, month: &str) -> Option<String> {
-        let entries = fund::cell_entries(self.0, row.cell(month)).unwrap_or_default();
+        let cell = row.cell(month);
+        // A suspended month with nothing in it says so.
+        if cell.rows.is_empty() && row.suspended_in(month).is_some() {
+            return Some("⏸".into());
+        }
+        let entries = fund::cell_entries(self.0, cell).unwrap_or_default();
         (entries.len() > 1).then(|| self.ops().format(&entries))
     }
 
@@ -236,6 +233,9 @@ impl Sheet for FundSheet {
         if self.0 == Fund::Benevolent && !row.enrolled {
             return Some("Not enrolled in the benevolent fund.".into());
         }
+        if let Some(window) = row.suspended_in(&dates::month_key(&dates::today())) {
+            return Some(format!("{}'s savings contributions are suspended {}.", row.name, suspensions::describe(window)));
+        }
         None
     }
 
@@ -261,7 +261,7 @@ impl Sheet for FundSheet {
 
     fn staged_text(&self, change: &fund::Change) -> Option<String> {
         let entries = fund::change_entries(change);
-        (entries.len() > 1).then(|| self.ops().format(&entries))
+        (entries.len() > 1 || change.kind == fund::ChangeKind::Suspend).then(|| self.ops().format(&entries))
     }
 
     fn staged_edit_text(&self, change: &fund::Change) -> String {
@@ -269,11 +269,7 @@ impl Sheet for FundSheet {
     }
 
     fn describe(&self, _: Option<&fund::MemberRow>, change: &fund::Change, _: &[&fund::Change]) -> String {
-        let entries = fund::change_entries(change);
-        if entries.is_empty() {
-            return "Clears this month.".into();
-        }
-        format!("Leaves: {}", entries.iter().map(|e| format!("{} {}", e.op.name, shillings(e.amount))).collect::<Vec<_>>().join("; "))
+        fund::describe(change)
     }
 
     fn apply(&self, journal: &Journal, changes: &[fund::Change]) -> Result<fund::BatchResult> {

@@ -339,7 +339,19 @@ pub fn apply(journal: &Journal, plan: &Plan) -> Result<Outcome> {
                     id
                 }
             };
+            // The sheet records money received, so it is imported even in a
+            // month the member's savings are suspended — and said.
+            let paused = if plan.fund == Fund::Savings { crate::funds::suspensions::windows(journal, member)? } else { Vec::new() };
             for (date, amount) in &row.months {
+                if let Some(window) = crate::funds::suspensions::covering(date, &paused) {
+                    out.warnings.push(format!(
+                        "{name}: {} recorded for {}, although their savings are suspended {} — imported; end or \
+                         remove the suspension if it no longer applies.",
+                        crate::money::shillings(*amount),
+                        crate::dates::month_label(&crate::dates::month_key(date)),
+                        crate::funds::suspensions::describe(window)
+                    ));
+                }
                 let kind = if plan.fund == Fund::Benevolent { "Contribution" } else { "Deposit" };
                 journal.funds().add(plan.fund, member, date, kind, crate::money::round2(*amount), "Monthly contribution (Excel import)", None)?;
                 out.deposits += 1;

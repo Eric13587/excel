@@ -230,6 +230,11 @@ pub fn write_statement(statement: &Statement, config: &StatementConfig, branding
         }
         row += 1;
         for line in &statement.savings {
+            if let Some(text) = &line.annotation {
+                band(sheet, row, config.savings_columns.len(), text, &note)?;
+                row += 1;
+                continue;
+            }
             let (text, number) = if line.brought_forward { (&carried, &carried_money) } else { (&cell, &money) };
             for (i, name) in config.savings_columns.iter().enumerate() {
                 write_value(sheet, row, col(i), &savings_value(line, name), text, number)?;

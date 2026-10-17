@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
 
 use super::Journal;
-use crate::error::{Error, Result, SCHEMA_VERSION};
+use crate::error::{Error, OLDEST_SCHEMA_VERSION, Result, SCHEMA_VERSION};
 
 /// What a candidate backup holds, read without modifying it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -82,8 +82,9 @@ impl Journal {
     }
 
     /// Replace this journal's contents with a backup's. The backup must be a
-    /// readable, undamaged journal at the current schema version. Returns the
-    /// safety copy of what was here before.
+    /// readable, undamaged journal this version opens; one from before 2.0's
+    /// additions is given them, as opening it would. Returns the safety copy
+    /// of what was here before.
     pub fn restore_from(&mut self, path: &Path) -> Result<Option<PathBuf>> {
         let info = inspect_backup(path);
         if !info.ok {
@@ -95,6 +96,7 @@ impl Journal {
             let backup = rusqlite::backup::Backup::new(&source, &mut self.conn)?;
             backup.run_to_completion(256, std::time::Duration::from_millis(0), None)?;
         }
+        self.ensure_schema()?;
         log::warn!("Journal restored from {} (safety copy: {safety:?})", path.display());
         Ok(safety)
     }
@@ -141,10 +143,16 @@ pub fn inspect_backup(path: &Path) -> BackupInfo {
             0
         };
         info.schema_version = Some(version);
-        if version != SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
             return Ok(Some(format!(
-                "This backup is on schema version {version}; only version {SCHEMA_VERSION} backups can be \
-                 restored here. Open it once in LoanMaster 1.x to bring it up to date."
+                "This backup was written by a newer LoanMaster (schema version {version}); this one reads up \
+                 to version {SCHEMA_VERSION}."
+            )));
+        }
+        if version < OLDEST_SCHEMA_VERSION {
+            return Ok(Some(format!(
+                "This backup is on schema version {version}; only backups from version {OLDEST_SCHEMA_VERSION} \
+                 on can be restored here. Open it once in LoanMaster 1.x to bring it up to date."
             )));
         }
         Ok(None)
@@ -187,6 +195,24 @@ mod tests {
         assert_eq!(names, ["Before"]);
         assert!(inspect_backup(&safety).counts.contains(&("individuals".into(), 2)));
         assert!(journal.available_backups().len() >= 2);
+    }
+
+    #[test]
+    fn a_backup_from_before_the_additions_is_restored_and_brought_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path().join("j.db"), OpenOptions::default()).unwrap();
+        let old = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&old).unwrap();
+            conn.execute_batch(super::super::SCHEMA).unwrap();
+            conn.execute("INSERT INTO individuals (name) VALUES ('Then')", []).unwrap();
+        }
+        assert_eq!(inspect_backup(&old).schema_version, Some(12));
+        journal.restore_from(&old).unwrap();
+        let version: i64 = journal.conn().query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let spans: i64 = journal.conn().query_row("SELECT COUNT(*) FROM savings_suspensions", [], |r| r.get(0)).unwrap();
+        assert_eq!(spans, 0);
     }
 
     #[test]

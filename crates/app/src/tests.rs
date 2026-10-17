@@ -186,6 +186,38 @@ fn the_savings_tab_lists_every_deposit() {
     shot(&mut harness, "member_savings");
 }
 
+fn savings_windows(harness: &Harness<'_, LoanMasterApp>, id: i64) -> Vec<funds::suspensions::Window> {
+    funds::suspensions::windows(&harness.state().workspace.as_ref().unwrap().journal, id).unwrap()
+}
+
+#[test]
+fn savings_are_suspended_from_the_savings_tab_and_resumed() {
+    let mut harness = harness(sample());
+    let ann = open_member(&mut harness, "ANN WANJIRU");
+    harness.get_by_label("Savings / Shares").click();
+    harness.run();
+    harness.get_by_label("⏸ Suspend…").click();
+    harness.run();
+    harness.get_by_label("Suspend Savings Contributions");
+    // Her last deposit is September's, so it starts this month.
+    harness.get_by_label_contains("contributions resume in");
+    shot(&mut harness, "savings_suspend");
+    harness.get_by_label("Suspend").click();
+    harness.run();
+    assert_eq!(savings_windows(&harness, ann).len(), 1);
+    harness.get_by_label_contains("⏸ SUSPENDED — RESUMES");
+    harness.get_by_label("⏸ Suspended");
+    shot(&mut harness, "savings_suspended");
+
+    // Resumed in the month it began, it has paused nothing: it goes.
+    harness.get_by_label("▶ Resume…").click();
+    harness.run();
+    harness.get_by_label("Resume").click();
+    harness.run();
+    assert!(savings_windows(&harness, ann).is_empty());
+    assert!(harness.query_by_label("⏸ Suspended").is_none());
+}
+
 
 // ------------------------------------------------------------ Ledger Grid
 
@@ -251,6 +283,23 @@ fn a_typed_figure_is_staged_until_saved_and_the_save_can_be_undone() {
     harness.get_by_label("Undo Save").click();
     harness.run();
     assert_eq!(savings(&harness, "ANN WANJIRU"), 22_500.0);
+}
+
+#[test]
+fn a_savings_suspension_typed_in_the_grid_closes_its_months() {
+    let mut harness = harness(sample());
+    let ann = member_id(&harness, "ANN WANJIRU");
+    open_grid(&mut harness);
+    type_into(&mut harness, "ANN WANJIRU, Oct 2026", "@S=2");
+    harness.get_by_label_contains("1 unsaved change(s).");
+    harness.get_by_label("Save Changes").click();
+    harness.run();
+    assert_eq!(savings_windows(&harness, ann), [("2026-10-01".to_string(), Some("2026-12-01".to_string()))]);
+    // October is closed to the grid now, and says why.
+    harness.get_by_label("ANN WANJIRU, Oct 2026").click();
+    harness.run();
+    assert!(harness.query_all_by_label_contains("contributions are suspended from October 2026 to November 2026").count() > 0);
+    shot(&mut harness, "grid_savings_suspended");
 }
 
 #[test]

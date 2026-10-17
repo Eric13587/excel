@@ -211,7 +211,8 @@ impl Members<'_> {
             ("christmas_savings", "Christmas savings entries"),
             ("benevolent_ledger", "benevolent entries"),
             ("benevolent_accounts", "benevolent enrolments"),
-            ("loan_suspensions", "suspension records"),
+            ("loan_suspensions", "loan suspension records"),
+            ("savings_suspensions", "savings suspension records"),
         ] {
             let n: i64 = self.0.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE individual_id=?"),

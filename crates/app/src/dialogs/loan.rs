@@ -170,9 +170,15 @@ impl CatchUp {
                             let (fund, member, monthly) = (*fund, *member, *monthly);
                             Action::run(move |ws, actions| {
                                 let result = funds::catch_up_pot(&ws.journal, fund, member, Some(monthly), Some(&to));
-                                outcome(actions, "The fund could not be caught up", result, |n| match n {
-                                    0 => "Already up to date.".into(),
-                                    n => format!("{n} deposit(s) of {} added.", shillings(monthly)),
+                                outcome(actions, "The fund could not be caught up", result, |done| {
+                                    let mut text = match done.added {
+                                        0 => "Already up to date.".to_string(),
+                                        n => format!("{n} deposit(s) of {} added.", shillings(monthly)),
+                                    };
+                                    if done.suspended > 0 {
+                                        text.push_str(&format!(" {} suspended month(s) were passed over.", done.suspended));
+                                    }
+                                    text
                                 });
                             })
                         }

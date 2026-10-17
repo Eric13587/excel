@@ -15,6 +15,11 @@
 //! member must not cost the other ninety edits — and a save may not leave a
 //! Savings or Christmas withdrawal bigger than the balance it came from
 //! (docs/grid/deleting-months.md §3.3).
+//!
+//! On the savings grid `@S=3` suspends a member's contributions for three
+//! months from that one. A suspended month is closed to the grid, as a loan's
+//! is: Fill Forward passes over it, and what it holds is changed in the
+//! member's ledger.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
@@ -26,6 +31,7 @@ use crate::dates::{self, month_bounds, month_key, month_label};
 use crate::db::ledger::Snapshot;
 use crate::db::model::{Fund, FundRow, WITHDRAWAL};
 use crate::error::Result;
+use crate::funds::suspensions::{self, Suspended, Window};
 use crate::funds::{Posting, check as check_posting};
 use crate::money::{round2, shillings};
 use crate::policy;
@@ -73,8 +79,18 @@ static PAYOUT: Op = Op {
     arg: None,
 };
 
+static SUSPEND: Op = Op {
+    code: "S",
+    name: "Suspend",
+    words: &["s", "suspend", "pause"],
+    help: "Pause the member's contributions for this many months, starting this month: @S=3. Resume them early, \
+           or remove the suspension, in the member's Savings tab.",
+    value: Some(Figure::Months),
+    arg: None,
+};
+
 static SAVINGS_OPS: LazyLock<OpSet> =
-    LazyLock::new(|| OpSet::new(vec![&DEPOSIT, &WITHDRAW], &DEPOSIT, Some(&WITHDRAW)));
+    LazyLock::new(|| OpSet::new(vec![&DEPOSIT, &WITHDRAW, &SUSPEND], &DEPOSIT, Some(&WITHDRAW)));
 static CHRISTMAS_OPS: LazyLock<OpSet> =
     LazyLock::new(|| OpSet::new(vec![&DEPOSIT, &XMAS_WITHDRAW], &DEPOSIT, Some(&XMAS_WITHDRAW)));
 static BENEVOLENT_OPS: LazyLock<OpSet> =
@@ -198,6 +214,8 @@ pub struct MemberRow {
     /// The month this member's account began: months before it are months the
     /// account did not exist for, which must not be filled.
     pub account_start: Option<String>,
+    /// Savings: when the member's contributions are suspended.
+    pub suspensions: Vec<Window>,
 }
 
 impl MemberRow {
@@ -216,6 +234,35 @@ impl MemberRow {
     pub fn period_total(&self, months: &[String]) -> f64 {
         round2(months.iter().map(|m| self.cell(m).net).sum())
     }
+
+    /// The suspension covering a month (`YYYY-MM`), if any.
+    pub fn suspended_in(&self, month: &str) -> Option<&Window> {
+        suspensions::covering(&format!("{}-01", dates::month_key(month)), &self.suspensions)
+    }
+}
+
+/// Why a cell cannot be typed into, or `None`: a month the member's savings
+/// are suspended in, or one holding a row no operation describes.
+pub fn cell_refusal(grid: &Grid, row: &MemberRow, month: &str) -> Option<String> {
+    if let Some(window) = row.suspended_in(month) {
+        return Some(format!(
+            "{}'s savings contributions are suspended {}. Resume them in the member's Savings tab to deposit \
+             here; anything else this month is changed there too.",
+            row.name,
+            suspensions::describe(window)
+        ));
+    }
+    let cell = row.cell(month);
+    if cell_entries(grid.fund, cell).is_some() {
+        return None;
+    }
+    Some(format!(
+        "{} transactions this month, netting {}, including one no grid operation describes — double-click to open \
+         {}'s ledger.",
+        cell.rows.len(),
+        shillings(cell.net),
+        row.name
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,6 +306,7 @@ pub fn load(journal: &Journal, fund: Fund, months: &[String], include_inactive: 
     }
     let excluded = journal.members().excluded_from(fund.table())?;
     let balances = journal.funds().balances(fund)?;
+    let mut paused = if fund == Fund::Savings { suspensions::all_windows(journal)? } else { HashMap::new() };
 
     let mut members = Vec::new();
     for person in journal.members().summaries()? {
@@ -293,6 +341,7 @@ pub fn load(journal: &Journal, fund: Fund, months: &[String], include_inactive: 
             excluded: excluded.contains_key(&id),
             exclusion_note: excluded.get(&id).cloned().unwrap_or_default(),
             account_start,
+            suspensions: paused.remove(&id).unwrap_or_default(),
         });
     }
     Ok(Grid { fund, months: months.to_vec(), members })
@@ -307,6 +356,8 @@ pub enum ChangeKind {
     Delete,
     /// Make the month hold exactly these entries.
     Set,
+    /// Suspend the member's savings contributions from this month.
+    Suspend,
 }
 
 /// One staged cell edit.
@@ -322,6 +373,8 @@ pub struct Change {
     /// The cell's fingerprint when it was read.
     pub before: Fingerprint,
     pub entries: Vec<Entry>,
+    /// Suspend: for how many months.
+    pub months: Option<i64>,
 }
 
 impl Change {
@@ -335,6 +388,7 @@ impl Change {
             row_id: None,
             before: Vec::new(),
             entries: Vec::new(),
+            months: None,
         }
     }
 
@@ -359,11 +413,17 @@ impl Change {
 /// Turn typed text into a change. `Ok(None)` when there is nothing to do;
 /// `Err` with a sentence when the text cannot be accepted.
 pub fn stage(grid: &Grid, row: &MemberRow, month: &str, text: &str) -> std::result::Result<Option<Change>, String> {
+    if row.suspended_in(month).is_some() {
+        return Err(cell_refusal(grid, row, month).unwrap_or_default());
+    }
     let cell = row.cell(month);
     let ops = operations(grid.fund);
     let current = cell_entries(grid.fund, cell)
         .ok_or("This month holds a transaction no grid operation describes. Open the member's ledger to edit it.")?;
     let (typed, append) = ops.parse(text)?;
+    if let Some(pause) = typed.iter().find(|e| std::ptr::eq(e.op, &SUSPEND)) {
+        return stage_suspension(grid, row, month, pause.amount, typed.len() > 1 || append);
+    }
     let entries: Vec<Entry> = if append {
         current.iter().copied().chain(typed.into_iter().filter(|e| e.amount != 0.0)).collect()
     } else if typed.is_empty() {
@@ -403,10 +463,71 @@ pub fn stage(grid: &Grid, row: &MemberRow, month: &str, text: &str) -> std::resu
     Ok(Some(Change { amount: net, before, entries, ..Change::new(grid.fund, row.member_id, month, ChangeKind::Set) }))
 }
 
+/// `@S=months` typed in a month: the member's contributions paused from it.
+/// What the screen shows of the following months is checked here; the
+/// journal is checked again when it is saved.
+fn stage_suspension(grid: &Grid, row: &MemberRow, month: &str, months: f64, crowded: bool) -> std::result::Result<Option<Change>, String> {
+    if crowded {
+        return Err("A suspension goes in its cell on its own — save it, then type the month's figures.".into());
+    }
+    let months = months as i64;
+    if months == 0 {
+        return Ok(None);
+    }
+    if !(1..=suspensions::MAX_MONTHS as i64).contains(&months) {
+        return Err(format!("A suspension runs for 1 to {} months.", suspensions::MAX_MONTHS));
+    }
+    if !row.active() {
+        return Err(format!("{} has left the SACCO, so their contributions are not suspended.", row.name));
+    }
+    let first = format!("{}-01", dates::month_key(month));
+    for i in 0..months {
+        let Some(key) = dates::add_months_str(&first, i as i32).map(|d| month_key(&d)) else { continue };
+        if let Some(later) = row.suspended_in(&key) {
+            return Err(format!(
+                "{}'s savings contributions are already suspended {}. Change or remove that suspension in the member's \
+                 Savings tab.",
+                row.name,
+                suspensions::describe(later)
+            ));
+        }
+        if row.cell(&key).rows.iter().any(|r| r.transaction_type == grid.fund.credit()) {
+            return Err(format!(
+                "{} has a deposit in {}, which the suspension would cover. Clear it first, or suspend from a later month.",
+                row.name,
+                month_label(&key)
+            ));
+        }
+    }
+    Ok(Some(Change {
+        months: Some(months),
+        before: row.cell(month).fingerprint(),
+        entries: vec![Entry::new(&SUSPEND, months as f64)],
+        ..Change::new(grid.fund, row.member_id, month, ChangeKind::Suspend)
+    }))
+}
+
+/// A staged change in words, for its tooltip.
+pub fn describe(change: &Change) -> String {
+    if change.kind == ChangeKind::Suspend {
+        let months = change.months.unwrap_or(0);
+        return format!(
+            "Suspends the member's savings contributions for {months} month{} from {}.",
+            if months == 1 { "" } else { "s" },
+            month_label(&change.month)
+        );
+    }
+    let entries = change_entries(change);
+    if entries.is_empty() {
+        return "Clears this month.".into();
+    }
+    format!("Leaves: {}", entries.iter().map(|e| format!("{} {}", e.op.name, shillings(e.amount))).collect::<Vec<_>>().join("; "))
+}
+
 /// What a staged change will leave in its month, as entries.
 pub fn change_entries(change: &Change) -> Vec<Entry> {
     match change.kind {
-        ChangeKind::Set => change.entries.clone(),
+        ChangeKind::Set | ChangeKind::Suspend => change.entries.clone(),
         ChangeKind::Delete => Vec::new(),
         _ => {
             let ops = operations(change.fund);
@@ -449,6 +570,8 @@ pub enum Restore {
     Deleted(Snapshot),
     /// A set: undo each step, last first.
     Steps(Vec<Restore>),
+    /// A suspension: take it back.
+    Suspension(Suspended),
 }
 
 #[derive(Debug, Clone)]
@@ -481,6 +604,7 @@ impl BatchResult {
         let added = self.count(ChangeKind::Insert);
         let changed = self.count(ChangeKind::Update) + self.count(ChangeKind::Set);
         let removed = self.count(ChangeKind::Delete);
+        let suspended = self.count(ChangeKind::Suspend);
         if added > 0 {
             bits.push(format!("{added} added"));
         }
@@ -489,6 +613,9 @@ impl BatchResult {
         }
         if removed > 0 {
             bits.push(format!("{removed} removed"));
+        }
+        if suspended > 0 {
+            bits.push(format!("{suspended} suspended"));
         }
         let mut text = if bits.is_empty() { "nothing changed".to_string() } else { bits.join(", ") };
         if !self.refused.is_empty() {
@@ -519,7 +646,8 @@ fn current_fingerprint(journal: &Journal, fund: Fund, member_id: i64, month: &st
 /// for money going in; the unlock month for Christmas money coming out.
 fn refusal_for(journal: &Journal, fund: Fund, change: &Change, date: &str) -> Result<Option<String>> {
     match change.kind {
-        ChangeKind::Delete => return Ok(None),
+        // A suspension is judged by the suspension's own rules as it is written.
+        ChangeKind::Delete | ChangeKind::Suspend => return Ok(None),
         ChangeKind::Set => {
             // One refusal holds back the whole cell: half a month is not what
             // anybody typed.
@@ -619,6 +747,14 @@ fn plan_set(journal: &Journal, fund: Fund, change: &Change) -> Result<Vec<Step>>
 fn write(journal: &Journal, fund: Fund, change: &Change, date: &str) -> Result<Restore> {
     let funds = journal.funds();
     match change.kind {
+        ChangeKind::Suspend => {
+            // The grid suspends for a number of months, never until further notice.
+            let months = change
+                .months
+                .and_then(|m| u32::try_from(m).ok())
+                .ok_or_else(|| crate::Error::invalid("A suspension needs its number of months."))?;
+            Ok(Restore::Suspension(suspensions::suspend(journal, change.member_id, date, Some(months))?))
+        }
         ChangeKind::Insert => {
             let kind = change.transaction_type();
             let id = funds.add(fund, change.member_id, date, kind, change.magnitude(), &grid_note(fund, kind), None)?;
@@ -695,6 +831,7 @@ fn undo_restore(journal: &Journal, fund: Fund, restore: &Restore) -> Result<()> 
             funds.set_type(fund, *id, kind)
         }
         Restore::Deleted(snapshot) => funds.reinstate(fund, snapshot),
+        Restore::Suspension(done) => suspensions::unsuspend(journal, done),
         Restore::Steps(steps) => {
             for step in steps.iter().rev() {
                 undo_restore(journal, fund, step)?;
@@ -904,6 +1041,8 @@ pub struct FillPlan {
     pub before_start: usize,
     /// Cells skipped because the month has not happened.
     pub in_future: usize,
+    /// Cells skipped because the member's savings were suspended.
+    pub suspended: usize,
 }
 
 impl FillPlan {
@@ -919,13 +1058,17 @@ impl FillPlan {
         if self.in_future > 0 {
             out.push(format!("{} month(s) in the future were left empty.", self.in_future));
         }
+        if self.suspended > 0 {
+            out.push(format!("{} suspended month(s) were skipped.", self.suspended));
+        }
         out
     }
 }
 
 /// Propose each member's usual credit for every month that has none — a month
 /// holding only a withdrawal still owed its deposit — never before the
-/// account began, never after this month. A proposal, staged for review.
+/// account began, never after this month, never in a month their savings are
+/// suspended. A proposal, staged for review.
 pub fn plan_fill(journal: &Journal, grid: &Grid, rows: &[&MemberRow], months: &[String], today: Option<&str>) -> Result<FillPlan> {
     let today = today.map(str::to_string).unwrap_or_else(dates::today);
     let this_month = month_key(&today);
@@ -969,6 +1112,8 @@ pub fn plan_fill(journal: &Journal, grid: &Grid, rows: &[&MemberRow], months: &[
                 plan.before_start += 1;
             } else if *month > this_month {
                 plan.in_future += 1;
+            } else if row.suspended_in(month).is_some() {
+                plan.suspended += 1;
             } else {
                 fillable.push(month.clone());
             }

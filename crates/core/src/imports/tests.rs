@@ -10,7 +10,8 @@ fn member(journal: &Journal, name: &str, pf: &str) -> i64 {
 }
 
 /// A source journal on disk: Ann with a loan, savings, Christmas money, a
-/// benevolent enrolment and a past suspension; Ben with his own L-001.
+/// benevolent enrolment, a past loan suspension and a savings suspension; Ben
+/// with his own L-001.
 fn source_journal(dir: &Path) -> PathBuf {
     let path = dir.join("source.db");
     let journal = Journal::open(&path, OpenOptions::default()).unwrap();
@@ -24,6 +25,7 @@ fn source_journal(dir: &Path) -> PathBuf {
     suspensions::record(&journal, loan.id, "2026-05-01", Some("2026-06-01"), Some("2026-10-09")).unwrap();
     funds::post(&journal, Posting::new(Fund::Savings, ann, "2026-01-05", "Deposit", 2000.0, "")).unwrap();
     funds::post(&journal, Posting::new(Fund::Savings, ann, "2026-03-05", "Deposit", 2000.0, "")).unwrap();
+    funds::suspensions::suspend(&journal, ann, "2026-06-01", Some(2)).unwrap();
     funds::post(&journal, Posting::new(Fund::Christmas, ann, "2026-02-05", "Deposit", 1000.0, "")).unwrap();
     funds::enrol(&journal, ann, 500.0, "2026-01-01").unwrap();
     funds::post(&journal, Posting::new(Fund::Benevolent, ann, "2026-01-01", "Contribution", 500.0, "")).unwrap();
@@ -77,6 +79,8 @@ fn everything_comes_across_into_an_empty_journal() {
     assert_eq!(journal.funds().balance(Fund::Christmas, ann.id).unwrap(), 1000.0);
     assert!(journal.funds().enrolment(ann.id).unwrap().is_some());
     assert_eq!(journal.loans().suspensions_for_member(ann.id).unwrap().len(), 1);
+    assert_eq!(funds::suspensions::windows(&journal, ann.id).unwrap(), [("2026-06-01".to_string(), Some("2026-08-01".to_string()))]);
+    assert_eq!(out.savings_suspensions, 1);
     assert_eq!(ann.pf_no, "PF1");
 
     let history = journal.imports().all().unwrap();
@@ -109,6 +113,8 @@ fn a_member_on_record_is_merged_into_and_undo_leaves_them_as_they_were() {
     let ann = member(&journal, "Ann", "PF9");
     issue(&journal, ann, 50000.0, 10, "2025-06-01", Some(0.15)).unwrap();
     funds::post(&journal, Posting::new(Fund::Christmas, ann, "2025-12-05", "Deposit", 700.0, "")).unwrap();
+    // Her own savings suspension overlaps the incoming one, and wins.
+    funds::suspensions::suspend(&journal, ann, "2026-07-01", None).unwrap();
     let before = (
         count(&journal, "SELECT COUNT(*) FROM ledger"),
         journal.funds().balance(Fund::Christmas, ann).unwrap(),
@@ -128,6 +134,8 @@ fn a_member_on_record_is_merged_into_and_undo_leaves_them_as_they_were() {
     assert_eq!(journal.funds().balance(Fund::Christmas, ann).unwrap(), 1700.0);
     assert_eq!(journal.members().get(ann).unwrap().unwrap().pf_no, "PF9");
     assert!(out.warnings.iter().any(|w| w.contains("already holds L-001")));
+    assert!(out.warnings.iter().any(|w| w.contains("already suspended from July 2026 until further notice")), "{:?}", out.warnings);
+    assert_eq!(funds::suspensions::windows(&journal, ann).unwrap(), [("2026-07-01".to_string(), None)]);
 
     undo(&journal, out.import_id).unwrap();
     let after = (

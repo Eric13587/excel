@@ -82,6 +82,12 @@ impl Workspace {
         let mut workspace = Workspace::with(journal, path.to_path_buf());
         if report.created {
             workspace.status = Some("A new, empty journal was created.".into());
+        } else if report.upgraded_from.is_some() {
+            let backup = if report.backup.is_some() { " The backup taken on opening holds it as it was." } else { "" };
+            workspace.status = Some(format!(
+                "This journal was brought up to date: it can now record savings suspensions, and still opens in \
+                 LoanMaster 1.x.{backup}"
+            ));
         }
         Ok((workspace, notices))
     }

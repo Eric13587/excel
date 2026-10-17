@@ -197,12 +197,13 @@ pub fn statement(statement: &Statement, config: &StatementConfig, branding: &Bra
     let savings: Vec<Json> = statement
         .savings
         .iter()
-        .map(|line| {
-            json!({
+        .map(|line| match &line.annotation {
+            Some(note) => json!({"note": note}),
+            None => json!({
                 "cells": config.savings_columns.iter().map(|c| savings_cell(line, c)).collect::<Vec<_>>(),
                 "withdrawal": line.is_withdrawal(),
                 "bf": line.brought_forward,
-            })
+            }),
         })
         .collect();
     let numeric = |columns: &[String]| columns.iter().map(|c| NUMERIC.contains(&c.as_str())).collect::<Vec<_>>();

@@ -326,6 +326,45 @@ impl FromRow for Suspension {
     }
 }
 
+/// A span of months a member's savings contributions are paused.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavingsSuspension {
+    pub id: i64,
+    pub individual_id: i64,
+    /// The 1st of the first month paused.
+    pub start_date: String,
+    /// The 1st of the month contributions were meant to resume in; `None`
+    /// for a suspension until further notice.
+    pub suspend_until: Option<String>,
+    /// The 1st of the month they resume in: `suspend_until` for one that
+    /// runs its course, earlier for one ended early.
+    pub resumed_date: Option<String>,
+    pub status: String,
+    pub created_at: Option<String>,
+}
+
+impl SavingsSuspension {
+    /// Where the span stops: the half-open window is `[start, end)`, and
+    /// `None` is until further notice.
+    pub fn end(&self) -> Option<&str> {
+        self.resumed_date.as_deref().or(self.suspend_until.as_deref())
+    }
+}
+
+impl FromRow for SavingsSuspension {
+    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(SavingsSuspension {
+            id: row.get("id")?,
+            individual_id: row.get("individual_id")?,
+            start_date: opt_string(row, "start_date")?,
+            suspend_until: row.get("suspend_until")?,
+            resumed_date: row.get("resumed_date")?,
+            status: opt_string(row, "status")?,
+            created_at: row.get("created_at").ok().flatten(),
+        })
+    }
+}
+
 /// A member's benevolent-fund enrolment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Enrolment {
