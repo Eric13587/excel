@@ -19,37 +19,36 @@
 )
 #set text(font: "Liberation Sans", size: 8pt)
 
-// The letterhead, kept low so the statement keeps the page: the society's
-// logo at the top left with its name beside it, and the statement's date and
-// period on the right.
-#grid(
-  columns: (auto, 1fr, auto),
-  column-gutter: 10pt,
-  align: (left + horizon, left + horizon, right + horizon),
-  if data.logo != none { image(data.logo, height: 40pt) } else [],
-  {
-    if data.org != "" {
-      text(size: 13pt, weight: "bold", fill: rgb("#0f172a"))[#data.org]
-      linebreak()
-    }
-    text(size: 10pt, weight: "bold", fill: accent, tracking: 0.5pt)[#upper(data.title)]
-  },
-  text(size: 8pt)[
-    #text(fill: grey)[Statement date:] *#data.statement_date* \
-    #text(fill: grey)[Period:] *#data.period*
-  ],
-)
-#v(2pt)
-#line(length: 100%, stroke: 2pt + accent)
-#v(2pt)
+// The letterhead as 1.x printed it: the logo at the top left; the society,
+// the title, the member and the period centred over a rule; then the
+// member's details in a grey box. Sizes are 1.x's, in points. Each line of a
+// stack is a cap height tall, so the gaps between them stand for 1.x's line
+// spacing as well as its margins.
+#block(width: 100%, inset: (bottom: 9pt), stroke: (bottom: 2.25pt + accent), below: 11pt, {
+  if data.logo != none { place(top + left, image(data.logo, height: 37.5pt)) }
+  let lines = ()
+  if data.org != "" {
+    lines += (text(size: 11.25pt, weight: "bold", fill: rgb("#0f172a"), tracking: 0.4pt, data.org), 5.5pt)
+  }
+  lines += (
+    text(size: 16.5pt, weight: "bold", fill: accent, data.title),
+    10pt,
+    text(size: 12pt, fill: rgb("#333333"), data.name),
+    8pt,
+    text(size: 8.25pt, fill: grey, "For the period: " + data.period),
+  )
+  align(center, stack(..lines))
+})
 
-#block(fill: rgb("#f5f5f5"), inset: (x: 7pt, y: 5pt), radius: 3pt, width: 100%)[
-  *Member:* #data.name
-  #if data.pf_no != "" [#h(12pt) *PF No:* #data.pf_no]
-  #if data.phone != "" [#h(12pt) *Contact:* #data.phone]
-  #h(1fr) *Account Status:* #text(fill: if data.active { green } else { red }, weight: "bold")[#data.status]
-]
-#v(5pt)
+#block(fill: rgb("#f5f5f5"), inset: 6pt, radius: 3.75pt, width: 100%, below: 11pt, grid(
+  columns: (1fr, 1fr),
+  align: (left, right),
+  row-gutter: 4pt,
+  [*Client Name:* #data.name], [*Statement Date:* #data.statement_date],
+  [*Contact:* #data.phone],
+  [*Account Status:* #text(fill: if data.active { green } else { red }, weight: "bold", data.status)],
+  ..if data.pf_no != "" { ([*PF No:* #data.pf_no], []) } else { () },
+))
 
 #let band(body, fill) = block(fill: fill, inset: 5pt, width: 100%, below: 0pt, text(fill: white, weight: "bold", size: 9pt, body))
 #let nothing(what) = block(inset: 8pt, text(fill: grey)[No #what transactions in this period])
