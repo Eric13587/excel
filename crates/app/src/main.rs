@@ -1,6 +1,6 @@
 //! LoanMaster: loan, savings and fund management for SACCOs.
 //!
-//! `loanmaster [journal.db] [--software]`
+//! `loanmaster [journal.db] [--software]`, or `loanmaster --version`.
 //!
 //! `--software` (or `LOANMASTER_SOFTWARE_RENDERING=1`) draws without the
 //! graphics card — WARP on Windows, llvmpipe elsewhere — for machines whose
@@ -53,6 +53,12 @@ fn choose_adapter(adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>
 }
 
 fn main() -> eframe::Result {
+    // Answered before anything else: CI runs it to prove the program loads
+    // on Windows, where an import Windows cannot find stops it before main.
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--version") {
+        println!("LoanMaster {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let log_file = logging::init();
     logging::install_panic_hook();
     log::info!("LoanMaster {} starting; log at {}", env!("CARGO_PKG_VERSION"), log_file.display());

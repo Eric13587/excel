@@ -52,6 +52,17 @@ jobs:
     - name: Build
       run: cargo build --release --locked -p loanmaster
 
+    - name: Check that the program starts
+      run: |
+        # Windows refuses to start a program that imports a function it
+        # cannot find (the first 2.0 builds asked comctl32 for
+        # TaskDialogIndirect), which building alone does not show.
+        $p = Start-Process target/release/loanmaster.exe -ArgumentList '--version' -RedirectStandardOutput version.txt -PassThru
+        $null = $p.Handle
+        if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'LoanMaster did not exit within a minute of starting.' }
+        if ($p.ExitCode -ne 0) { throw ('LoanMaster could not start: exit code 0x{0:X8}' -f $p.ExitCode) }
+        Get-Content version.txt
+
     - name: Install Inno Setup
       run: |
         choco install innosetup --no-progress

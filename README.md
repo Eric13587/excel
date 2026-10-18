@@ -79,7 +79,7 @@ LOANMASTER_STRESS_SEEDS=7919 cargo test -p loanmaster-core --test stress   # rep
 ```
 
 CI (GitHub Actions) runs clippy and the tests, and builds the Windows
-installer only when both pass.
+installer only when both pass and the built program starts on Windows.
 
 ## Building the Windows app
 
