@@ -1,0 +1,36 @@
+[package]
+name = "loanmaster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Loan, savings and fund management for SACCOs"
+
+[[bin]]
+name = "loanmaster"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+eframe = { version = "0.36.2", features = ["persistence"] }
+egui_extras = { version = "0.36.2", features = ["datepicker", "image", "serde"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
+loanmaster-core = { path = "../core" }
+loanmaster-reports = { path = "../reports" }
+log = "0.4.34"
+open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
+# Not rfd's "common-controls-v6": it imports TaskDialogIndirect, which Windows
+# only provides to a program with an application manifest, and refuses to
+# start one without ("Entry Point Not Found").
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot", "eframe"] }
+rust_xlsxwriter = "0.99.1"
+tempfile = "3.27.0"
