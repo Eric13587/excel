@@ -29,6 +29,7 @@ use crate::dates::{self, month_bounds, month_key, month_label};
 use crate::db::model::{LOAN_ACTIVE, LOAN_PAID, event};
 use crate::error::{Error, Result};
 use crate::loans::deletions::{self, Removal, Timeline};
+use crate::loans::guards;
 use crate::loans::projection::{clear_split, project_loan, project_member};
 use crate::loans::service::{self as loan_service, recalculate_default_deduction};
 use crate::loans::suspensions;
@@ -994,7 +995,18 @@ pub fn apply_changes(journal: &Journal, changes: &[Change]) -> Result<BatchResul
                 continue;
             }
             let before = RestorePoint::capture(journal, change.member_id, &change.reference)?;
-            match journal.savepoint(|| write(journal, &change)) {
+            // A change that leaves the loan out of step with its schedule, or
+            // repaid beyond what it owed, is refused like any other.
+            let sound = guards::soundness(journal, change.member_id, &change.reference)?;
+            let checked = || -> Result<()> {
+                write(journal, &change)?;
+                if journal.loans().by_ref(change.member_id, &change.reference)?.is_some() {
+                    project_loan(journal, change.member_id, &change.reference)?;
+                    guards::keep_sound(journal, change.member_id, &change.reference, &sound)?;
+                }
+                Ok(())
+            };
+            match journal.savepoint(checked) {
                 Ok(()) => {
                     result.members_touched.insert(change.member_id);
                     result.applied.push(Applied { change, before });

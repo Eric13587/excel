@@ -42,7 +42,11 @@ fn alignment(journal: &Journal, member_id: i64, reference: &str) -> Result<Align
     if events.is_empty() {
         return Ok(Alignment::Nothing);
     }
-    let result = derive(&events, None);
+    // Up to the loan's last entry, not just its last payment: a month whose
+    // interest was charged and nothing paid — a missed month — can be the
+    // latest thing to have happened to it.
+    let last = journal.ledger().last_date(member_id, reference)?.map(|d| dates::date_part(&d).to_string());
+    let result = derive(&events, last.as_deref());
     let mut stmt = journal.conn().prepare(
         "SELECT id, date, balance, principal_balance, interest_balance, principal_portion, \
          interest_portion FROM ledger WHERE individual_id=? AND loan_id=? \
@@ -172,11 +176,22 @@ fn carry_position(journal: &Journal, member_id: i64, reference: &str) -> Result<
     Ok(changed)
 }
 
-/// When the next deduction falls due: a month after the last repayment, or
-/// after issue (honouring `deduct_same_month`) when none has been taken.
+/// When the next deduction falls due: a month after the last month the
+/// schedule has dealt with — paid, or its interest charged with nothing paid
+/// (missed) — or after issue (honouring `deduct_same_month`) when none has.
+/// The interest a buy-off realises on its own date is not a month.
 fn next_due(journal: &Journal, member_id: i64, reference: &str, loan: &crate::db::model::Loan) -> Result<Option<String>> {
     let ledger = journal.ledger();
-    let last_repayment = ledger.max_date(member_id, reference, event::REPAYMENT)?;
+    let rows = ledger.for_loan(member_id, reference)?;
+    let settled: Vec<&str> = rows.iter().filter(|r| r.event_type == event::BUYOFF).map(|r| dates::date_part(&r.date)).collect();
+    let last_repayment = rows
+        .iter()
+        .filter(|r| {
+            r.event_type == event::REPAYMENT
+                || (r.event_type == event::INTEREST && !settled.contains(&dates::date_part(&r.date)))
+        })
+        .map(|r| r.date.clone())
+        .max();
     let base = match &last_repayment {
         Some(date) => Some(date.clone()),
         None => ledger

@@ -27,11 +27,13 @@ pub enum EventKind {
 
 impl EventKind {
     /// State changes apply before their own month accrues; a payment is a
-    /// transaction within that month and lands after its accrual.
+    /// transaction within that month and lands after its accrual. A
+    /// settlement charges what is left on its own day, so the month it falls
+    /// in does not accrue first.
     fn changes_state(self) -> bool {
         matches!(
             self,
-            EventKind::Disbursed | EventKind::ToppedUp | EventKind::TermsChanged | EventKind::Suspended
+            EventKind::Disbursed | EventKind::ToppedUp | EventKind::TermsChanged | EventKind::Suspended | EventKind::Settled
         )
     }
 }
@@ -261,6 +263,23 @@ pub fn derive(events: &[LoanEvent], up_to: Option<&str>) -> DerivedLoan {
                 out.suspension_windows.push((event.date.clone(), event.until.clone()));
             }
             EventKind::PaymentReceived | EventKind::Settled => {
+                // Settling charges everything left to charge, on the day it
+                // settles — whether or not that is a due date.
+                if event.kind == EventKind::Settled && unearned > 0.0 {
+                    interest_bal = round2(interest_bal + unearned);
+                    out.postings.push(Posting {
+                        date: event.date.clone(),
+                        kind: PostingKind::InterestEarned,
+                        added: unearned,
+                        deducted: 0.0,
+                        principal_portion: 0.0,
+                        interest_portion: 0.0,
+                        principal_balance: round2(principal),
+                        interest_balance: interest_bal,
+                        source: None,
+                    });
+                    unearned = 0.0;
+                }
                 let paid = round2(event.amount);
                 // An asserted split wins; otherwise interest is settled first.
                 let (interest_pay, principal_pay) = if event.interest.is_some() || event.principal.is_some() {

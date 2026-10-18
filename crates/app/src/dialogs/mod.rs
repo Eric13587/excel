@@ -77,7 +77,7 @@ impl Dialog {
             Dialog::TopUp(d) => d.show(ctx, actions),
             Dialog::Suspend(d) => d.show(ctx, journal, actions),
             Dialog::Suspensions(d) => d.show(ctx, journal, actions),
-            Dialog::ClearSuspension(d) => d.show(ctx, actions),
+            Dialog::ClearSuspension(d) => d.show(ctx, journal, actions),
             Dialog::EntryDate(d) => d.show(ctx, actions),
             Dialog::EntryAmount(d) => d.show(ctx, journal, actions),
             Dialog::EntryNotes(d) => d.show(ctx, actions),

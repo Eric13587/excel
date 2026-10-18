@@ -105,6 +105,35 @@ fn undo_restores_a_set_exactly_with_original_ids() {
 }
 
 #[test]
+fn undo_is_held_to_the_rules_every_change_is() {
+    let journal = Journal::open_in_memory().unwrap();
+    journal.set_today(dates::parse("2026-03-31").unwrap());
+    let ann = member(&journal, "Ann");
+    // A deposit a later withdrawal was taken from stays.
+    let deposited = save(&journal, Fund::Savings, ann, "2026-01", "2,000");
+    funds::withdraw(&journal, Fund::Savings, ann, 1500.0, "2026-02-10", "", false).unwrap();
+    let why = revert(&journal, Fund::Savings, &deposited).unwrap_err().to_string();
+    assert!(why.contains("overdraw Ann's savings"), "{why}");
+    assert_eq!(funds::balance(&journal, Fund::Savings, ann).unwrap(), 500.0);
+
+    // A deposit deleted from a month since suspended stays deleted.
+    put(&journal, Fund::Savings, ann, "2026-03-01", "Deposit", 700.0);
+    let deleted = save(&journal, Fund::Savings, ann, "2026-03", "");
+    funds::suspensions::suspend(&journal, ann, "2026-03-01", Some(1)).unwrap();
+    let why = revert(&journal, Fund::Savings, &deleted).unwrap_err().to_string();
+    assert!(why.contains("back into a month their savings are suspended"), "{why}");
+
+    // A benevolent month paid since is not paid twice.
+    let ben = member(&journal, "Ben");
+    put(&journal, Fund::Benevolent, ben, "2026-02-01", "Contribution", 100.0);
+    let removed = save(&journal, Fund::Benevolent, ben, "2026-02", "");
+    put(&journal, Fund::Benevolent, ben, "2026-02-15", "Contribution", 100.0);
+    let why = revert(&journal, Fund::Benevolent, &removed).unwrap_err().to_string();
+    assert!(why.contains("contribution for Feb 2026 back beside"), "{why}");
+    assert_eq!(rows_of(&journal, Fund::Benevolent, ben).len(), 1);
+}
+
+#[test]
 fn a_withdrawal_bigger_than_the_savings_is_refused() {
     let journal = Journal::open_in_memory().unwrap();
     let ann = member(&journal, "Ann");

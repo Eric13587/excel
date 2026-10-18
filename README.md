@@ -68,6 +68,16 @@ The application's tests drive the window headlessly. Set `LOANMASTER_SHOTS`
 to a folder to have them save screenshots there (this needs a Vulkan driver,
 such as Mesa's lavapipe).
 
+The stress test applies random sequences of operations to a fresh journal and
+checks the books after every step (see the guard rails in
+[docs/rust-migration.md](docs/rust-migration.md#guard-rails)). The workspace
+tests run a few seeds of it. A longer run, with seeds in parallel:
+
+```bash
+LOANMASTER_STRESS=200 LOANMASTER_STRESS_STEPS=600 cargo test --release -p loanmaster-core --test stress
+LOANMASTER_STRESS_SEEDS=7919 cargo test -p loanmaster-core --test stress   # replay one seed
+```
+
 CI (GitHub Actions) runs clippy and the tests, and builds the Windows
 installer only when both pass.
 

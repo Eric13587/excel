@@ -5,6 +5,12 @@
 //! cannot disagree about what a row means. The sign lives in the transaction
 //! type, never in the amount: only a `Withdrawal` takes money out.
 //!
+//! Two rules hold for every change, however it is made: nothing is dated in
+//! a month that has not come, and a member's own money (savings, Christmas)
+//! is never overdrawn — a withdrawal may not be bigger than the balance it
+//! came from, whether it is recorded, edited, or left behind when an entry
+//! before it is changed or deleted.
+//!
 //! Savings and Christmas are pots with a monthly contribution that catch-up
 //! fills forward from the last deposit; savings contributions can be
 //! suspended for some months ([`suspensions`]). Christmas withdrawals are
@@ -19,7 +25,7 @@ use crate::Journal;
 use crate::dates;
 use crate::db::model::{Fund, FundRow, WITHDRAWAL};
 use crate::error::{Error, Result};
-use crate::money::round2;
+use crate::money::{round2, shillings};
 use crate::policy::{self, Operation};
 
 pub mod suspensions;
@@ -96,13 +102,80 @@ pub fn validate(posting: &Posting) -> Vec<String> {
     problems
 }
 
+/// The member's own money: a withdrawal may not exceed the balance it came
+/// from. Not benevolent — a payout draws on a pooled fund.
+pub fn own_money(fund: Fund) -> bool {
+    fund != Fund::Benevolent
+}
+
+/// A withdrawal a change leaves bigger than the balance it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Overdraw {
+    pub date: String,
+    pub amount: f64,
+    /// What there was to take it from.
+    pub available: f64,
+    /// How far it goes below zero.
+    pub short: f64,
+}
+
+/// The lowest running balance in a `(id, date, type, amount)` history, and
+/// the `(date, amount)` of the withdrawal it falls at.
+fn low_point(history: &[(i64, String, String, f64)]) -> (f64, Option<(String, f64)>) {
+    let (mut running, mut low, mut at) = (0.0, 0.0, None);
+    for (_, date, kind, amount) in history {
+        running = round2(if kind == WITHDRAWAL { running - amount } else { running + amount });
+        if running < low - 0.005 {
+            low = running;
+            at = Some((dates::date_part(date).to_string(), *amount));
+        }
+    }
+    (low, at)
+}
+
+/// The withdrawal `after` leaves overdrawn, if it is worse off than
+/// `before`. A history already overdrawn is not a reason on its own; only a
+/// change that makes it worse is, so correcting old figures stays possible.
+pub fn overdrawn(before: &[(i64, String, String, f64)], after: &[(i64, String, String, f64)]) -> Option<Overdraw> {
+    let (was, _) = low_point(before);
+    let (now, at) = low_point(after);
+    if now >= was.min(0.0) - 0.005 {
+        return None;
+    }
+    let (date, amount) = at?;
+    Some(Overdraw { date, amount, available: round2(amount + now).max(0.0), short: round2(-now) })
+}
+
+/// Refuse a change that overdraws a member's own money. `before` is the
+/// member's history as it was; the change has been written, inside the
+/// caller's transaction, which the refusal rolls back.
+pub(crate) fn guard_overdraw(journal: &Journal, fund: Fund, member_id: i64, before: &[(i64, String, String, f64)]) -> Result<()> {
+    if !own_money(fund) {
+        return Ok(());
+    }
+    let after = journal.funds().history(fund, member_id)?;
+    let Some(found) = overdrawn(before, &after) else { return Ok(()) };
+    let name = journal.members().name_of(member_id)?.unwrap_or_default();
+    Err(Error::NotAllowed(vec![format!(
+        "That would overdraw {name}'s {}: the withdrawal of {} on {} is more than the {} there was then.",
+        fund.label().to_lowercase(),
+        shillings(found.amount),
+        found.date,
+        shillings(found.available)
+    )]))
+}
+
 /// Normalise, validate and apply the membership rules, writing nothing.
 /// Only money going *in* is a new obligation; a member who has left may still
-/// withdraw what they saved.
+/// withdraw what they saved. Nothing is dated in a month still to come.
 pub fn check(journal: &Journal, posting: Posting) -> Result<(Posting, Vec<String>)> {
     let tidy = normalise(posting);
     let mut problems = validate(&tidy);
     if !problems.is_empty() {
+        return Ok((tidy, problems));
+    }
+    if let Some(why) = journal.date_ahead(&tidy.date) {
+        problems.push(why);
         return Ok((tidy, problems));
     }
     if tidy.kind != WITHDRAWAL {
@@ -132,7 +205,9 @@ pub fn post_with_batch(journal: &Journal, posting: Posting, batch_id: Option<&st
         return Err(Error::NotAllowed(problems));
     }
     journal.transaction(|| {
+        let before = journal.funds().history(tidy.fund, tidy.member_id)?;
         journal.funds().add(tidy.fund, tidy.member_id, &tidy.date, &tidy.kind, tidy.amount, &tidy.notes, batch_id)?;
+        guard_overdraw(journal, tidy.fund, tidy.member_id, &before)?;
         journal.funds().recalculate(tidy.fund, tidy.member_id)?;
         journal.funds().balance(tidy.fund, tidy.member_id)
     })
@@ -234,7 +309,9 @@ pub fn withdraw_all(journal: &Journal, fund: Fund, member_id: i64, date: &str, n
 }
 
 /// Correct a row's date, amount and notes; balances follow. A savings
-/// deposit is not moved into a month the member's savings are suspended in.
+/// deposit is not moved into a month the member's savings are suspended in,
+/// nothing is moved into a month to come, and the correction may not
+/// overdraw the member.
 pub fn edit_row(journal: &Journal, fund: Fund, row_id: i64, date: &str, amount: f64, notes: &str) -> Result<()> {
     if dates::parse(date).is_none() {
         return Err(Error::invalid(format!("{date} is not a date (use YYYY-MM-DD).")));
@@ -242,8 +319,12 @@ pub fn edit_row(journal: &Journal, fund: Fund, row_id: i64, date: &str, amount: 
     if amount.is_nan() || amount <= 0.0 {
         return Err(Error::invalid("The amount must be greater than zero."));
     }
+    if let Some(why) = journal.date_ahead(date) {
+        return Err(Error::NotAllowed(vec![why]));
+    }
     journal.transaction(|| {
         let row = journal.funds().get(fund, row_id)?.ok_or_else(|| Error::invalid("That entry no longer exists."))?;
+        let before = journal.funds().history(fund, row.individual_id)?;
         if fund == Fund::Savings
             && row.transaction_type == fund.credit()
             && dates::month_key(date) != dates::month_key(&row.date)
@@ -252,14 +333,18 @@ pub fn edit_row(journal: &Journal, fund: Fund, row_id: i64, date: &str, amount: 
             return Err(Error::NotAllowed(vec![reason]));
         }
         journal.funds().update(fund, row_id, dates::date_part(date), round2(amount), notes.trim())?;
+        guard_overdraw(journal, fund, row.individual_id, &before)?;
         journal.funds().recalculate(fund, row.individual_id)
     })
 }
 
+/// Delete one row; refused when a later withdrawal was taken from it.
 pub fn delete_row(journal: &Journal, fund: Fund, row_id: i64) -> Result<()> {
     journal.transaction(|| {
         let Some(row) = journal.funds().get(fund, row_id)? else { return Ok(()) };
+        let before = journal.funds().history(fund, row.individual_id)?;
         journal.funds().delete(fund, row_id)?;
+        guard_overdraw(journal, fund, row.individual_id, &before)?;
         journal.funds().recalculate(fund, row.individual_id)
     })
 }
@@ -311,8 +396,9 @@ pub fn catch_up_pot(journal: &Journal, fund: Fund, member_id: i64, monthly: Opti
     let paused = if fund == Fund::Savings { suspensions::windows(journal, member_id)? } else { Vec::new() };
     let target = match target {
         Some(t) => dates::parse(t).ok_or_else(|| Error::invalid(format!("{t} is not a date.")))?,
-        None => chrono::Local::now().date_naive(),
-    };
+        None => journal.today(),
+    }
+    .min(journal.latest_entry_date());
     let limit = dates::add_months(target, 1).with_day(1).unwrap_or(target);
     let mut next = dates::add_months(last_date, 1).with_day(1).unwrap_or(last_date);
     let notes = "Monthly contribution (Auto)";
@@ -338,23 +424,54 @@ pub fn is_enrolled(journal: &Journal, member_id: i64) -> Result<bool> {
     Ok(journal.funds().enrolment(member_id)?.is_some_and(|e| e.active && e.monthly_amount > 0.0))
 }
 
-/// Enrol (or re-configure) a member. The first contribution is due on `start`.
+/// Enrol (or re-configure) a member. The first contribution is due on
+/// `start` — or, when contributions are already recorded after it, the
+/// month after the last of them: re-enrolling never offers a month again.
 pub fn enrol(journal: &Journal, member_id: i64, monthly: f64, start: &str) -> Result<()> {
     if monthly < 0.0 || dates::parse(start).is_none() {
         return Err(Error::invalid("Enter a monthly amount and a start date."));
     }
-    journal.transaction(|| journal.funds().upsert_enrolment(member_id, monthly, start, start))
+    journal.transaction(|| {
+        let next = match journal.funds().last_dated_row(Fund::Benevolent, member_id, &["Contribution"])? {
+            Some(last) => dates::add_months_str(&last.date, 1).filter(|after| after.as_str() > start).unwrap_or_else(|| start.to_string()),
+            None => start.to_string(),
+        };
+        journal.funds().upsert_enrolment(member_id, monthly, start, &next)
+    })
 }
 
-/// Take one contribution at the next due date and advance the schedule.
+/// The months a member already has a benevolent contribution in.
+fn contributed_months(journal: &Journal, member_id: i64) -> Result<std::collections::HashSet<String>> {
+    Ok(journal
+        .funds()
+        .rows(Fund::Benevolent, member_id, None, None)?
+        .iter()
+        .filter(|r| r.transaction_type == "Contribution")
+        .map(|r| dates::month_key(&r.date))
+        .collect())
+}
+
+/// Take one contribution at the next due date and advance the schedule. A
+/// month already contributed is passed over, not paid twice; a contribution
+/// not yet due is refused.
 pub fn contribute_once(journal: &Journal, member_id: i64) -> Result<usize> {
     policy::enforce(journal, &Operation::new("benevolent.contribute", member_id))?;
     let Some(account) = journal.funds().enrolment(member_id)?.filter(|e| e.active) else { return Ok(0) };
-    let Some(due) = account.next_due_date.clone().filter(|d| !d.is_empty()) else { return Ok(0) };
+    let Some(mut due) = account.next_due_date.clone().filter(|d| !d.is_empty()) else { return Ok(0) };
     if account.monthly_amount <= 0.0 {
         return Ok(0);
     }
     journal.transaction(|| {
+        let taken = contributed_months(journal, member_id)?;
+        while taken.contains(&dates::month_key(&due)) {
+            match dates::add_months_str(&due, 1) {
+                Some(next) => due = next,
+                None => break,
+            }
+        }
+        if journal.date_ahead(&due).is_some() {
+            return Err(Error::invalid(format!("Nothing is due yet: the next benevolent contribution falls on {due}.")));
+        }
         post(journal, Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Monthly contribution"))?;
         journal.funds().set_next_due(member_id, &dates::add_months_str(&due, 1).unwrap_or(due.clone()))?;
         Ok(1)
@@ -362,7 +479,8 @@ pub fn contribute_once(journal: &Journal, member_id: i64) -> Result<usize> {
 }
 
 /// A contribution for every due month from the schedule through `target`
-/// (default today). Returns how many were added.
+/// (default today), never past this month and never twice in a month.
+/// Returns how many were added.
 pub fn catch_up_benevolent(journal: &Journal, member_id: i64, target: Option<&str>) -> Result<usize> {
     policy::enforce(journal, &Operation::new("benevolent.catch_up", member_id))?;
     let Some(account) = journal.funds().enrolment(member_id)?.filter(|e| e.active) else { return Ok(0) };
@@ -370,21 +488,25 @@ pub fn catch_up_benevolent(journal: &Journal, member_id: i64, target: Option<&st
     if account.monthly_amount <= 0.0 {
         return Ok(0);
     }
-    let limit = target.map(str::to_string).unwrap_or_else(dates::today);
+    let limit = target.and_then(dates::parse).unwrap_or_else(|| journal.today()).min(journal.latest_entry_date());
+    let limit = dates::format(limit);
     journal.transaction(|| {
-        let mut count = 0;
+        let taken = contributed_months(journal, member_id)?;
+        let (start, mut count) = (due.clone(), 0);
         while due <= limit {
-            post(
-                journal,
-                Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Monthly contribution (Auto)"),
-            )?;
-            count += 1;
+            if !taken.contains(&dates::month_key(&due)) {
+                post(
+                    journal,
+                    Posting::new(Fund::Benevolent, member_id, &due, "Contribution", account.monthly_amount, "Monthly contribution (Auto)"),
+                )?;
+                count += 1;
+            }
             match dates::add_months_str(&due, 1) {
                 Some(next) => due = next,
                 None => break, // an unreadable date: stop rather than loop
             }
         }
-        if count > 0 {
+        if due != start {
             journal.funds().set_next_due(member_id, &due)?;
         }
         Ok(count)
@@ -433,6 +555,7 @@ mod tests {
     #[test]
     fn christmas_withdrawals_wait_for_the_unlock_month() {
         let journal = Journal::open_in_memory().unwrap();
+        journal.set_today(chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap());
         let ann = member(&journal, "Ann");
         deposit(&journal, Fund::Christmas, ann, 1000.0, "2026-01-01", "").unwrap();
         assert!(matches!(withdraw(&journal, Fund::Christmas, ann, 100.0, "2026-06-01", "", false), Err(Error::ChristmasLocked(_))));

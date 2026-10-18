@@ -243,13 +243,20 @@ mod tests {
         journal.members().add(&MemberDetails { name: name.into(), ..Default::default() }).unwrap()
     }
 
+    /// A journal whose today is after every month these tests use.
+    fn journal() -> Journal {
+        let journal = Journal::open_in_memory().unwrap();
+        journal.set_today(chrono::NaiveDate::from_ymd_opt(2027, 12, 31).unwrap());
+        journal
+    }
+
     fn spans(journal: &Journal, id: i64) -> Vec<Window> {
         windows(journal, id).unwrap()
     }
 
     #[test]
     fn a_suspension_covers_whole_months_and_refuses_deposits_inside_them() {
-        let journal = Journal::open_in_memory().unwrap();
+        let journal = journal();
         let ann = member(&journal, "Ann");
         assert_eq!(suspend(&journal, ann, "2026-11-17", Some(3)).unwrap(), Suspended::Added(1));
         assert_eq!(spans(&journal, ann), [("2026-11-01".to_string(), Some("2027-02-01".to_string()))]);
@@ -268,7 +275,7 @@ mod tests {
 
     #[test]
     fn asking_for_longer_extends_the_suspension_and_an_overlap_is_refused() {
-        let journal = Journal::open_in_memory().unwrap();
+        let journal = journal();
         let ann = member(&journal, "Ann");
         suspend(&journal, ann, "2026-11-01", Some(2)).unwrap();
         let done = suspend(&journal, ann, "2026-12-01", Some(3)).unwrap();
@@ -289,7 +296,7 @@ mod tests {
 
     #[test]
     fn deposits_already_in_the_months_are_named_and_refuse_it() {
-        let journal = Journal::open_in_memory().unwrap();
+        let journal = journal();
         let ann = member(&journal, "Ann");
         funds::deposit(&journal, Fund::Savings, ann, 2500.0, "2026-12-01", "").unwrap();
         let refused = suspend(&journal, ann, "2026-11-01", None).unwrap_err().to_string();
@@ -313,7 +320,7 @@ mod tests {
 
     #[test]
     fn a_member_who_left_cannot_be_suspended() {
-        let journal = Journal::open_in_memory().unwrap();
+        let journal = journal();
         let ann = member(&journal, "Ann");
         journal.members().set_status(ann, "Retired", Some("2026-02-01")).unwrap();
         assert!(matches!(suspend(&journal, ann, "2026-11-01", Some(2)), Err(Error::NotAllowed(_))));
@@ -321,7 +328,7 @@ mod tests {
 
     #[test]
     fn resuming_ends_it_from_a_month_and_removing_forgets_it() {
-        let journal = Journal::open_in_memory().unwrap();
+        let journal = journal();
         let ann = member(&journal, "Ann");
         // Resumed in the month it begins, it paused nothing: it goes.
         suspend(&journal, ann, "2026-11-01", Some(4)).unwrap();

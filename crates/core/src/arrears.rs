@@ -135,7 +135,7 @@ pub fn summarize(rows: &[ArrearsRow]) -> Summary {
 
 /// Arrears straight from a journal, as at `as_of` (default today).
 pub fn arrears(journal: &Journal, as_of: Option<&str>) -> Result<Vec<ArrearsRow>> {
-    let as_of = as_of.map(str::to_string).unwrap_or_else(dates::today);
+    let as_of = as_of.map(str::to_string).unwrap_or_else(|| dates::format(journal.today()));
     Ok(build_rows(&journal.loans().overdue(&as_of)?, &as_of))
 }
 

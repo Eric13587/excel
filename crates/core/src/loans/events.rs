@@ -38,22 +38,40 @@ pub fn reconstruct(rows: &[EventRow], suspensions: &[(String, Option<String>)]) 
     let mut seq = 0;
     let mut current_rate: Option<f64> = None;
 
-    // Everything the loan ever accrued is what it was written for.
-    let total_accrued = round2(rows.iter().filter(|r| r.kind == event::INTEREST).map(|r| r.added).sum());
+    // What each disbursement and top-up brought: the interest charged from it
+    // until the next one. The charges are the evidence of what each was
+    // written for, as far as it has been charged — so interest a top-up adds
+    // is never charged before the top-up.
+    let mut pools: Vec<f64> = Vec::new();
+    for row in rows {
+        match row.kind.as_str() {
+            event::LOAN_ISSUED | event::TOP_UP => pools.push(0.0),
+            event::INTEREST => match pools.last_mut() {
+                Some(pool) => *pool = round2(*pool + row.added),
+                None => pools.push(round2(row.added)),
+            },
+            _ => {}
+        }
+    }
+    let mut pool = pools.into_iter();
     let first_accrual = rows
         .iter()
         .find(|r| r.kind == event::INTEREST)
         .map(|r| round2(r.added))
         .unwrap_or(0.0);
 
-    for row in rows {
+    for (at, row) in rows.iter().enumerate() {
         seq += 1;
+        // A buy-off's charge of what was left to charge, just before it on
+        // its own day, is part of the settlement, not a change of terms.
+        let realised = row.kind == event::INTEREST
+            && rows.get(at + 1).is_some_and(|next| next.kind == event::BUYOFF && next.date == row.date);
         match row.kind.as_str() {
             event::LOAN_ISSUED => {
                 events.push(LoanEvent {
                     amount: row.added,
                     monthly_interest: Some(first_accrual),
-                    unearned_interest: Some(total_accrued),
+                    unearned_interest: Some(pool.next().unwrap_or(0.0)),
                     source: Some(row.id),
                     ..LoanEvent::new(row.date.clone(), EventKind::Disbursed, seq)
                 });
@@ -61,9 +79,11 @@ pub fn reconstruct(rows: &[EventRow], suspensions: &[(String, Option<String>)]) 
             }
             event::TOP_UP => events.push(LoanEvent {
                 amount: row.added,
+                unearned_interest: Some(pool.next().unwrap_or(0.0)),
                 source: Some(row.id),
                 ..LoanEvent::new(row.date.clone(), EventKind::ToppedUp, seq)
             }),
+            event::INTEREST if realised => {}
             event::INTEREST => {
                 let amount = round2(row.added);
                 if current_rate.is_none_or(|rate| (amount - rate).abs() > EPSILON) {

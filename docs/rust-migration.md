@@ -101,6 +101,86 @@ purpose.
   month.** 1.x stored the state after the month's interest accrual, so
   restoring from it lost a month of interest.
 
+### Guard rails
+
+2.0 refuses a change that would leave the books in a state no true history
+produces. 1.x allowed each of these, and the production journal audited on
+2026-10-17 held examples of most of them: an overdrawn Christmas fund,
+deductions and a buy-off dated months ahead, contributions posted twice, and
+loans whose interest no longer added up. Each rule is enforced where the
+change is written, so it holds wherever the change is made, whether in the
+member's ledger, the Ledger Grid, Catch Up or Fill Forward. Each refusal says
+what to do instead.
+
+* **Nothing is dated in a month that has not come yet.** A deduction,
+  deposit, withdrawal, top-up, buy-off or correction may be dated later this
+  month (payroll day), but not in a month to come. Catch Up and Fill Forward
+  stop at the end of this month.
+* **A savings or Christmas balance never goes below zero**, on any date. That
+  covers a later balance too: a withdrawal, correction or deletion that is
+  covered by today's balance is still refused if the money was not there on
+  the day of the withdrawal. The refusal gives the date and the shortfall.
+* **Catch Up and + One Month never post a benevolent contribution into a
+  month that already has one**, and the next due month follows the
+  contributions recorded.
+* **A loan's history must read in order.** A change to a loan is refused if
+  it leaves any of these behind:
+  * entries out of step with its schedule;
+  * a due month before its last payment with no deduction, no interest
+    charge and no suspension;
+  * an entry dated before the disbursement;
+  * a loan without its disbursement.
+
+  Every change to a loan is held to this: deductions and catch-ups, top-ups
+  and buy-offs, corrections and deletions, moved dates, changed repayments,
+  suspensions and Ledger Grid saves.
+* **A loan is never repaid more than it owes**, in principal or in interest.
+  A loan is settled with a buy-off.
+* **A top-up or buy-off falls between the loan's last entry and its next due
+  date**, and a top-up needs an active loan. A buy-off ends a running
+  suspension on its date.
+* **Changing a month's interest charge keeps the loan's total**: the months
+  still to charge make up the difference. Changing a repayment re-spreads the
+  interest still to charge and never adds any.
+* **A loan suspension accounts for its months.** It is not recorded over
+  months that hold deductions or interest charges. Suspend offers to remove
+  them as it records the suspension, saving a backup first, and the interest
+  goes back to what the loan has still to charge. It never covers a buy-off.
+  A suspension that has already skipped months is removed only by deducting
+  them (Deduct Them Now, which rebuilds the schedule). 1.x recorded a
+  suspension "as a note" over deductions, which left months the schedule
+  could not explain.
+* **Undo Last Save on the Ledger Grid is held to the same rules.** It is
+  refused if putting the save back would overdraw a member, for example by
+  removing a deposit a later withdrawal was taken from. It is also refused if
+  it would return a savings deposit to a month since suspended, or a
+  benevolent contribution to a month paid since.
+
+A loan already out of order is not held to the rules: only a change that
+makes it worse is refused, so old figures can still be corrected.
+
+`crates/core/tests/stress.rs` tests the rules. It applies random sequences
+of the operations the screens perform to a fresh journal and checks the books
+after every step. Those operations are money in and out, corrections,
+catch-ups, loans and their schedules, suspensions, members leaving, the Ledger
+Grid and undo. The checks are:
+
+* running balances;
+* overdrafts;
+* dates in months to come;
+* deposits in suspended months;
+* benevolent schedules;
+* every loan re-derived from its history;
+* months nothing accounts for;
+* paid and active loans with the wrong balances;
+* interest charged plus interest still to charge equals what the loan was
+  written for;
+* the member's monthly deduction.
+
+A refusal is a guard rail working; a change that goes through must leave the
+books whole. A failure names the seed and the steps that led to it, so it
+can be replayed. A new operation joins the stress test along with its rule.
+
 ### Members leaving
 
 * **Every way of leaving pays the member out** — retiring, resigning,

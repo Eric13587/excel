@@ -6,8 +6,12 @@
 //! re-derives the member's loans (see [`super::projection`]) so the ledger's
 //! running balances follow from its facts.
 //!
-//! Each operation is one transaction: it happens whole or not at all.
+//! Each operation is one transaction: it happens whole or not at all. One
+//! that leaves the loan's history worse than it found it — out of order,
+//! months unaccounted for, repaid beyond what it owed — is refused
+//! ([`super::guards`]).
 
+use super::guards;
 use super::projection::project_member;
 use super::suspensions::{date_in_suspension, loan_windows, resume};
 use crate::Journal;
@@ -40,10 +44,67 @@ fn require_active(loan: &Loan) -> Result<()> {
     }
 }
 
+/// When a loan is next due, stepped over its suspended months; `None` while
+/// it is suspended until further notice, or has no due date.
+fn stepped_due(journal: &Journal, loan: &Loan) -> Result<Option<String>> {
+    let Some(mut due) = dates::parse(loan.due()) else { return Ok(None) };
+    let windows = loan_windows(journal, loan.id)?;
+    for _ in 0..600 {
+        if !date_in_suspension(&dates::format(due), &windows) {
+            return Ok(Some(dates::format(due)));
+        }
+        due = dates::add_months(due, 1);
+    }
+    Ok(None)
+}
+
+/// An entry that changes a loan's terms — a top-up, a buy-off — goes after
+/// the loan's history, never in the middle of it (what follows was worked
+/// out without it), never past the month it is due for (the months between
+/// would be unaccounted for), and never in a month to come.
+fn not_ahead_or_behind(journal: &Journal, member_id: i64, reference: &str, date: &str, what: &str) -> Result<()> {
+    if let Some(why) = journal.date_ahead(date) {
+        return Err(Error::NotAllowed(vec![why]));
+    }
+    if let Some(loan) = journal.loans().by_ref(member_id, reference)?
+        && let Some(due) = stepped_due(journal, &loan)?
+        && dates::date_part(date) > due.as_str()
+    {
+        return Err(Error::NotAllowed(vec![format!(
+            "{reference} is due on {due} first. {what} on {} would leave the months between unaccounted for — \
+             take or record them first, or date it on or before {due}.",
+            dates::date_part(date)
+        )]));
+    }
+    if let Some(last) = journal.ledger().last_date(member_id, reference)?
+        && dates::date_part(date) < dates::date_part(&last)
+    {
+        return Err(Error::NotAllowed(vec![format!(
+            "{what} on {} would fall before {reference}'s entry of {}; it goes on or after the loan's last entry.",
+            dates::date_part(date),
+            dates::date_part(&last)
+        )]));
+    }
+    Ok(())
+}
+
 /// Keep the member's cached deduction — the sum of their active instalments.
 pub fn recalculate_default_deduction(journal: &Journal, member_id: i64) -> Result<()> {
     let total: f64 = journal.loans().active_for_member(member_id)?.iter().map(|l| l.installment).sum();
     journal.members().set_default_deduction(member_id, total)
+}
+
+/// Make a change to one loan as one transaction, refused if it leaves the
+/// loan worse than it was ([`guards::keep_sound`]).
+fn guarded<T>(journal: &Journal, member_id: i64, reference: &str, change: impl FnOnce() -> Result<T>) -> Result<T> {
+    journal.transaction(|| {
+        let sound = guards::soundness(journal, member_id, reference)?;
+        let done = change()?;
+        if journal.loans().by_ref(member_id, reference)?.is_some() {
+            guards::keep_sound(journal, member_id, reference, &sound)?;
+        }
+        Ok(done)
+    })
 }
 
 fn settle(journal: &Journal, member_id: i64) -> Result<()> {
@@ -110,6 +171,9 @@ pub fn issue(
         return Err(Error::invalid("A loan must run for at least one month."));
     }
     let issued = dates::parse(date).ok_or_else(|| Error::invalid(format!("{date} is not a date.")))?;
+    if let Some(why) = journal.date_ahead(date) {
+        return Err(Error::NotAllowed(vec![why]));
+    }
     let rate = rate.unwrap_or_else(|| journal.settings().default_interest_rate());
     let terms = terms_for(principal, duration_months, rate);
     let next_due = if journal.settings().deduct_same_month() {
@@ -155,11 +219,19 @@ pub fn issue(
 /// Take one month's deduction: accrue the month's interest, then settle
 /// interest before principal with the instalment.
 pub fn deduct(journal: &Journal, member_id: i64, reference: &str) -> Result<()> {
-    journal.transaction(|| {
+    guarded(journal, member_id, reference, || {
         let mut loan = require_loan(journal, member_id, reference)?;
         require_active(&loan)?;
         if loan.is_suspended {
-            return Err(Error::LoanSuspended { reference: reference.into(), until: loan.suspend_until.clone() });
+            // A suspension whose end has come has run its course: it resumes
+            // at its end, as catch-up and the Ledger Grid resume it.
+            match loan.suspend_until.as_deref().map(dates::date_part).filter(|u| !u.is_empty()) {
+                Some(until) if journal.date_ahead(until).is_none() => {
+                    resume(journal, loan.id, Some(until))?;
+                    loan = require_loan(journal, member_id, reference)?;
+                }
+                until => return Err(Error::LoanSuspended { reference: reference.into(), until: until.map(str::to_string) }),
+            }
         }
         // Step over recorded suspension months, so the deduction lands on the
         // first month not suspended — the term extends.
@@ -180,6 +252,12 @@ pub fn deduct(journal: &Journal, member_id: i64, reference: &str) -> Result<()> 
         let date = loan.due().to_string();
         if dates::parse(&date).is_none() {
             return Err(Error::invalid(format!("{reference} has no valid due date.")));
+        }
+        if journal.date_ahead(&date).is_some() {
+            return Err(Error::NotAllowed(vec![format!(
+                "{reference} is next due on {}, in a month that has not come yet.",
+                dates::date_part(&date)
+            )]));
         }
 
         let accrual = loan.monthly_interest.min(loan.unearned_interest);
@@ -247,8 +325,8 @@ pub fn deduct(journal: &Journal, member_id: i64, reference: &str) -> Result<()> 
 /// suspended months. Returns the number of deductions taken.
 pub fn catch_up(journal: &Journal, member_id: i64, reference: &str, target: Option<&str>) -> Result<usize> {
     policy::enforce(journal, &Operation::new("loan.catch_up", member_id).for_loan(reference))?;
-    let limit = target.map(str::to_string).unwrap_or_else(dates::today);
-    journal.transaction(|| {
+    let limit = dates::format(target.and_then(dates::parse).unwrap_or_else(|| journal.today()).min(journal.latest_entry_date()));
+    guarded(journal, member_id, reference, || {
         let mut loan = require_loan(journal, member_id, reference)?;
         require_active(&loan)?;
 
@@ -388,14 +466,26 @@ pub fn catch_up(journal: &Journal, member_id: i64, reference: &str, target: Opti
 /// Deduct month by month from `from` to `to` (both `YYYY-MM-DD`), stepping
 /// over suspended months — the ledger's "Auto…" deduction.
 pub fn deduct_range(journal: &Journal, member_id: i64, reference: &str, from: &str, to: &str) -> Result<usize> {
-    journal.transaction(|| {
+    guarded(journal, member_id, reference, || {
         let Some(loan) = journal.loans().by_ref(member_id, reference)? else { return Ok(0) };
         if !loan.is_active() {
             return Ok(0);
         }
-        let (Some(mut current), Some(end)) = (dates::parse(from), dates::parse(to)) else {
+        let (Some(from), Some(end)) = (dates::parse(from), dates::parse(to)) else {
             return Err(Error::invalid("Choose a valid range of dates."));
         };
+        let end = end.min(journal.latest_entry_date());
+        // Months are deducted in order from the one due: never before it, and
+        // never past it leaving it behind.
+        let Some(mut current) = dates::parse(loan.due()) else {
+            return Err(Error::invalid(format!("{reference} has no due date recorded.")));
+        };
+        if dates::month_key(&dates::format(from)) > dates::month_key(loan.due()) {
+            return Err(Error::NotAllowed(vec![format!(
+                "{reference} is due for {} first; its months are deducted in order from there.",
+                current.format("%B %Y")
+            )]));
+        }
         let position = journal.ledger().loan_position(member_id, reference)?;
         let (mut running, mut running_principal, mut running_interest) =
             (position.balance, position.principal_balance, position.interest_balance);
@@ -472,7 +562,7 @@ pub fn deduct_range(journal: &Journal, member_id: i64, reference: &str, from: &s
 
 /// Interest a loan was written for, less what it has charged — recomputed
 /// from the ledger at the loan's own rate.
-fn unearned_from_ledger(journal: &Journal, member_id: i64, reference: &str, rate: f64) -> Result<f64> {
+pub(crate) fn unearned_from_ledger(journal: &Journal, member_id: i64, reference: &str, rate: f64) -> Result<f64> {
     let mut expected = 0.0;
     let mut accrued = 0.0;
     for row in journal.ledger().for_loan(member_id, reference)? {
@@ -497,11 +587,13 @@ pub fn top_up(
     if amount <= 0.0 || new_duration < 1 {
         return Err(Error::invalid("A top-up needs an amount and a duration of at least one month."));
     }
-    journal.transaction(|| {
+    guarded(journal, member_id, reference, || {
         project_member(journal, member_id)?;
         let loan = require_loan(journal, member_id, reference)?;
+        require_active(&loan)?;
         let previous = LoanState::of(&loan).to_json();
-        let date = date.map(str::to_string).unwrap_or_else(dates::today);
+        let date = date.map(str::to_string).unwrap_or_else(|| dates::format(journal.today()));
+        not_ahead_or_behind(journal, member_id, reference, &date, "A top-up")?;
         let rate = loan_rate(journal, &loan);
 
         let top_up_interest = amount * rate;
@@ -511,6 +603,9 @@ pub fn top_up(
         let new_installment = (total_future / new_duration as f64).ceil();
         let new_monthly = (new_unearned / new_duration as f64).ceil();
         let position = journal.ledger().loan_position(member_id, reference)?;
+        // The schedule carries on: the next deduction falls when it was due,
+        // not on the day of the top-up.
+        let next_due = if loan.due() > dates::date_part(&date) { loan.due().to_string() } else { dates::date_part(&date).to_string() };
 
         journal.loans().set_details(
             loan.id,
@@ -518,7 +613,7 @@ pub fn top_up(
             new_principal,
             new_installment,
             new_monthly,
-            &date,
+            &next_due,
             Some(new_unearned),
             None,
             None,
@@ -546,7 +641,7 @@ pub fn top_up(
 /// Settle a loan in full: realise its unearned interest, then pay principal
 /// and all interest in one entry. Returns the amount settled.
 pub fn buyoff(journal: &Journal, member_id: i64, reference: &str, date: Option<&str>) -> Result<f64> {
-    journal.transaction(|| {
+    guarded(journal, member_id, reference, || {
         let loan = require_loan(journal, member_id, reference)?;
         require_active(&loan)?;
         let previous = LoanState::of(&loan).to_json();
@@ -559,7 +654,18 @@ pub fn buyoff(journal: &Journal, member_id: i64, reference: &str, date: Option<&
         let date = date
             .map(str::to_string)
             .or_else(|| loan.next_due_date.clone().filter(|d| !d.is_empty()))
-            .unwrap_or_else(dates::today);
+            .unwrap_or_else(|| dates::format(journal.today()));
+        not_ahead_or_behind(journal, member_id, reference, &date, "A buy-off")?;
+        // Settling ends a suspension: it lasted until the settlement, and one
+        // not begun by then never applied.
+        if let Some(open) = journal.loans().open_suspension(loan.id)? {
+            if dates::date_part(&open.start_date) >= dates::date_part(&date) {
+                journal.loans().delete_suspension(open.id)?;
+            } else {
+                journal.loans().close_open_suspension(loan.id, dates::date_part(&date))?;
+            }
+            journal.loans().clear_suspended(loan.id)?;
+        }
 
         let future = loan.unearned_interest;
         if future > 0.0 {
@@ -654,7 +760,7 @@ pub fn rebuild_schedule(journal: &Journal, member_id: i64, reference: &str, targ
             ));
         }
         let last = journal.ledger().max_date(member_id, reference, event::REPAYMENT)?;
-        let limit = target.map(str::to_string).or(last).unwrap_or_else(dates::today);
+        let limit = target.map(str::to_string).or(last).unwrap_or_else(|| dates::format(journal.today()));
         journal.ledger().delete_events(member_id, reference, &[event::REPAYMENT, event::INTEREST])?;
 
         let unearned = round2(loan.principal * loan_rate(journal, &loan));

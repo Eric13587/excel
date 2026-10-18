@@ -2,18 +2,23 @@
 //! one, change a repayment, edit a top-up, move dates.
 //!
 //! Every edit ends by re-deriving the loan, so what follows the edited row
-//! follows from it.
+//! follows from it — and is refused if it leaves the loan out of order or
+//! repaid beyond what it owed ([`super::guards`]). Nothing is moved into a
+//! month to come, and a changed interest charge keeps the loan's total
+//! interest what it was written for.
 
 use rusqlite::params;
 
 use super::deletions;
+use super::guards::{keep_sound, soundness};
 use super::projection::{clear_split, project_loan, project_member};
-use super::service::{loan_rate, recalculate_default_deduction, require_loan};
+use super::service::{loan_rate, recalculate_default_deduction, require_loan, unearned_from_ledger};
 use crate::Journal;
 use crate::dates;
 use crate::db::loans::LoanState;
 use crate::db::model::{LedgerRow, event};
 use crate::error::{Error, Result};
+use crate::money::{round2, shillings};
 
 fn loan_rows(journal: &Journal, row: &LedgerRow) -> Result<Vec<LedgerRow>> {
     journal.ledger().for_loan(row.individual_id, &row.loan_ref)
@@ -52,6 +57,7 @@ fn sibling(rows: &[LedgerRow], row: &LedgerRow) -> Option<i64> {
 pub fn delete_entry(journal: &Journal, member_id: i64, row_id: i64) -> Result<()> {
     journal.transaction(|| {
         let Some(row) = journal.ledger().get(row_id)? else { return Ok(()) };
+        let before = soundness(journal, member_id, &row.loan_ref)?;
         if row.loan_ref.is_empty() || row.loan_ref == "-" {
             return journal.ledger().delete(row_id);
         }
@@ -93,6 +99,7 @@ pub fn delete_entry(journal: &Journal, member_id: i64, row_id: i64) -> Result<()
                 }
                 journal.ledger().delete(row.id)?;
                 restore_previous(journal, loan.id, &row)?;
+                charge_what_remains(journal, member_id, loan.id, &row.loan_ref)?;
             }
             event::TOP_UP | event::RESTRUCTURE => {
                 let at = rows.iter().position(|r| r.id == row.id).unwrap_or(0);
@@ -100,12 +107,26 @@ pub fn delete_entry(journal: &Journal, member_id: i64, row_id: i64) -> Result<()
                     journal.ledger().delete(later.id)?;
                 }
                 restore_previous(journal, loan.id, &row)?;
+                charge_what_remains(journal, member_id, loan.id, &row.loan_ref)?;
             }
             _ => journal.ledger().delete(row.id)?,
         }
         project_member(journal, member_id)?;
+        if journal.loans().by_ref(member_id, &row.loan_ref)?.is_some() {
+            keep_sound(journal, member_id, &row.loan_ref, &before)?;
+        }
         recalculate_default_deduction(journal, member_id)
     })
+}
+
+/// After an entry that changed a loan's terms is taken away, the loan has
+/// left to charge what its remaining history was written for, less what it
+/// has charged. The snapshot restored is the loan before that entry; an
+/// earlier entry corrected since must not take its correction back with it.
+fn charge_what_remains(journal: &Journal, member_id: i64, loan_id: i64, reference: &str) -> Result<()> {
+    let Some(loan) = journal.loans().get(loan_id)? else { return Ok(()) };
+    let wanted = round2(unearned_from_ledger(journal, member_id, reference, loan_rate(journal, &loan))?);
+    journal.loans().adjust_unearned(loan_id, round2(wanted - loan.unearned_interest))
 }
 
 /// Return a loan to the state an entry recorded before it was made. An entry
@@ -142,12 +163,43 @@ pub fn edit_entry(
     }
     journal.transaction(|| {
         let row = journal.ledger().get(row_id)?.ok_or_else(|| Error::invalid("That entry no longer exists."))?;
+        if dates::date_part(date) != dates::date_part(&row.date)
+            && let Some(why) = journal.date_ahead(date)
+        {
+            return Err(Error::NotAllowed(vec![why]));
+        }
+        let before = soundness(journal, member_id, &row.loan_ref)?;
+        if row.event_type == event::INTEREST && (added - row.added).abs() > 0.005 {
+            // What this month charges more, the months to come charge less:
+            // the loan's total interest stays what it was written for.
+            let loan = require_loan(journal, member_id, &row.loan_ref)?;
+            if !loan.is_active() {
+                return Err(Error::NotAllowed(vec![format!(
+                    "{} is {}; its interest charges stay as they were.",
+                    row.loan_ref,
+                    loan.status.to_lowercase()
+                )]));
+            }
+            let more = round2(added - row.added);
+            if more > loan.unearned_interest + 0.005 {
+                return Err(Error::NotAllowed(vec![format!(
+                    "That charges {} more interest, but {} has only {} left to charge.",
+                    shillings(more),
+                    row.loan_ref,
+                    shillings(loan.unearned_interest)
+                )]));
+            }
+            journal.loans().adjust_unearned(loan.id, -more)?;
+        }
         journal.ledger().update_core(row_id, date, added, deducted, notes, None, mark_edited, None)?;
         clear_split(journal, row_id)?;
         if !row.loan_ref.is_empty() {
             project_loan(journal, member_id, &row.loan_ref)?;
         }
         project_member(journal, member_id)?;
+        if !row.loan_ref.is_empty() {
+            keep_sound(journal, member_id, &row.loan_ref, &before)?;
+        }
         recalculate_default_deduction(journal, member_id)
     })
 }
@@ -163,7 +215,12 @@ pub fn change_repayment(journal: &Journal, member_id: i64, row_id: i64, amount: 
              the entry's date to the month it actually happened.",
         ));
     }
-    journal.transaction(|| change_repayment_inner(journal, member_id, row_id, amount, notes, false))
+    journal.transaction(|| {
+        let row = journal.ledger().get(row_id)?.ok_or_else(|| Error::invalid("That entry no longer exists."))?;
+        let before = soundness(journal, member_id, &row.loan_ref)?;
+        change_repayment_inner(journal, member_id, row_id, amount, notes, false)?;
+        keep_sound(journal, member_id, &row.loan_ref, &before)
+    })
 }
 
 fn split_against_previous(journal: &Journal, row: &LedgerRow, amount: f64) -> Result<(f64, f64)> {
@@ -207,8 +264,14 @@ fn change_repayment_inner(
     // yet charged — they are about to be re-priced.
     let pot = loan.unearned_interest + future_sum;
     let months = ((total_future + amount) / amount).ceil().max(1.0);
-    let monthly = if pot > 0.0 { (pot / months).ceil() } else { 0.0 };
-    let remaining = (pot - monthly * future_count as f64).max(0.0);
+    let mut monthly = if pot > 0.0 { (pot / months).ceil() } else { 0.0 };
+    // The charges already recorded from this month on take the new rate, but
+    // together never more than the loan has left to charge: re-pricing moves
+    // interest between months, it does not add any.
+    if future_count > 0 && monthly * future_count as f64 > pot {
+        monthly = (pot / future_count as f64).floor();
+    }
+    let remaining = round2((pot - monthly * future_count as f64).max(0.0));
     journal.loans().set_details(
         loan.id,
         loan.total_amount,
@@ -254,6 +317,12 @@ pub fn edit_top_up(
         if row.event_type != event::TOP_UP {
             return Err(Error::invalid("Only a top-up can be edited this way."));
         }
+        if dates::date_part(date) != dates::date_part(&row.date)
+            && let Some(why) = journal.date_ahead(date)
+        {
+            return Err(Error::NotAllowed(vec![why]));
+        }
+        let sound = soundness(journal, member_id, &row.loan_ref)?;
         let loan = require_loan(journal, member_id, &row.loan_ref)?;
         let rate = loan_rate(journal, &loan);
         let changed = (row.added - amount).abs() > 0.001;
@@ -275,6 +344,7 @@ pub fn edit_top_up(
         journal.loans().set_installment(loan.id, installment, monthly)?;
         journal.loans().set_terms(loan.id, duration_months, None)?;
         project_member(journal, member_id)?;
+        keep_sound(journal, member_id, &row.loan_ref, &sound)?;
         recalculate_default_deduction(journal, member_id)
     })
 }
@@ -307,19 +377,22 @@ pub fn move_date(journal: &Journal, member_id: i64, row_id: i64, new_date: &str,
         let row = journal.ledger().get(row_id)?.ok_or_else(|| Error::invalid("That entry no longer exists."))?;
         let old = dates::parse(&row.date).ok_or_else(|| Error::invalid("The entry's date is unreadable."))?;
         let (months, days) = relative_delta(new, old);
+        let before = soundness(journal, member_id, &row.loan_ref)?;
         let rows = journal.ledger().for_loan(member_id, &row.loan_ref)?;
         let start = rows.iter().position(|r| r.id == row_id).unwrap_or(0);
         let targets: Vec<&LedgerRow> = if cascade { rows[start..].iter().collect() } else { vec![&rows[start]] };
         for target in &targets {
             if let Some(old) = dates::parse(&target.date) {
-                let moved = dates::add_days(dates::add_months(old, months), days);
-                journal.conn().execute(
-                    "UPDATE ledger SET date=? WHERE id=?",
-                    params![dates::format(moved), target.id],
-                )?;
+                let moved = dates::format(dates::add_days(dates::add_months(old, months), days));
+                if let Some(why) = journal.date_ahead(&moved) {
+                    return Err(Error::NotAllowed(vec![why]));
+                }
+                journal.conn().execute("UPDATE ledger SET date=? WHERE id=?", params![moved, target.id])?;
             }
         }
         project_member(journal, member_id)?;
+        keep_sound(journal, member_id, &row.loan_ref, &before)?;
+        recalculate_default_deduction(journal, member_id)?;
         Ok(targets.len())
     })
 }
@@ -369,10 +442,25 @@ mod tests {
     fn a_date_moved_with_cascade_moves_the_rest_by_a_month() {
         let (journal, ann) = loan_with_history();
         let rows = journal.ledger().for_loan(ann, "L-001").unwrap();
+        let issued = rows.iter().find(|r| r.event_type == event::LOAN_ISSUED).unwrap().id;
+        move_date(&journal, ann, issued, "2026-02-01", true).unwrap();
+        let moved: Vec<String> = journal.ledger().for_loan(ann, "L-001").unwrap().iter().map(|r| r.date.clone()).collect();
+        assert_eq!(moved, ["2026-02-01", "2026-03-01", "2026-03-01", "2026-04-01", "2026-04-01"]);
+        assert_eq!(journal.loans().by_ref(ann, "L-001").unwrap().unwrap().due(), "2026-05-01");
+    }
+
+    #[test]
+    fn moving_deductions_away_from_their_schedule_is_refused() {
+        // February's charge moved to March leaves February with none: the
+        // schedule could no longer account for it.
+        let (journal, ann) = loan_with_history();
+        let rows = journal.ledger().for_loan(ann, "L-001").unwrap();
         let feb_interest = rows.iter().find(|r| r.event_type == event::INTEREST).unwrap().id;
-        move_date(&journal, ann, feb_interest, "2026-03-01", true).unwrap();
-        let moved: Vec<String> =
-            journal.ledger().for_loan(ann, "L-001").unwrap().iter().skip(1).map(|r| r.date.clone()).collect();
-        assert_eq!(moved, ["2026-03-01", "2026-03-01", "2026-04-01", "2026-04-01"]);
+        let refused = move_date(&journal, ann, feb_interest, "2026-03-01", true).unwrap_err().to_string();
+        assert!(refused.contains("nothing accounts for"), "{refused}");
+        assert_eq!(journal.ledger().for_loan(ann, "L-001").unwrap(), rows, "nothing moved");
+        // Nor into a month to come.
+        let last = rows.last().unwrap().id;
+        assert!(move_date(&journal, ann, last, "2099-01-01", false).is_err());
     }
 }

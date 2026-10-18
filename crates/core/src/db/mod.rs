@@ -96,6 +96,8 @@ pub struct Journal {
     report: OpenReport,
     /// Savepoint names must be unique while nested.
     savepoint_depth: Cell<u32>,
+    /// The day the rules take as today; the real date unless set.
+    clock: Cell<Option<chrono::NaiveDate>>,
 }
 
 impl Journal {
@@ -113,6 +115,7 @@ impl Journal {
             path: Some(path.clone()),
             report: OpenReport::default(),
             savepoint_depth: Cell::new(0),
+            clock: Cell::new(None),
         };
         journal.report.integrity_ok = true;
         if pre_existing {
@@ -137,6 +140,7 @@ impl Journal {
             path: None,
             report: OpenReport { integrity_ok: true, ..OpenReport::default() },
             savepoint_depth: Cell::new(0),
+            clock: Cell::new(None),
         };
         journal.configure()?;
         journal.ensure_schema()?;
@@ -182,6 +186,39 @@ impl Journal {
 
     pub fn report(&self) -> &OpenReport {
         &self.report
+    }
+
+    /// Today, as the journal's rules see it: the real date, unless
+    /// [`Journal::set_today`] fixed another — for tests, which must not
+    /// depend on the day they run.
+    pub fn today(&self) -> chrono::NaiveDate {
+        self.clock.get().unwrap_or_else(|| chrono::Local::now().date_naive())
+    }
+
+    pub fn set_today(&self, date: chrono::NaiveDate) {
+        self.clock.set(Some(date));
+    }
+
+    /// The last day an entry may be dated: the end of the current month. A
+    /// deduction or a contribution is recorded in the month it happens —
+    /// later this month is payroll day; next month has not come.
+    pub fn latest_entry_date(&self) -> chrono::NaiveDate {
+        use chrono::Datelike;
+        let today = self.today();
+        crate::dates::add_days(crate::dates::add_months(today.with_day(1).unwrap_or(today), 1), -1)
+    }
+
+    /// Why an entry may not carry `date`, or `None`: it falls in a month that
+    /// has not come yet.
+    pub fn date_ahead(&self, date: &str) -> Option<String> {
+        let parsed = crate::dates::parse(date)?;
+        (parsed > self.latest_entry_date()).then(|| {
+            format!(
+                "{} is in {}, which has not come yet. Record it in the month it happens.",
+                crate::dates::date_part(date),
+                parsed.format("%B %Y")
+            )
+        })
     }
 
     fn looks_like_sqlite(&self) -> bool {

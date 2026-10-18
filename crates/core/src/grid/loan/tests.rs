@@ -709,6 +709,7 @@ fn deleting_an_earlier_month_records_it_missed() {
 #[test]
 fn a_missed_loan_is_collected_after_its_last_scheduled_month() {
     let journal = Journal::open_in_memory().unwrap();
+    journal.set_today(chrono::NaiveDate::from_ymd_opt(2028, 12, 31).unwrap());
     let ann = loan(&journal, "Ann", "2026-06-01");
     let twin = loan(&journal, "Ben", "2026-06-01");
     delete_months(&journal, ann, &["2026-03"], false);

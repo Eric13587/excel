@@ -105,11 +105,7 @@ pub fn operations(fund: Fund) -> &'static OpSet {
     }
 }
 
-/// The member's own money: a withdrawal may not exceed the balance it came
-/// from. Not benevolent — a payout draws on a pooled fund.
-pub fn own_money(fund: Fund) -> bool {
-    fund != Fund::Benevolent
-}
+pub use crate::funds::own_money;
 
 fn type_for(fund: Fund, op: &'static Op) -> &'static str {
     if operations(fund).is_default(op) { fund.credit() } else { WITHDRAWAL }
@@ -645,6 +641,11 @@ fn current_fingerprint(journal: &Journal, fund: Fund, member_id: i64, month: &st
 /// Why a change may not be written, or `None`. The posting pipeline's rules
 /// for money going in; the unlock month for Christmas money coming out.
 fn refusal_for(journal: &Journal, fund: Fund, change: &Change, date: &str) -> Result<Option<String>> {
+    if change.kind != ChangeKind::Delete
+        && let Some(why) = journal.date_ahead(date)
+    {
+        return Ok(Some(why));
+    }
     match change.kind {
         // A suspension is judged by the suspension's own rules as it is written.
         ChangeKind::Delete | ChangeKind::Suspend => return Ok(None),
@@ -841,36 +842,18 @@ fn undo_restore(journal: &Journal, fund: Fund, restore: &Restore) -> Result<()> 
     }
 }
 
-/// The lowest running balance in a `(id, date, type, amount)` history, and
-/// the `(date, amount)` of the withdrawal it falls at.
-fn low_point(history: &[(i64, String, String, f64)]) -> (f64, Option<(String, f64)>) {
-    let (mut running, mut low, mut at) = (0.0, 0.0, None);
-    for (_, date, kind, amount) in history {
-        running = round2(if kind == WITHDRAWAL { running - amount } else { running + amount });
-        if running < low - 0.005 {
-            low = running;
-            at = Some((dates::date_part(date).to_string(), *amount));
-        }
-    }
-    (low, at)
-}
-
 /// Why `after` may not replace `before`: a withdrawal left bigger than the
 /// balance it came from. Already-overdrawn history is not a reason; only a
 /// change that makes it worse is.
 pub fn overdraw_reason(before: &[(i64, String, String, f64)], after: &[(i64, String, String, f64)]) -> Option<String> {
-    let (was, _) = low_point(before);
-    let (now, at) = low_point(after);
-    if now >= was.min(0.0) - 0.005 {
-        return None;
-    }
-    let (date, amount) = at?;
+    let found = crate::funds::overdrawn(before, after)?;
     Some(format!(
-        "This would leave the withdrawal of {} on {date} taken from {} — overdrawn by {}. Include that \
+        "This would leave the withdrawal of {} on {} taken from {} — overdrawn by {}. Include that \
          withdrawal's month, or correct it in the member's ledger.",
-        shillings(amount),
-        shillings(amount + now),
-        shillings(-now)
+        shillings(found.amount),
+        found.date,
+        shillings(found.available),
+        shillings(found.short)
     ))
 }
 
@@ -962,10 +945,21 @@ fn apply_one(journal: &Journal, fund: Fund, change: &Change, refused: &mut Vec<R
     }
 }
 
-/// Put a batch back exactly as it was — the grid's own undo.
+/// Put a batch back exactly as it was — the grid's own undo. Refused when
+/// putting it back would overdraw a member, return a savings deposit to a
+/// month since suspended, or a benevolent contribution to a month that has
+/// been paid since.
 pub fn revert(journal: &Journal, fund: Fund, result: &BatchResult) -> Result<BTreeSet<i64>> {
     let mut touched = BTreeSet::new();
     journal.transaction(|| {
+        // What the members' books were, so the undo can be held to the rules
+        // every other change is: no overdraw, no deposit in a paused month,
+        // no month's contribution twice.
+        let mut before = Vec::new();
+        for member_id in result.applied.iter().map(|a| a.change.member_id).collect::<BTreeSet<_>>() {
+            let (paused, doubled) = (paused_deposits(journal, fund, member_id)?.len(), doubled_months(journal, fund, member_id)?.len());
+            before.push((member_id, journal.funds().history(fund, member_id)?, paused, doubled));
+        }
         for applied in result.applied.iter().rev() {
             touched.insert(applied.change.member_id);
             undo_restore(journal, fund, &applied.restore)?;
@@ -976,22 +970,77 @@ pub fn revert(journal: &Journal, fund: Fund, result: &BatchResult) -> Result<BTr
                 resync_benevolent_schedule(journal, *member_id)?;
             }
         }
+        for (member_id, history, paused, doubled) in &before {
+            crate::funds::guard_overdraw(journal, fund, *member_id, history)?;
+            let name = || Ok::<_, crate::Error>(journal.members().name_of(*member_id)?.unwrap_or_default());
+            let now = paused_deposits(journal, fund, *member_id)?;
+            if now.len() > *paused {
+                return Err(crate::Error::NotAllowed(vec![format!(
+                    "That would put {}'s savings deposit of {} back into a month their savings are suspended. \
+                     Remove the suspension first, or keep the save.",
+                    name()?,
+                    now.last().map(String::as_str).unwrap_or_default()
+                )]));
+            }
+            let now = doubled_months(journal, fund, *member_id)?;
+            if now.len() > *doubled {
+                return Err(crate::Error::NotAllowed(vec![format!(
+                    "That would put {}'s benevolent contribution for {} back beside the one recorded since. Keep \
+                     the save, or delete the later contribution in the member's ledger first.",
+                    name()?,
+                    month_label(now.last().map(String::as_str).unwrap_or_default())
+                )]));
+            }
+        }
         Ok(())
     })?;
     Ok(touched)
 }
 
-/// Point the benevolent schedule at the month after the last contribution,
-/// or the enrolment's start when none is left — otherwise the next catch-up
-/// re-posts every month the grid just filled.
+/// The months a member has more than one benevolent contribution in.
+fn doubled_months(journal: &Journal, fund: Fund, member_id: i64) -> Result<Vec<String>> {
+    if fund != Fund::Benevolent {
+        return Ok(Vec::new());
+    }
+    let mut months: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for row in journal.funds().rows(fund, member_id, None, None)? {
+        if row.transaction_type == fund.credit() {
+            *months.entry(month_key(&row.date)).or_default() += 1;
+        }
+    }
+    Ok(months.into_iter().filter(|(_, n)| *n > 1).map(|(month, _)| month).collect())
+}
+
+/// The dates of a member's savings deposits that fall in a suspension.
+fn paused_deposits(journal: &Journal, fund: Fund, member_id: i64) -> Result<Vec<String>> {
+    if fund != Fund::Savings {
+        return Ok(Vec::new());
+    }
+    let paused = suspensions::windows(journal, member_id)?;
+    Ok(journal
+        .funds()
+        .rows(fund, member_id, None, None)?
+        .into_iter()
+        .filter(|r| r.transaction_type == fund.credit() && suspensions::covering(&r.date, &paused).is_some())
+        .map(|r| dates::date_part(&r.date).to_string())
+        .collect())
+}
+
+/// Point the benevolent schedule at the month after the last contribution —
+/// or at the enrolment's start, when none is left or it starts later —
+/// otherwise the next catch-up re-posts every month the grid just filled.
 pub fn resync_benevolent_schedule(journal: &Journal, member_id: i64) -> Result<Option<String>> {
     let Some(account) = journal.funds().enrolment(member_id)? else { return Ok(None) };
+    let start = account.start_date.clone().filter(|s| !s.is_empty());
     let due = match journal.funds().last_dated_row(Fund::Benevolent, member_id, &["Contribution"])? {
         Some(last) => match dates::add_months_str(&last.date, 1) {
-            Some(due) => Some(due),
+            Some(after) => Some(match start {
+                Some(start) if start > after => start,
+                _ => after,
+            }),
             None => return Ok(None),
         },
-        None => account.start_date.clone(),
+        None => start,
     };
     if let Some(due) = &due {
         journal.funds().set_next_due(member_id, due)?;
@@ -1070,7 +1119,7 @@ impl FillPlan {
 /// account began, never after this month, never in a month their savings are
 /// suspended. A proposal, staged for review.
 pub fn plan_fill(journal: &Journal, grid: &Grid, rows: &[&MemberRow], months: &[String], today: Option<&str>) -> Result<FillPlan> {
-    let today = today.map(str::to_string).unwrap_or_else(dates::today);
+    let today = today.map(str::to_string).unwrap_or_else(|| dates::format(journal.today()));
     let this_month = month_key(&today);
     let ops = operations(grid.fund);
     let noun = if grid.fund == Fund::Benevolent { "contribution" } else { "deposit" };

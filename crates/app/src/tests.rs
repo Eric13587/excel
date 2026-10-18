@@ -218,6 +218,35 @@ fn savings_are_suspended_from_the_savings_tab_and_resumed() {
     assert!(harness.query_by_label("⏸ Suspended").is_none());
 }
 
+#[test]
+fn a_loan_suspension_over_recorded_deductions_removes_them() {
+    let mut harness = harness(sample());
+    let grace = open_member(&mut harness, "GRACE ACHIENG");
+    let repayments = |harness: &Harness<'_, LoanMasterApp>| {
+        let journal = &harness.state().workspace.as_ref().unwrap().journal;
+        journal.ledger().for_loan(grace, "L-001").unwrap().iter().filter(|r| r.event_type == "Repayment").count()
+    };
+    let loan = harness.state().workspace.as_ref().unwrap().journal.loans().by_ref(grace, "L-001").unwrap().unwrap().id;
+    assert_eq!(repayments(&harness), 5);
+    // She was away from March, though her March to May deductions were
+    // recorded. (The date picker cannot be driven, so the dialog opens on it.)
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+    let dialog = crate::dialogs::loan::Suspend::new(loan, grace, "L-001", start);
+    harness.state_mut().workspace.as_mut().unwrap().dialogs.push(dialog.into());
+    harness.run();
+    harness.get_by_label("Suspend").click();
+    harness.run();
+    harness.get_by_label_contains("L-001 already has 3 deductions between 2026-03-01 and 2026-06-01");
+    assert!(harness.query_by_label("Only Record It").is_none());
+    shot(&mut harness, "loan_suspend_over_deductions");
+    harness.get_by_label("Remove Them and Suspend").click();
+    harness.run();
+    assert_eq!(repayments(&harness), 2);
+    let journal = &harness.state().workspace.as_ref().unwrap().journal;
+    assert_eq!(journal.loans().suspensions_for_loan(loan).unwrap().len(), 1);
+    assert_eq!(loanmaster_core::loans::projection::reconcile_problem(journal, grace, "L-001").unwrap(), None);
+}
+
 
 // ------------------------------------------------------------ Ledger Grid
 

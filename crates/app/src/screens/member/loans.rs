@@ -535,7 +535,7 @@ fn table(ui: &mut egui::Ui, p: &Palette, member: i64, view: &LoanView, actions: 
                                 }
                                 7 => {
                                     ui.label(RichText::new(&note).italics().color(p.muted));
-                                    if ui.small_button("Clear…").on_hover_text("Remove this suspension; you choose what happens to the months it skipped").clicked() {
+                                    if ui.small_button("Clear…").on_hover_text("Remove this suspension — any months it skipped are deducted").clicked() {
                                         actions.push(Action::dialog(loan_dialogs::ClearSuspension::new(span.id, member, &reference, span)));
                                     }
                                 }

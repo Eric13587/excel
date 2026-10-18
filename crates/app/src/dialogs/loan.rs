@@ -294,8 +294,10 @@ impl TopUp {
 
 enum Stage {
     Choose,
-    /// Deductions already exist in the window: rebuild, or only record it.
-    Overlap { existing: i64, rows: i64, rebuildable: bool },
+    /// The period already holds deductions or interest charges, which the
+    /// suspension would contradict: they go as it is recorded, or the start
+    /// moves.
+    Overlap(suspensions::Taken),
 }
 
 /// Suspend a loan for a set number of months, or until resumed.
@@ -318,27 +320,30 @@ impl Suspend {
         (!self.open_ended).then(|| dates::format(dates::add_months(self.start, self.months as i32)))
     }
 
-    fn job(&self, rebuild: bool) -> Action {
-        let (loan_id, member, reference) = (self.loan_id, self.member, self.reference.clone());
+    /// Record the suspension; `clear` removes what it contradicts first.
+    fn job(&self, clear: bool) -> Action {
+        let (loan_id, reference) = (self.loan_id, self.reference.clone());
         let (start, end) = (dates::format(self.start), self.end());
         Action::run(move |ws, actions| {
-            if rebuild && let Err(e) = ws.journal.snapshot(&format!("rebuild-{reference}")) {
+            if clear && let Err(e) = ws.journal.snapshot(&format!("suspend-{reference}")) {
                 actions.push(Action::Notice(Notice::from_error("No backup could be saved, so nothing was changed", &e)));
                 return;
             }
             let journal = &ws.journal;
-            let result = journal.transaction(|| {
-                let recorded = suspensions::record(journal, loan_id, &start, end.as_deref(), None)?;
-                let created = if rebuild { service::rebuild_schedule(journal, member, &reference, None)? } else { 0 };
-                Ok((recorded, created))
-            });
-            outcome(actions, "The suspension could not be recorded", result, |(recorded, created)| {
-                if rebuild {
-                    format!("{reference} rebuilt: {created} deduction(s) re-created around the suspension.")
-                } else if recorded == suspensions::Recorded::Active {
-                    format!("{reference} suspended from {start}.")
+            let result = if clear {
+                suspensions::record_and_clear(journal, loan_id, &start, end.as_deref())
+            } else {
+                suspensions::record(journal, loan_id, &start, end.as_deref(), None).map(|recorded| (recorded, 0))
+            };
+            outcome(actions, "The suspension could not be recorded", result, |(recorded, removed)| {
+                let what = if recorded == suspensions::Recorded::Active {
+                    format!("{reference} suspended from {start}")
                 } else {
-                    format!("A past suspension of {reference} was recorded.")
+                    format!("A past suspension of {reference} was recorded")
+                };
+                match removed {
+                    0 => format!("{what}."),
+                    n => format!("{what}; the {n} deduction(s) in those months were removed."),
                 }
             });
         })
@@ -381,18 +386,12 @@ impl Suspend {
                     footer(ui, |ui| {
                         if widgets::primary(ui, "Suspend", p.warning) {
                             let start = dates::format(self.start);
-                            let end = self.end();
-                            match suspensions::deductions_in_period(journal, self.member, &self.reference, &start, end.as_deref()) {
-                                Ok(0) => {
+                            match suspensions::taken_in_period(journal, self.member, &self.reference, &start, self.end().as_deref()) {
+                                Ok(taken) if taken.is_empty() => {
                                     actions.push(self.job(false));
                                     open = false;
                                 }
-                                Ok(existing) => {
-                                    let rows = journal.ledger().count_events(self.member, &self.reference, &[event::REPAYMENT, event::INTEREST], None, None).unwrap_or(0);
-                                    let rebuildable = !service::has_restructure_events(journal, self.member, &self.reference).unwrap_or(true)
-                                        && !service::has_manual_edits(journal, self.member, &self.reference).unwrap_or(true);
-                                    self.stage = Stage::Overlap { existing, rows, rebuildable };
-                                }
+                                Ok(taken) => self.stage = Stage::Overlap(taken),
                                 Err(e) => {
                                     actions.push(Action::Notice(Notice::from_error("The loan could not be checked", &e)));
                                     open = false;
@@ -404,32 +403,27 @@ impl Suspend {
                         }
                     });
                 }
-                Stage::Overlap { existing, rows, rebuildable } => {
-                    let window = match self.end() {
-                        Some(end) => format!("between {} and {end}", dates::format(self.start)),
-                        None => format!("on or after {}", dates::format(self.start)),
-                    };
-                    ui.label(format!("{existing} deduction(s) are already recorded on {} {window}.", self.reference));
+                Stage::Overlap(taken) => {
+                    let window = suspensions::window_words(&dates::format(self.start), self.end().as_deref());
+                    ui.label(format!("{} already has {taken} {window}.", self.reference));
                     ui.add_space(4.0);
-                    if rebuildable {
-                        ui.label(format!(
-                            "To apply the suspension, the loan's schedule is rebuilt: all {rows} repayment and interest entries on {} \
-                             are deleted and re-created from the issue date, skipping the suspended months. A backup is saved first.",
-                            self.reference
-                        ));
-                    } else {
-                        ui.label(RichText::new("This loan has top-ups, buy-offs or hand-edited entries, so it cannot be rebuilt automatically.").color(p.warning));
-                    }
-                    ui.label(RichText::new("Recording it only as a note leaves those deductions in place; statements will show both.").color(p.muted));
+                    ui.label(
+                        "A suspended month takes no deduction and charges no interest, so recording the suspension removes \
+                         them. Their interest goes back to what the loan has still to charge, every other entry stays as it is, \
+                         and the term runs on by the months suspended. A backup is saved first.",
+                    );
+                    ui.label(
+                        RichText::new("If those deductions were really taken, the suspension began after them: go back and choose a later start.")
+                            .color(p.muted),
+                    );
                     footer(ui, |ui| {
-                        // Enter only records it: rebuilding a schedule takes a click.
-                        if rebuildable && widgets::solid(ui, "Rebuild the Schedule", p.danger).clicked() {
+                        // Removing entries takes a click, never Enter.
+                        if widgets::solid(ui, "Remove Them and Suspend", p.danger).clicked() {
                             actions.push(self.job(true));
                             open = false;
                         }
-                        if ui.button("Only Record It").clicked() || widgets::enter(ui) {
-                            actions.push(self.job(false));
-                            open = false;
+                        if ui.button("Back").clicked() {
+                            self.stage = Stage::Choose;
                         }
                         if ui.button("Cancel").clicked() {
                             open = false;
@@ -464,8 +458,8 @@ impl Suspensions {
             ui.heading(format!("Suspensions — {}", self.reference));
             ui.label(
                 RichText::new(
-                    "Periods when deductions were skipped. Removing one means it never applied: you choose whether the months it \
-                     skipped are deducted now. Resuming, by contrast, ends a suspension and leaves its months skipped.",
+                    "Periods when deductions were skipped. Removing one means it never applied, so any months it skipped are \
+                     deducted now. Resuming, by contrast, ends a suspension and leaves its months skipped.",
                 )
                 .color(p.muted),
             );
@@ -504,12 +498,26 @@ impl Suspensions {
     }
 }
 
-/// Removing a suspension: leave its months skipped, or deduct them now.
+/// What removing a suspension does to the loan.
+enum Removal {
+    /// It has skipped nothing yet: it simply goes.
+    Plain,
+    /// It has skipped months: they are deducted, by rebuilding the schedule.
+    Rebuild,
+    /// It cannot go, for the reason given.
+    Stays(String),
+}
+
+/// Removing a suspension: one that has skipped nothing simply goes; one
+/// that has takes its months back with it, deducted by a rebuild — or stays,
+/// when the loan cannot be rebuilt.
 pub struct ClearSuspension {
     id: i64,
     member: i64,
     reference: String,
+    span: Suspension,
     description: String,
+    removal: Option<Removal>,
 }
 
 impl ClearSuspension {
@@ -519,7 +527,31 @@ impl ClearSuspension {
             id,
             member,
             reference: reference.into(),
+            span: span.clone(),
             description: format!("from {} to {until}", dates::date_part(&span.start_date)),
+            removal: None,
+        }
+    }
+
+    fn judge(&self, journal: &Journal) -> Removal {
+        let (member, reference) = (self.member, self.reference.as_str());
+        match suspensions::skipped(journal, member, reference, &self.span) {
+            Ok(None) => Removal::Plain,
+            Ok(Some(why)) => {
+                let active = journal.loans().by_ref(member, reference).ok().flatten().is_some_and(|loan| loan.is_active());
+                let rebuildable = !service::has_restructure_events(journal, member, reference).unwrap_or(true)
+                    && !service::has_manual_edits(journal, member, reference).unwrap_or(true);
+                match (active, rebuildable) {
+                    (true, true) => Removal::Rebuild,
+                    (true, false) => Removal::Stays(format!(
+                        "It has already skipped months of {reference}, and {reference} has top-ups, buy-offs or hand-edited \
+                         entries, so its schedule cannot be worked out again to deduct them. The suspension stays; to end it \
+                         from today, resume the loan."
+                    )),
+                    (false, _) => Removal::Stays(why),
+                }
+            }
+            Err(e) => Removal::Stays(e.to_string()),
         }
     }
 
@@ -535,38 +567,62 @@ impl ClearSuspension {
                 if rebuild {
                     format!("Suspension removed; {reference} was rebuilt and {created} deduction(s) now cover the period.")
                 } else {
-                    format!("Suspension removed from {reference}; its months stay skipped.")
+                    format!("Suspension removed from {reference}.")
                 }
             });
         })
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, journal: &Journal, actions: &mut Vec<Action>) -> bool {
         let p = theme::palette(ctx);
+        if self.removal.is_none() {
+            self.removal = Some(self.judge(journal));
+        }
         let mut open = true;
         let response = modal("clear_suspension").show(ctx, |ui| {
             ui.set_width(460.0);
             ui.heading("Remove Suspension");
             ui.add_space(4.0);
             ui.label(format!("Remove the suspension on {} {}?", self.reference, self.description));
-            ui.label(RichText::new("What should happen to the months it skipped?").strong());
-            ui.label(
-                RichText::new("Deducting them rebuilds the loan's schedule from its issue date; a backup is saved first.")
-                    .small()
-                    .color(p.muted),
-            );
-            footer(ui, |ui| {
-                if ui.button("Cancel").clicked() {
-                    open = false;
+            match &self.removal {
+                Some(Removal::Plain) => {
+                    ui.label(RichText::new("It has not skipped a month yet, so nothing else changes.").color(p.muted));
                 }
-                if widgets::solid(ui, "Deduct Them Now", p.danger).clicked() {
-                    actions.push(self.job(true));
-                    open = false;
+                Some(Removal::Rebuild) => {
+                    ui.label(
+                        "It has already skipped months, and nothing else accounts for them: removing it means they are \
+                         deducted. The loan's schedule is rebuilt from its issue date; a backup is saved first.",
+                    );
                 }
-                // Enter leaves them skipped: deducting rebuilds the schedule, which takes a click.
-                if widgets::primary(ui, "Leave Them Skipped", p.accent) {
-                    actions.push(self.job(false));
-                    open = false;
+                Some(Removal::Stays(why)) => {
+                    ui.label(RichText::new(why).color(p.warning));
+                }
+                None => {}
+            }
+            footer(ui, |ui| match &self.removal {
+                Some(Removal::Plain) => {
+                    if widgets::primary(ui, "Remove It", p.warning) {
+                        actions.push(self.job(false));
+                        open = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        open = false;
+                    }
+                }
+                Some(Removal::Rebuild) => {
+                    // Rebuilding a schedule takes a click, never Enter.
+                    if widgets::solid(ui, "Deduct Them Now", p.danger).clicked() {
+                        actions.push(self.job(true));
+                        open = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        open = false;
+                    }
+                }
+                _ => {
+                    if widgets::primary(ui, "Close", p.accent) {
+                        open = false;
+                    }
                 }
             });
         });

@@ -5,6 +5,7 @@ pub mod deletions;
 pub mod derivation;
 pub mod edits;
 pub mod events;
+pub mod guards;
 pub mod projection;
 pub mod service;
 pub mod suspensions;

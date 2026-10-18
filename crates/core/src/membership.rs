@@ -186,11 +186,12 @@ pub fn leave(journal: &Journal, id: i64, status: &str, date: Option<&str>) -> Re
     if !is_leaving(status) {
         return Err(Error::invalid(format!("{status} is not a way of leaving the society.")));
     }
-    let date = date.map(str::to_string).unwrap_or_else(dates::today);
+    let today = dates::format(journal.today());
+    let date = date.map(str::to_string).unwrap_or_else(|| today.clone());
     if dates::parse(&date).is_none() {
         return Err(Error::invalid(format!("{date} is not a date (use YYYY-MM-DD).")));
     }
-    if date > dates::today() {
+    if date > today {
         return Err(Error::invalid("A member cannot be recorded as leaving on a date still to come."));
     }
     journal.transaction(|| {
@@ -207,7 +208,7 @@ pub(crate) fn settle_status_change(journal: &Journal, id: i64, before: &str, sta
     if !is_leaving(status) || is_leaving(before) {
         return Ok(Payout::default());
     }
-    let today = dates::today();
+    let today = dates::format(journal.today());
     let paid = pay_out(journal, id, status, &today)?;
     journal.members().set_status(id, status, Some(&today))?;
     Ok(paid)
