@@ -113,7 +113,7 @@ fn the_bundled_logo_is_the_default_and_an_unreadable_one_falls_back_to_it() {
 #[test]
 fn the_shipped_logos_print() {
     let (journal, id) = journal_with("Ann");
-    for logo in ["nairobi_water_sacco_logo.png", "nairobi_water_sacco_logo.jpg"] {
+    for logo in ["kaswa_n.png", "nairobi_water_sacco_logo.png", "nairobi_water_sacco_logo.jpg"] {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources").join(logo);
         let branding = Branding { logo: Some(Logo::read(&path).unwrap()), org_name: "Society".into(), ..Branding::default() };
         assert!(pdf::table(&interest(&journal), &branding).unwrap().starts_with(b"%PDF-"));

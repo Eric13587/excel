@@ -29,7 +29,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The logo that ships inside the program: the society's own, printed until
 /// Settings names another.
-pub const BUNDLED_LOGO: &[u8] = include_bytes!("../../../resources/nairobi_water_sacco_logo.png");
+pub const BUNDLED_LOGO: &[u8] = include_bytes!("../../../resources/kaswa_n.png");
 
 /// A letterhead image: its bytes, and the kind of image they are.
 #[derive(Debug, Clone, PartialEq)]
