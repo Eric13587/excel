@@ -97,18 +97,18 @@ pub fn resume(journal: &Journal, loan_id: i64, resumed: Option<&str>) -> Result<
         journal.loans().clear_suspended(loan_id)?;
         journal.loans().close_open_suspension(loan_id, &resumed)?;
         let windows = loan_windows(journal, loan_id)?;
-        if let Some(loan) = journal.loans().get(loan_id)? {
-            if !windows.is_empty() && date_in_suspension(loan.due(), &windows) {
-                if let Some(mut due) = dates::parse(loan.due()) {
-                    for _ in 0..600 {
-                        if !date_in_suspension(&dates::format(due), &windows) {
-                            break;
-                        }
-                        due = dates::add_months(due, 1);
-                    }
-                    journal.loans().set_next_due(loan_id, &dates::format(due))?;
+        if let Some(loan) = journal.loans().get(loan_id)?
+            && !windows.is_empty()
+            && date_in_suspension(loan.due(), &windows)
+            && let Some(mut due) = dates::parse(loan.due())
+        {
+            for _ in 0..600 {
+                if !date_in_suspension(&dates::format(due), &windows) {
+                    break;
                 }
+                due = dates::add_months(due, 1);
             }
+            journal.loans().set_next_due(loan_id, &dates::format(due))?;
         }
         Ok(())
     })
