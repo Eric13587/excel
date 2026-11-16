@@ -73,10 +73,44 @@ pub fn suspend(journal: &Journal, loan_id: i64, until: Option<&str>, start: Opti
 
 /// End a suspension: deductions resume from `resumed` (default today).
 pub fn resume(journal: &Journal, loan_id: i64, resumed: Option<&str>) -> Result<()> {
-    let resumed = resumed.map(str::to_string).unwrap_or_else(|| dates::format(journal.today()));
+    let resumed = match resumed {
+        Some(r) => r.to_string(),
+        None => {
+            let today = dates::format(journal.today());
+            if let Ok(Some(open)) = journal.loans().open_suspension(loan_id) {
+                if let Some(start) = dates::parse(dates::date_part(&open.start_date)) {
+                    let mut cursor = start;
+                    let target_month = dates::month_key(&today);
+                    while dates::month_key(&dates::format(cursor)) < target_month {
+                        cursor = dates::add_months(cursor, 1);
+                    }
+                    dates::format(cursor)
+                } else {
+                    today
+                }
+            } else {
+                today
+            }
+        }
+    };
     journal.transaction(|| {
         journal.loans().clear_suspended(loan_id)?;
-        journal.loans().close_open_suspension(loan_id, &resumed)
+        journal.loans().close_open_suspension(loan_id, &resumed)?;
+        let windows = loan_windows(journal, loan_id)?;
+        if let Some(loan) = journal.loans().get(loan_id)? {
+            if !windows.is_empty() && date_in_suspension(loan.due(), &windows) {
+                if let Some(mut due) = dates::parse(loan.due()) {
+                    for _ in 0..600 {
+                        if !date_in_suspension(&dates::format(due), &windows) {
+                            break;
+                        }
+                        due = dates::add_months(due, 1);
+                    }
+                    journal.loans().set_next_due(loan_id, &dates::format(due))?;
+                }
+            }
+        }
+        Ok(())
     })
 }
 
@@ -404,5 +438,35 @@ mod tests {
         assert_eq!(skipped(&journal, ann, "L-001", &ahead).unwrap(), None);
         remove(&journal, ann, "L-001", ahead.id, false).unwrap();
         assert_eq!(journal.loans().suspensions_for_loan(loan).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn resuming_an_indefinite_suspension_advances_due_date_and_clears_flag() {
+        let (journal, _ann, loan) = deducted_loan(false);
+        let before = journal.loans().get(loan).unwrap().unwrap();
+        let due = before.due().to_string();
+        assert_eq!(due, "2026-10-28");
+        record(&journal, loan, &due, None, Some(&due)).unwrap();
+        assert!(journal.loans().get(loan).unwrap().unwrap().is_suspended);
+
+        // Resume explicitly in a later month
+        resume(&journal, loan, Some("2026-12-28")).unwrap();
+        let after = journal.loans().get(loan).unwrap().unwrap();
+        assert!(!after.is_suspended);
+        assert_eq!(after.due(), "2026-12-28");
+    }
+
+    #[test]
+    fn resuming_without_date_aligns_to_current_month() {
+        let (journal, _ann, loan) = deducted_loan(false);
+        let before = journal.loans().get(loan).unwrap().unwrap();
+        let due = before.due().to_string();
+        record(&journal, loan, &due, None, Some(&due)).unwrap();
+        assert!(journal.loans().get(loan).unwrap().unwrap().is_suspended);
+
+        resume(&journal, loan, None).unwrap();
+        let after = journal.loans().get(loan).unwrap().unwrap();
+        assert!(!after.is_suspended);
+        assert_eq!(after.due(), "2026-10-28");
     }
 }

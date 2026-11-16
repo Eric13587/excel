@@ -58,11 +58,10 @@ pub fn show(ui: &mut egui::Ui, remembered: &Remembered, actions: &mut Vec<Action
                     {
                         actions.push(Action::OpenJournal(path));
                     }
-                    let recent: Vec<&PathBuf> = remembered.recent.iter().filter(|p| p.exists()).collect();
-                    if !recent.is_empty() {
+                    if !remembered.recent.is_empty() {
                         ui.add_space(18.0);
                         ui.label(RichText::new("Recent journals").small().color(p.muted));
-                        for path in recent {
+                        for path in &remembered.recent {
                             let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
                             if ui.link(name).on_hover_text(path.display().to_string()).clicked() {
                                 actions.push(Action::OpenJournal(path.clone()));

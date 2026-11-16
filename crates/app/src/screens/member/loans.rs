@@ -220,7 +220,7 @@ fn section(screen: &mut MemberScreen, ui: &mut egui::Ui, journal: &Journal, data
         ui.add_space(6.0);
         actions_row(screen, ui, journal, data, view, last_date, actions);
         ui.add_space(6.0);
-        table(ui, p, data.member.id, view, actions);
+        table(ui, p, journal, data.member.id, view, actions);
     }))
     .response;
     if screen.scroll_to.as_deref() == Some(reference.as_str()) {
@@ -431,7 +431,7 @@ fn signed(value: f64) -> String {
     }
 }
 
-fn table(ui: &mut egui::Ui, p: &Palette, member: i64, view: &LoanView, actions: &mut Vec<Action>) {
+fn table(ui: &mut egui::Ui, p: &Palette, journal: &Journal, member: i64, view: &LoanView, actions: &mut Vec<Action>) {
     let lines = lines(view);
     let reference = view.loan.reference.clone();
     TableBuilder::new(ui)
@@ -535,6 +535,11 @@ fn table(ui: &mut egui::Ui, p: &Palette, member: i64, view: &LoanView, actions: 
                                 }
                                 7 => {
                                     ui.label(RichText::new(&note).italics().color(p.muted));
+                                    if span.status == "active"
+                                        && ui.small_button("Resume…").on_hover_text("End this suspension and resume deductions").clicked()
+                                    {
+                                        actions.push(Action::dialog(resume(journal, view)));
+                                    }
                                     if ui.small_button("Clear…").on_hover_text("Remove this suspension — any months it skipped are deducted").clicked() {
                                         actions.push(Action::dialog(loan_dialogs::ClearSuspension::new(span.id, member, &reference, span)));
                                     }

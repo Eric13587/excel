@@ -9,6 +9,7 @@ use loanmaster_core::loans::{edits, suspensions};
 use loanmaster_core::money::{figure, shillings};
 use loanmaster_core::{Journal, dates, funds};
 
+use super::confirm::Confirm;
 use super::footer;
 use crate::app::{Action, Notice, outcome};
 use crate::theme;
@@ -486,6 +487,13 @@ impl Suspensions {
                     open = false;
                 }
                 let chosen = spans.iter().find(|s| Some(s.id) == self.selected);
+                let can_resume = chosen.is_some_and(|s| s.status == "active");
+                if widgets::solid_enabled(ui, can_resume, "Resume…", p.success, "Choose a live suspension to resume.").clicked()
+                    && let Some(span) = chosen
+                {
+                    actions.push(Action::dialog(resume_confirm(self.loan_id, &self.reference, span)));
+                    open = false;
+                }
                 if widgets::solid_enabled(ui, chosen.is_some(), "Remove…", p.warning, "Choose a suspension first.").clicked()
                     && let Some(span) = chosen
                 {
@@ -496,6 +504,23 @@ impl Suspensions {
         });
         open && !response.should_close()
     }
+}
+
+fn resume_confirm(loan_id: i64, reference: &str, span: &Suspension) -> Confirm {
+    let reference = reference.to_string();
+    let since = format!(" It has been suspended since {}.", dates::date_part(&span.start_date));
+    Confirm::new(
+        "Resume Loan",
+        format!(
+            "Resume deductions on {reference}?{since}\n\nThe months it skipped stay skipped and the term stays extended; only the \
+             suspension is ended so deductions can be taken again."
+        ),
+        "Resume",
+        move |ws, actions| {
+            let result = suspensions::resume(&ws.journal, loan_id, None);
+            outcome(actions, "The loan could not be resumed", result, |()| format!("{reference} resumed."));
+        },
+    )
 }
 
 /// What removing a suspension does to the loan.

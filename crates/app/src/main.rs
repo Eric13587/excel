@@ -75,6 +75,14 @@ fn main() -> eframe::Result {
 
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
     if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        #[cfg(windows)]
+        {
+            // On Windows, avoid probing slow or hanging third-party Vulkan ICDs/layers
+            // when DirectX 12 is available, unless explicitly requested via WGPU_BACKEND.
+            if std::env::var_os("WGPU_BACKEND").is_none() {
+                setup.instance_descriptor.backends = wgpu::Backends::DX12;
+            }
+        }
         setup.native_adapter_selector = Some(Arc::new(move |adapters, surface| choose_adapter(adapters, surface, software)));
     }
     let mut viewport = egui::ViewportBuilder::default()
