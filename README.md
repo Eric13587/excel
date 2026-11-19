@@ -1,12 +1,28 @@
 # LoanMaster
 
+[![CI](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/ci.yml)
+
+Built for the Kabete Welfare Staff Association at Nairobi Water to manage
+member loans, savings, and welfare funds.
+
 Desktop loan, savings and fund management for SACCOs (savings and credit
 cooperatives). Written in Rust with egui and SQLite; runs fully offline with a
 single-file "journal" database that can live on a shared drive.
 
-LoanMaster 2.0 opens the same journals as 1.x. How the port was checked, and
-every place 2.0 behaves differently on purpose, is in
-[docs/rust-migration.md](docs/rust-migration.md).
+See the [migration notes](docs/rust-migration.md) for journal compatibility,
+validation, and workflow changes from 1.x. The Ledger Grid replaces the old
+mass operations. The general ledger and journal repair tools were removed.
+
+## Windows downloads
+
+For LoanMaster 2.0 (Rust), open a successful `main` run in the
+[CI workflow](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/ci.yml?query=branch%3Amain)
+and download `LoanMaster-Installer` or `LoanMaster-Portable` under **Artifacts**.
+GitHub Actions artifacts may require signing in and expire.
+
+The [legacy Windows release](https://github.com/Eric13587/loanmaster-sacco/releases/tag/loan)
+contains the Python version. It can be used to update older journals before
+opening them in 2.0.
 
 ## Features
 
@@ -44,11 +60,14 @@ every place 2.0 behaves differently on purpose, is in
 Requires Rust 1.95 or newer.
 
 ```bash
+git clone https://github.com/Eric13587/loanmaster-sacco.git
+cd loanmaster-sacco
 cargo run --release -p loanmaster                       # choose a journal
 cargo run --release -p loanmaster -- path/to/journal.db
 ```
 
 On first launch, create a new journal (`.db` file) or open an existing one.
+Before upgrading, make a separate copy of your journal and test 2.0 with that copy.
 A 1.x journal must be at schema version 12: if 2.0 refuses one, open it once
 in LoanMaster 1.x, which brings it up to date. 2.0 then adds the savings
 suspensions table to it on opening (version 13); 1.x still opens it.
