@@ -1,8 +1,20 @@
 # LoanMaster
 
+[![CI](https://github.com/Eric13587/excel/actions/workflows/python-app.yml/badge.svg?branch=main)](https://github.com/Eric13587/excel/actions/workflows/python-app.yml)
+
 Desktop loan, savings and fund management for SACCOs (savings and credit
 cooperatives). Built with PyQt6 and SQLite; runs fully offline with a
 single-file "journal" database that can live on a shared drive.
+
+**[Download the Windows installer](https://github.com/Eric13587/excel/releases/tag/loan)**
+
+### Example workflow
+
+| Input | What LoanMaster does | Output |
+| --- | --- | --- |
+| Member roster in Excel | Previews the import and flags duplicates | Searchable member register |
+| Monthly payroll deductions | Applies loan repayments and posts ledger entries | Updated balances and member statements |
+| Quarter-end ledger balances | Compiles accounting and fund reports | Financial statements and loan-loss provisioning report |
 
 ## Features
 
@@ -33,9 +45,21 @@ single-file "journal" database that can live on a shared drive.
 Requires Python 3.10+.
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # optional
-pip install -r requirements.txt
-python loan.py
+git clone https://github.com/Eric13587/excel.git
+cd excel
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python loan.py
+```
+
+On Windows, use PowerShell:
+
+```powershell
+git clone https://github.com/Eric13587/excel.git
+cd excel
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe loan.py
 ```
 
 On first launch, create a new journal (`.db` file) or open an existing one.
