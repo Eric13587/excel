@@ -2,9 +2,12 @@
 
 [![CI](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/python-app.yml/badge.svg?branch=main)](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/python-app.yml)
 
-Desktop loan, savings and fund management for SACCOs (savings and credit
-cooperatives). Built with PyQt6 and SQLite; runs fully offline with a
-single-file "journal" database that can live on a shared drive.
+LoanMaster is an offline desktop app built for the Kabete Welfare Staff
+Association at Nairobi Water. It helps the association manage member loans,
+savings, welfare funds, and accounting in one place.
+
+The app uses PyQt6 and SQLite and stores records in a single journal database
+file that can live on a shared drive.
 
 **[Download the Windows installer](https://github.com/Eric13587/loanmaster-sacco/releases/tag/loan)**
 
