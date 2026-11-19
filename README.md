@@ -8,6 +8,10 @@ single-file "journal" database that can live on a shared drive.
 
 **[Download the Windows installer](https://github.com/Eric13587/loanmaster-sacco/releases/tag/loan)**
 
+![LoanMaster dashboard with demo data](docs/images/dashboard-demo.png)
+
+*LoanMaster dashboard with demo data.*
+
 ### Example workflow
 
 | Input | What LoanMaster does | Output |
