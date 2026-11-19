@@ -1,12 +1,12 @@
 # LoanMaster
 
-[![CI](https://github.com/Eric13587/excel/actions/workflows/python-app.yml/badge.svg?branch=main)](https://github.com/Eric13587/excel/actions/workflows/python-app.yml)
+[![CI](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/python-app.yml/badge.svg?branch=main)](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/python-app.yml)
 
 Desktop loan, savings and fund management for SACCOs (savings and credit
 cooperatives). Built with PyQt6 and SQLite; runs fully offline with a
 single-file "journal" database that can live on a shared drive.
 
-**[Download the Windows installer](https://github.com/Eric13587/excel/releases/tag/loan)**
+**[Download the Windows installer](https://github.com/Eric13587/loanmaster-sacco/releases/tag/loan)**
 
 ### Example workflow
 
@@ -45,8 +45,8 @@ single-file "journal" database that can live on a shared drive.
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/Eric13587/excel.git
-cd excel
+git clone https://github.com/Eric13587/loanmaster-sacco.git
+cd loanmaster-sacco
 python -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python loan.py
@@ -55,8 +55,8 @@ python -m venv .venv
 On Windows, use PowerShell:
 
 ```powershell
-git clone https://github.com/Eric13587/excel.git
-cd excel
+git clone https://github.com/Eric13587/loanmaster-sacco.git
+cd loanmaster-sacco
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe loan.py
