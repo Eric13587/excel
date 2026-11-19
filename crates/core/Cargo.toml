@@ -1,0 +1,25 @@
+[package]
+name = "loanmaster-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+calamine = { version = "0.36.1", features = ["dates"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+log = "0.4.34"
+regex = "1.13.1"
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# Objects keep their keys in the order written, as 1.x's Python did.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+rust_xlsxwriter = "0.99.1"
+serde_json = "1.0.151"
+tempfile = "3.27.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
