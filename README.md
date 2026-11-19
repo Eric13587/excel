@@ -13,6 +13,10 @@ See the [migration notes](docs/rust-migration.md) for journal compatibility,
 validation, and workflow changes from 1.x. The Ledger Grid replaces the old
 mass operations. The general ledger and journal repair tools were removed.
 
+![LoanMaster 2.0 Ledger Grid showing monthly savings contributions for fictional members](docs/images/ledger-grid-demo.webp)
+
+*LoanMaster 2.0 Ledger Grid with demo data.*
+
 ## Windows downloads
 
 For LoanMaster 2.0 (Rust), open a successful `main` run in the
