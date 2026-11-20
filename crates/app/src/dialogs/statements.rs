@@ -122,7 +122,7 @@ impl Statements {
             actions.push(Action::Notice(Notice::info("Statements", "The period ends before it starts.")));
             return false;
         }
-        if self.email {
+        if self.email && self.chosen.len() == 1 {
             let selected = self.people.iter().filter(|p| self.chosen.contains(&p.id)).collect::<Vec<_>>();
             let [person] = selected.as_slice() else {
                 actions.push(Action::Notice(Notice::info("Email statement","Select one member to compose their private statement email.")));
@@ -159,14 +159,14 @@ impl Statements {
         let Some(folder) = super::files::folder("Select Folder to Save Statements") else { return false };
         let config = self.config();
         // Read now, on this thread; the task only typesets and writes.
-        let mut prepared: Vec<(String, Result<Statement, String>)> = Vec::new();
+        let mut prepared = Vec::new();
         for person in self.people.iter().filter(|p| self.chosen.contains(&p.id)) {
             let (from, to) = self.span(journal, person.id);
             let statement = statements::prepare(journal, person.id, &dates::format(from), &dates::format(to), &config).map_err(|e| {
                 log::error!("Statement for {} ({}) could not be prepared: {e}", person.name, person.id);
                 e.to_string()
             });
-            prepared.push((person.name.clone(), statement));
+            prepared.push(Prepared { name:person.name.clone(), draft:self.email.then(||(person.id,person.email.trim().to_owned())), statement });
         }
         let task = batch(ctx, prepared, config, Branding::of(journal), folder, self.excel);
         actions.push(Action::Task(Box::new(task)));
@@ -284,7 +284,7 @@ impl Statements {
                     close = true;
                 }
                 ui.add_space(12.0);
-                ui.checkbox(&mut self.email,"Email draft");
+                ui.checkbox(&mut self.email,"Email drafts").on_hover_text("One member opens in your mail app. For multiple members, save a separate addressed .eml draft with its attachment for each person.");
                 ui.radio_value(&mut self.excel, true, "Excel");
                 ui.radio_value(&mut self.excel, false, "PDF");
                 ui.label("Save as");
@@ -326,13 +326,19 @@ fn names(list: &[String]) -> String {
     if list.len() <= CAP { list.join(", ") } else { format!("{}, and {} more", list[..CAP].join(", "), list.len() - CAP) }
 }
 
-fn batch(ctx: &egui::Context, prepared: Vec<(String, Result<Statement, String>)>, config: StatementConfig, branding: Branding, folder: PathBuf, excel: bool) -> Task {
+struct Prepared {
+    name: String,
+    draft: Option<(i64,String)>,
+    statement: Result<Statement,String>,
+}
+
+fn batch(ctx: &egui::Context, prepared: Vec<Prepared>, config: StatementConfig, branding: Branding, folder: PathBuf, excel: bool) -> Task {
     Task::spawn(ctx, "Generating Statements", move |reporter| {
         let today = chrono::Local::now().date_naive();
         let mut outcome = Outcome::default();
         let mut taken = BTreeSet::new();
         let count = prepared.len();
-        for (i, (name, statement)) in prepared.into_iter().enumerate() {
+        for (i, Prepared {name, draft, statement}) in prepared.into_iter().enumerate() {
             if !reporter.step(i, count, &format!("Generating statement for {name}…")) {
                 outcome.stopped = true;
                 break;
@@ -346,6 +352,26 @@ fn batch(ctx: &egui::Context, prepared: Vec<(String, Result<Statement, String>)>
             };
             if statement.is_empty() {
                 outcome.empty.push(name);
+                continue;
+            }
+            if let Some((id,address))=draft {
+                let result=(|| -> Result<(),String> {
+                    super::mail::validate(&address).map_err(|e|e.to_string())?;
+                    let directory=tempfile::tempdir().map_err(|e|e.to_string())?;
+                    let ext=if excel {"xlsx"} else {"pdf"};
+                    let attachment=directory.path().join(format!("Statement-{id}.{ext}"));
+                    if excel {
+                        loanmaster_reports::write_statement_xlsx(&statement,&config,&branding,&attachment)
+                    } else {
+                        loanmaster_reports::write_statement_pdf(&statement,&config,&branding,&attachment)
+                    }.map_err(|e|e.to_string())?;
+                    let subject=format!("Member statement, {} to {}",statement.from,statement.to);
+                    super::mail::save_statement_draft(&folder,id,&address,&subject,&attachment).map_err(|e|e.to_string())
+                })();
+                match result {
+                    Ok(())=>outcome.saved.push(name),
+                    Err(e)=>outcome.failed.push(format!("{name} ({e})"))
+                }
                 continue;
             }
             let written = if excel {

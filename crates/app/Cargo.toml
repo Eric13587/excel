@@ -11,6 +11,8 @@ name = "loanmaster"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22.1"
+tempfile = "3.27.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.36.2", features = ["persistence"] }
 egui_extras = { version = "0.36.2", features = ["datepicker", "image", "serde"] }
@@ -33,4 +35,3 @@ winresource = "0.1.31"
 [dev-dependencies]
 egui_kittest = { version = "0.36.2", features = ["wgpu", "snapshot", "eframe"] }
 rust_xlsxwriter = "0.99.1"
-tempfile = "3.27.0"
