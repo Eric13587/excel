@@ -29,6 +29,16 @@ jobs:
           $file = "gui-$($entry.name).db"
           python -c "import sqlite3,pathlib; c=sqlite3.connect('$file'); c.executescript(pathlib.Path('crates/core/src/schema.sql').read_text(encoding='utf8')); c.close()"
           if ($LASTEXITCODE) { throw 'Fixture creation failed' }
+          @'
+        import sqlite3,sys
+        with sqlite3.connect(sys.argv[1]) as c:
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('org_name','Demo Welfare Association')")
+            for i,name in enumerate(['Ann Wanjiru','Peter Mwangi','Grace Achieng','John Otieno','Mary Njeri','David Kiprop','Esther Wambui','James Mutua'],1):
+                c.execute("INSERT INTO individuals(id,name,pf_no) VALUES(?,?,?)",(i,name,'PF%04d'%i))
+                for month in range(1,10):
+                    c.execute("INSERT INTO savings(individual_id,date,transaction_type,amount,balance) VALUES(?,?,'Deposit',?,?)",(i,'2026-%02d-01'%month,1000+200*i,(1000+200*i)*month))
+        '@ | python - $file
+          if ($LASTEXITCODE) { throw 'Sample data creation failed' }
           $p = Start-Process $entry.exe -ArgumentList $file -PassThru
           try {
             $ready = $false
@@ -42,7 +52,41 @@ jobs:
             Start-Sleep -Seconds 2
             $p.Refresh()
             Write-Host "$($entry.name) opened visible journal window: $($p.MainWindowTitle)"
+            if ($entry.name -eq 'portable') {
+              Add-Type -AssemblyName System.Drawing
+              Add-Type @'
+        using System;
+        using System.Runtime.InteropServices;
+        public class Capture {
+          [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left,Top,Right,Bottom; }
+          [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out Rect r);
+          [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
+          [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int cmd);
+          [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        }
+        '@
+              $null=[Capture]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+              $null=[Capture]::ShowWindow($p.MainWindowHandle,3)
+              $null=[Capture]::SetForegroundWindow($p.MainWindowHandle)
+              Start-Sleep -Seconds 2
+              $rect=New-Object Capture+Rect
+              if (![Capture]::GetWindowRect($p.MainWindowHandle,[ref]$rect)) {throw 'Window bounds unavailable'}
+              Add-Type -AssemblyName System.Windows.Forms
+              $bounds=[System.Windows.Forms.Screen]::FromHandle($p.MainWindowHandle).Bounds
+              $area=[Drawing.Rectangle]::Intersect($bounds,[Drawing.Rectangle]::FromLTRB($rect.Left,$rect.Top,$rect.Right,$rect.Bottom))
+              $bmp=[Drawing.Bitmap]::new($area.Width,$area.Height)
+              $g=[Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($area.Location,[Drawing.Point]::Empty,$area.Size)
+              $bmp.Save((Join-Path $PWD 'LoanMaster-Windows.png'),[Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose()
+              $bmp.Dispose()
+            }
             if (!$p.Responding -or !$p.CloseMainWindow() -or !$p.WaitForExit(30000) -or $p.ExitCode -ne 0) { throw 'Window failed to close cleanly' }
             Write-Host "$($entry.name) closed successfully"
           } finally { if (!$p.HasExited) { $p.Kill() } }
         }
+    - uses: actions/upload-artifact@v7
+      with:
+        name: LoanMaster-Windows-Screenshot
+        path: LoanMaster-Windows.png
+        if-no-files-found: error
