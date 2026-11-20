@@ -36,9 +36,9 @@ impl Payroll {
     }
     fn load(&mut self, path: &std::path::Path) -> Result<()> {
         let sheet = loanmaster_core::imports::excel::read_sheet(path)?;
-        if sheet.headers.len() != 3 {
+        if !matches!(sheet.headers.len(),3|7) {
             return Err(Error::invalid(
-                "Use a sheet with three columns in order: PF, expected, deducted.",
+                "Use PF, expected and deducted. Optionally append loan, savings, Christmas and benevolent amounts.",
             ));
         }
         let mut lines = Vec::new();
@@ -79,7 +79,7 @@ impl Payroll {
                 }
             });
             ui.horizontal(|ui|{ui.label("Month (YYYY-MM)");if ui.text_edit_singleline(&mut self.month).changed(){self.preview.clear();}});
-            ui.label("Paste payroll columns in order: PF number, expected amount, actual deduction. Use one member per line.");
+            ui.label("Paste payroll columns in order: PF number, expected amount, actual deduction. Optionally append loan, savings, Christmas and benevolent amounts to check allocation.");
             if ui.text_edit_multiline(&mut self.input).changed(){self.preview.clear();}
             if ui.button("Import payroll workbook…").clicked() && let Some(path)=files::pick("Payroll workbook",&[("Excel",&["xlsx","xls"])]) {
                 let result=self.load(&path);self.result(result,"Payroll loaded. Compare against the journal.");
@@ -92,7 +92,10 @@ impl Payroll {
                 egui::ScrollArea::vertical().max_height(175.0).show(ui,|ui|{
                     egui::Grid::new("payroll_comparison").striped(true).show(ui,|ui|{
                         for h in ["PF","Expected","Deducted","Posted"]{ui.strong(h);} ui.end_row();
-                        for l in &self.preview{ui.label(&l.pf);for value in [l.expected,l.payroll,l.posted]{ui.label(format!("{}.{:02}",value/100,value%100));}ui.end_row();}
+                        for l in &self.preview{ui.label(&l.pf);for value in [l.expected,l.payroll,l.posted]{ui.label(format!("{}.{:02}",value/100,value%100));}
+                            if let Some(payroll)=l.payroll_by_fund && payroll!=l.posted_by_fund{
+                                ui.label(format!("Allocation differs (loan, savings, Christmas, benevolent), in cents: payroll {payroll:?}, posted {:?}",l.posted_by_fund));
+                            }ui.end_row();}
                     });
                 });
             }

@@ -95,7 +95,9 @@ jobs:
         $dir = Join-Path $env:RUNNER_TEMP 'InstalledLoanMaster'
         $installer = Start-Process build/LoanMasterSetup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$dir`"" -Wait -PassThru
         if ($installer.ExitCode) { throw 'Installation failed' }
-        $app = Start-Process "$dir/LoanMaster.exe" -ArgumentList '--journal-self-test' -Wait -PassThru
+        python -c "import sqlite3,pathlib; c=sqlite3.connect('sample.db'); c.executescript(pathlib.Path('crates/core/src/schema.sql').read_text(encoding='utf8')); c.close()"
+        if ($LASTEXITCODE) { throw 'Could not prepare sample journal' }
+        $app = Start-Process "$dir/LoanMaster.exe" -ArgumentList '--journal-self-test sample.db' -Wait -PassThru
         if ($app.ExitCode) { throw 'Installed journal self-test failed' }
 
   release:

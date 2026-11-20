@@ -261,3 +261,22 @@ mod tests {
         assert!(!info.ok && info.problem.unwrap().contains("missing"));
     }
 }
+
+#[cfg(test)]
+mod office_backup_tests {
+    use super::*;
+    #[test]
+    fn secondary_copy_is_verified_and_a_reviewer_can_open_it_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.db");
+        let j = Journal::open_for_operator(&source,"admin").unwrap();
+        crate::office::set_role(&j,"admin","admin","administrator").unwrap();
+        j.conn().execute("INSERT INTO individuals(name) VALUES('Example')",[]).unwrap();
+        let backup = j.secondary_backup(dir.path()).unwrap();
+        verify_secondary(&backup).unwrap();
+        let reader = Journal::open_for_operator(&backup,"reviewer").unwrap();
+        assert!(reader.conn().is_readonly("main").unwrap());
+        assert_eq!(reader.members().all().unwrap().len(),1);
+        assert!(reader.conn().execute("DELETE FROM individuals",[]).is_err());
+    }
+}

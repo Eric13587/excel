@@ -17,12 +17,12 @@ use crate::money::round2;
 
 pub struct Funds<'a>(pub(crate) &'a Connection);
 
-const SIGNED: &str = "CASE transaction_type WHEN 'Withdrawal' THEN -amount ELSE amount END";
+const SIGNED: &str = "CASE transaction_type WHEN 'Withdrawal' THEN -amount_cents ELSE amount_cents END";
 
 impl Funds<'_> {
     pub fn balance(&self, fund: Fund, member_id: i64) -> Result<f64> {
         let total: f64 = self.0.query_row(
-            &format!("SELECT COALESCE(SUM({SIGNED}), 0) FROM {} WHERE individual_id=?", fund.table()),
+            &format!("SELECT (COALESCE(SUM({SIGNED}), 0) / 100.0) FROM posted_{} WHERE individual_id=?", fund.table()),
             [member_id],
             |r| r.get(0),
         )?;
@@ -32,7 +32,7 @@ impl Funds<'_> {
     /// The whole fund across every member.
     pub fn total(&self, fund: Fund) -> Result<f64> {
         let total: f64 = self.0.query_row(
-            &format!("SELECT COALESCE(SUM({SIGNED}), 0) FROM {}", fund.table()),
+            &format!("SELECT (COALESCE(SUM({SIGNED}), 0) / 100.0) FROM posted_{}", fund.table()),
             [],
             |r| r.get(0),
         )?;
@@ -42,7 +42,7 @@ impl Funds<'_> {
     /// Every member's balance at once.
     pub fn balances(&self, fund: Fund) -> Result<HashMap<i64, f64>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT individual_id, COALESCE(SUM({SIGNED}), 0) FROM {} GROUP BY individual_id",
+            "SELECT individual_id, (COALESCE(SUM({SIGNED}), 0) / 100.0) FROM posted_{} GROUP BY individual_id",
             fund.table()
         ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, round2(r.get::<_, f64>(1)?))))?;
@@ -52,14 +52,14 @@ impl Funds<'_> {
     pub fn get(&self, fund: Fund, id: i64) -> Result<Option<FundRow>> {
         Ok(self
             .0
-            .query_row(&format!("SELECT * FROM {} WHERE id=?", fund.table()), [id], FundRow::from_row)
+            .query_row(&format!("SELECT * FROM posted_{} WHERE id=?", fund.table()), [id], FundRow::from_row)
             .optional()?)
     }
 
     /// A member's rows in statement order, optionally between two dates.
     pub fn rows(&self, fund: Fund, member_id: i64, start: Option<&str>, end: Option<&str>) -> Result<Vec<FundRow>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT * FROM {} WHERE individual_id=?1 AND (?2 IS NULL OR date >= ?2) \
+            "SELECT * FROM posted_{} WHERE individual_id=?1 AND (?2 IS NULL OR date >= ?2) \
              AND (?3 IS NULL OR date <= ?3) ORDER BY date, id",
             fund.table()
         ))?;
@@ -69,7 +69,7 @@ impl Funds<'_> {
     /// Every member's rows in a window, in one query.
     pub fn movements_in_range(&self, fund: Fund, start: &str, end: &str) -> Result<Vec<FundRow>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT * FROM {} WHERE date >= ? AND date <= ? ORDER BY individual_id, date, id",
+            "SELECT * FROM posted_{} WHERE date >= ? AND date <= ? ORDER BY individual_id, date, id",
             fund.table()
         ))?;
         Ok(collect(&mut stmt, params![start, end])?)
@@ -78,7 +78,7 @@ impl Funds<'_> {
     /// `{member: earliest date}` — when each member's account opened.
     pub fn first_movement_dates(&self, fund: Fund) -> Result<HashMap<i64, String>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT individual_id, MIN(date) FROM {} GROUP BY individual_id",
+            "SELECT individual_id, MIN(date) FROM posted_{} GROUP BY individual_id",
             fund.table()
         ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
@@ -99,7 +99,7 @@ impl Funds<'_> {
             .0
             .query_row(
                 &format!(
-                    "SELECT * FROM {} WHERE individual_id=?{filter} ORDER BY date DESC, id DESC LIMIT 1",
+                    "SELECT * FROM posted_{} WHERE individual_id=?{filter} ORDER BY date DESC, id DESC LIMIT 1",
                     fund.table()
                 ),
                 [member_id],
@@ -112,7 +112,7 @@ impl Funds<'_> {
     /// balance is computed over.
     pub fn history(&self, fund: Fund, member_id: i64) -> Result<Vec<(i64, String, String, f64)>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT id, date, transaction_type, amount FROM {} WHERE individual_id=? \
+            "SELECT id, date, transaction_type, amount FROM posted_{} WHERE individual_id=? \
              ORDER BY date ASC, id ASC",
             fund.table()
         ))?;
@@ -125,7 +125,7 @@ impl Funds<'_> {
     /// One member's rows within a window — what a grid cell was read from.
     pub fn month_rows(&self, fund: Fund, member_id: i64, start: &str, end: &str) -> Result<Vec<FundRow>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT * FROM {} WHERE individual_id=? AND date >= ? AND date <= ? ORDER BY date, id",
+            "SELECT * FROM posted_{} WHERE individual_id=? AND date >= ? AND date <= ? ORDER BY date, id",
             fund.table()
         ))?;
         Ok(collect(&mut stmt, params![member_id, start, end])?)

@@ -42,13 +42,21 @@
   let at = data.columns.position(c => c == "Name" or c == "Member")
   if at == none { data.numeric.position(n => not n) } else { at }
 }
-#table(
-  columns: range(data.columns.len()).map(i => if i == wide { 1fr } else { auto }),
-  stroke: 0.5pt + rgb("#e2e8f0"),
-  inset: (x: 4pt, y: 3pt),
-  table.header(..data.columns.map(c => table.cell(fill: rgb("#f1f5f9"), text(weight: "bold", fill: ink)[#c]))),
-  ..data.rows.map(row => row.enumerate().map(((i, v)) => shown(i, v))).flatten(),
+#let draw(indices) = table(
+  columns: indices.map(i => if data.custom { 1fr } else if i == wide { 1fr } else { auto }),
+  stroke: 0.5pt + rgb("#e2e8f0"), inset: (x: 4pt, y: 3pt),
+  table.header(..indices.map(i => table.cell(fill: rgb("#f1f5f9"), text(weight: "bold", fill: ink)[#data.columns.at(i)]))),
+  ..data.rows.map(row => indices.map(i => shown(i,row.at(i)))).flatten(),
   ..if data.total != none {
-    data.total.enumerate().map(((i, v)) => table.cell(fill: rgb("#f8fafc"), text(weight: "bold", shown(i, v))))
+    indices.map(i => table.cell(fill: rgb("#f8fafc"), text(weight: "bold", shown(i, data.total.at(i)))))
   } else { () },
 )
+#if data.custom and data.columns.len() > 8 {
+  // Repeat the first selected field to identify rows in later column groups.
+  for start in range(1, data.columns.len(), step: 7) {
+    if start > 1 { pagebreak(); words; v(6pt) }
+    draw((0,) + range(start, calc.min(start + 7, data.columns.len())))
+  }
+} else {
+  draw(range(data.columns.len()))
+}

@@ -122,3 +122,17 @@ fn the_shipped_logos_print() {
         assert!(pdf::statement(&statement, &config, &branding).unwrap().starts_with(b"%PDF-"));
     }
 }
+
+#[test]
+fn custom_documents_support_wide_tables_and_fractional_amounts() {
+    let (j,_) = journal_with("Demo");
+    let columns = loanmaster_core::documents::columns(&j,1).unwrap();
+    let table = loanmaster_core::documents::build(&j,1,&columns,"Quarterly review".into(),"Committee copy".into()).unwrap();
+    let brand=Branding{org_name:"Welfare office".into(),logo:Some(Logo::bundled()),..Default::default()};
+    let dir=tempfile::tempdir().unwrap();
+    for ext in ["xlsx","pdf"] {
+        let path=dir.path().join(format!("custom.{ext}"));
+        loanmaster_reports::write_custom_table(&table,&brand,&path).unwrap();
+        assert!(std::fs::metadata(path).unwrap().len()>1000);
+    }
+}

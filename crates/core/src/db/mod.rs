@@ -134,6 +134,28 @@ impl Journal {
         Ok(journal)
     }
 
+    /// Open a reviewer session even when the file share grants only read access.
+    pub fn open_for_operator(path: &Path, user: &str) -> Result<Journal> {
+        if path.exists() {
+            let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let mut reader = Journal {
+                conn, path: Some(path.to_owned()), report: OpenReport::default(),
+                savepoint_depth: Cell::new(0), clock: Cell::new(None),
+            };
+            if reader.schema_version()? == SCHEMA_VERSION && crate::office::role(&reader,user)? == "reviewer" {
+                reader.report.integrity_ok = reader.quick_check();
+                reader.enforce_foreign_keys()?;
+                reader.report.journal_mode = reader.conn.query_row("PRAGMA journal_mode",[],|r|r.get(0))?;
+                reader.report.journal_mode_reason = "Read-only reviewer".into();
+                crate::office::session(&reader,user)?;
+                return Ok(reader);
+            }
+        }
+        let journal = Journal::open(path,OpenOptions {backup_on_open:true})?;
+        crate::office::session(&journal,user)?;
+        Ok(journal)
+    }
+
     /// A private journal in memory, for tests and previews.
     pub fn open_in_memory() -> Result<Journal> {
         let mut journal = Journal {

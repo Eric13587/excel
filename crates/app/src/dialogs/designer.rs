@@ -13,6 +13,7 @@ pub struct Designer {
     subtitle: String,
     logo: bool,
     email: bool,
+    excel: bool,
 }
 impl Designer {
     pub fn new(j: &Journal) -> Self {
@@ -24,6 +25,7 @@ impl Designer {
             subtitle: String::new(),
             logo: true,
             email: false,
+            excel: false,
         };
         d.select(j);
         d
@@ -74,7 +76,27 @@ impl Designer {
                     &mut self.email,
                     "Open an email draft with this document attached",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("Format");
+                    ui.radio_value(&mut self.excel, false, "PDF");
+                    ui.radio_value(&mut self.excel, true, "Excel");
+                });
                 if ui.button("Generate document…").clicked() {
+                    let (name, filter) = if self.excel {
+                        ("Document.xlsx", ("Excel", "xlsx"))
+                    } else {
+                        ("Document.pdf", ("PDF", "pdf"))
+                    };
+                    if self.columns.chosen().is_empty() {
+                        actions.push(Action::Notice(Notice::info(
+                            "Document builder",
+                            "Select at least one column.",
+                        )));
+                        return;
+                    }
+                    let Some(path) = files::save_as("Save document", name, &[filter]) else {
+                        return;
+                    };
                     let table = match documents::build(
                         j,
                         self.source,
@@ -88,13 +110,6 @@ impl Designer {
                                 .push(Action::Notice(Notice::from_error("Document builder", &e)));
                             return;
                         }
-                    };
-                    let Some(path) = files::save_as(
-                        "Save document",
-                        "Document.pdf",
-                        &[("PDF", "pdf"), ("Excel", "xlsx")],
-                    ) else {
-                        return;
                     };
                     let mut brand = Branding::of(j);
                     brand.org_name.clone_from(&self.header);

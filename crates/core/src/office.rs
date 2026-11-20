@@ -10,6 +10,10 @@ pub struct Line {
     pub expected: i64,
     pub payroll: i64,
     pub posted: i64,
+    #[serde(default)]
+    pub posted_by_fund: [i64; 4],
+    #[serde(default)]
+    pub payroll_by_fund: Option<[i64; 4]>,
 }
 
 fn invalid(s: &str) -> Error {
@@ -45,20 +49,26 @@ fn month_key(month: &str) -> Result<()> {
 pub fn compare(j: &Journal, month: &str, input: &str) -> Result<Vec<Line>> {
     month_key(month)?;
     let mut people = BTreeMap::new();
-    let mut statement=j.conn().prepare("WITH postings(member,cents) AS (
-      SELECT l.individual_id,c.deducted FROM ledger l JOIN ledger_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.event_type='Repayment'
-      UNION ALL SELECT l.individual_id,c.amount FROM savings l JOIN savings_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.transaction_type='Deposit'
-      UNION ALL SELECT l.individual_id,c.amount FROM christmas_savings l JOIN christmas_savings_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.transaction_type='Deposit'
-      UNION ALL SELECT l.individual_id,c.amount FROM benevolent_ledger l JOIN benevolent_ledger_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.transaction_type='Contribution')
-      SELECT trim(i.pf_no), COALESCE(sum(p.cents),0) FROM individuals i LEFT JOIN postings p ON p.member=i.id GROUP BY i.id")?;
+    let mut statement=j.conn().prepare("WITH postings(member,cents,fund) AS (
+      SELECT l.individual_id,c.deducted,0 FROM ledger l JOIN ledger_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.event_type='Repayment'
+      UNION ALL SELECT l.individual_id,c.amount,1 FROM savings l JOIN savings_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.transaction_type='Deposit'
+      UNION ALL SELECT l.individual_id,c.amount,2 FROM christmas_savings l JOIN christmas_savings_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.transaction_type='Deposit'
+      UNION ALL SELECT l.individual_id,c.amount,3 FROM benevolent_ledger l JOIN benevolent_ledger_cents c ON c.posting_id=l.id WHERE substr(l.date,1,7)=?1 AND l.transaction_type='Contribution')
+      SELECT trim(i.pf_no), COALESCE(sum(p.cents),0),
+        coalesce(sum(p.cents) FILTER (WHERE p.fund=0),0),coalesce(sum(p.cents) FILTER (WHERE p.fund=1),0),
+        coalesce(sum(p.cents) FILTER (WHERE p.fund=2),0),coalesce(sum(p.cents) FILTER (WHERE p.fund=3),0) FROM individuals i LEFT JOIN postings p ON p.member=i.id GROUP BY i.id")?;
     for row in statement.query_map([month], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            [r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?],
+        ))
     })? {
-        let (pf, posted) = row?;
+        let (pf, posted, breakdown) = row?;
         if pf.is_empty() && posted == 0 {
             continue;
         }
-        if pf.is_empty() || people.insert(pf, posted).is_some() {
+        if pf.is_empty() || people.insert(pf, (posted, breakdown)).is_some() {
             return Err(invalid(
                 "Each member used in payroll needs a unique PF number.",
             ));
@@ -68,33 +78,55 @@ pub fn compare(j: &Journal, month: &str, input: &str) -> Result<Vec<Line>> {
     let mut out = Vec::new();
     for line in input.lines().filter(|l| !l.trim().is_empty()) {
         let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-        let [pf, expected, actual] = fields.as_slice() else {
-            return Err(invalid(
-                "Paste three tab-separated columns from payroll: PF, expected and deducted.",
-            ));
+        let (pf, expected, actual, breakdown) = match fields.as_slice() {
+            [pf, expected, actual] => (*pf, *expected, *actual, None),
+            [pf, expected, actual, loan, savings, christmas, benevolent] => {
+                let amounts = [
+                    cents(loan)?,
+                    cents(savings)?,
+                    cents(christmas)?,
+                    cents(benevolent)?,
+                ];
+                if amounts.iter().try_fold(0_i64, |s, a| s.checked_add(*a)) != Some(cents(actual)?)
+                {
+                    return Err(Error::invalid(format!(
+                        "The payroll allocation for {pf} must add up to the deduction."
+                    )));
+                }
+                (*pf, *expected, *actual, Some(amounts))
+            }
+            _ => {
+                return Err(invalid(
+                    "Use three payroll columns or include all four fund allocations.",
+                ));
+            }
         };
-        if !seen.insert(*pf) {
+        if !seen.insert(pf) {
             return Err(Error::Invalid(format!("Duplicate payroll row for {pf}")));
         }
-        let posted = people
-            .remove(*pf)
+        let (posted, posted_by_fund) = people
+            .remove(pf)
             .ok_or_else(|| Error::Invalid(format!("Unknown payroll number {pf}")))?;
         out.push(Line {
             pf: pf.to_string(),
             expected: cents(expected)?,
             payroll: cents(actual)?,
+            posted_by_fund,
+            payroll_by_fund: breakdown,
             posted,
         });
     }
     if out.is_empty() {
         return Err(invalid("Paste the payroll rows before comparing."));
     }
-    for (pf, posted) in people {
+    for (pf, (posted, posted_by_fund)) in people {
         if posted != 0 {
             out.push(Line {
                 pf,
                 expected: 0,
                 payroll: 0,
+                posted_by_fund,
+                payroll_by_fund: None,
                 posted,
             });
         }
@@ -197,7 +229,7 @@ pub fn close(
         let received=cents(bank)?;
         let total=rows.iter().try_fold(0_i64,|sum,l|sum.checked_add(l.payroll)).ok_or_else(||invalid("Payroll total is too large"))?;
         if received!=total{return Err(invalid("The amount received must match total payroll deductions."));}
-        if rows.iter().any(|l|l.posted!=l.payroll){return Err(invalid("Resolve differences between posted and deducted amounts before closing."));}
+        if rows.iter().any(|l|l.posted!=l.payroll || l.payroll_by_fund.is_some_and(|a| a!=l.posted_by_fund)){return Err(invalid("Resolve differences between posted and deducted amounts before closing."));}
         if rows.iter().any(|l|l.expected!=l.payroll) && reason.trim().is_empty(){return Err(invalid("Explain the difference between expected and deducted amounts."));}
         j.conn().execute("INSERT INTO period_events(month,event,operator,reason,bank_cents,details) VALUES (?,'close',?,?,?,?)",params![month,user,reason,received,serde_json::to_string(&rows).map_err(|_|invalid("Could not save payroll details"))?])?;
         Ok(())
@@ -223,27 +255,6 @@ pub fn reopen(j: &Journal, user: &str, month: &str, reason: &str) -> Result<()> 
         j.conn().execute("INSERT INTO period_events(month,event,operator,reason,details) VALUES(?,?,?,?,'')",params![month,event,user,reason])?;
         Ok(())
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn signed_period_is_locked_until_another_officer_approves() {
-        let j = Journal::open_in_memory().unwrap();
-        set_role(&j, "ann", "ann", "administrator").unwrap();
-        set_role(&j, "ann", "bob", "officer").unwrap();
-        session(&j, "ann").unwrap();
-        j.conn().execute_batch("INSERT INTO individuals(name,pf_no) VALUES('Demo','001'); INSERT INTO savings(individual_id,date,transaction_type,amount) VALUES(1,'2020-01-02','Deposit',12.34);").unwrap();
-        let payroll = "001\t12.34\t12.34";
-        assert!(close(&j, "ann", "2020-01", payroll, "11", "").is_err());
-        close(&j, "ann", "2020-01", payroll, "12.34", "").unwrap();
-        assert!(j.conn().execute("DELETE FROM savings", []).is_err());
-        reopen(&j, "ann", "2020-01", "Correction").unwrap();
-        assert!(reopen(&j, "ann", "2020-01", "Approve").is_err());
-        reopen(&j, "bob", "2020-01", "Approved").unwrap();
-        j.conn().execute("DELETE FROM savings", []).unwrap();
-    }
 }
 
 /// Print a specific signed revision, independently of later changes to the journal.
@@ -317,4 +328,35 @@ pub(crate) fn approve_payout(j: &Journal, id: i64, status: &str, date: &str) -> 
     Err(invalid(
         "Use Retire or Leave to request the payout. A different officer must confirm the same status, date and amounts.",
     ))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn signed_period_is_locked_until_another_officer_approves() {
+        let j = Journal::open_in_memory().unwrap();
+        set_role(&j, "ann", "ann", "administrator").unwrap();
+        set_role(&j, "ann", "bob", "officer").unwrap();
+        session(&j, "ann").unwrap();
+        j.conn().execute_batch("INSERT INTO individuals(name,pf_no) VALUES('Demo','001'); INSERT INTO savings(individual_id,date,transaction_type,amount) VALUES(1,'2020-01-02','Deposit',12.34);").unwrap();
+        let payroll = "001\t12.34\t12.34";
+        assert!(close(&j, "ann", "2020-01", payroll, "11", "").is_err());
+        assert!(
+            close(
+                &j,
+                "ann",
+                "2020-01",
+                "001	12.34	12.34	12.34	0	0	0",
+                "12.34",
+                ""
+            )
+            .is_err()
+        );
+        close(&j, "ann", "2020-01", payroll, "12.34", "").unwrap();
+        assert!(j.conn().execute("DELETE FROM savings", []).is_err());
+        reopen(&j, "ann", "2020-01", "Correction").unwrap();
+        assert!(reopen(&j, "ann", "2020-01", "Approve").is_err());
+        reopen(&j, "bob", "2020-01", "Approved").unwrap();
+        j.conn().execute("DELETE FROM savings", []).unwrap();
+    }
 }

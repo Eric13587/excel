@@ -149,13 +149,13 @@ pub(crate) fn reinstate_row(conn: &Connection, table: &str, snapshot: &Snapshot)
 
 impl Ledger<'_> {
     pub fn get(&self, id: i64) -> Result<Option<LedgerRow>> {
-        Ok(self.0.query_row("SELECT * FROM ledger WHERE id=?", [id], LedgerRow::from_row).optional()?)
+        Ok(self.0.query_row("SELECT * FROM posted_ledger WHERE id=?", [id], LedgerRow::from_row).optional()?)
     }
 
     /// A member's whole loan history, in statement order.
     pub fn for_member(&self, member_id: i64) -> Result<Vec<LedgerRow>> {
         let mut stmt =
-            self.0.prepare("SELECT * FROM ledger WHERE individual_id=? ORDER BY date, id")?;
+            self.0.prepare("SELECT * FROM posted_ledger WHERE individual_id=? ORDER BY date, id")?;
         Ok(collect(&mut stmt, [member_id])?)
     }
 
@@ -167,7 +167,7 @@ impl Ledger<'_> {
         end: Option<&str>,
     ) -> Result<Vec<LedgerRow>> {
         let mut stmt = self.0.prepare(
-            "SELECT * FROM ledger WHERE individual_id=? AND (?2 IS NULL OR date >= ?2) \
+            "SELECT * FROM posted_ledger WHERE individual_id=? AND (?2 IS NULL OR date >= ?2) \
              AND (?3 IS NULL OR date <= ?3) ORDER BY date, id",
         )?;
         Ok(collect(&mut stmt, params![member_id, start, end])?)
@@ -177,7 +177,7 @@ impl Ledger<'_> {
     pub fn for_loan(&self, member_id: i64, reference: &str) -> Result<Vec<LedgerRow>> {
         let mut stmt = self
             .0
-            .prepare("SELECT * FROM ledger WHERE individual_id=? AND loan_id=? ORDER BY date, id")?;
+            .prepare("SELECT * FROM posted_ledger WHERE individual_id=? AND loan_id=? ORDER BY date, id")?;
         Ok(collect(&mut stmt, params![member_id, reference])?)
     }
 

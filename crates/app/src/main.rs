@@ -60,7 +60,11 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "--journal-self-test") {
-        if loanmaster_core::Journal::open_in_memory().and_then(|j| j.members().all()).is_err() {
+        let journal = match std::env::args_os().nth(2) {
+            Some(path) => loanmaster_core::Journal::open(path, Default::default()),
+            None => loanmaster_core::Journal::open_in_memory(),
+        };
+        if journal.and_then(|j| j.members().all()).is_err() {
             std::process::exit(1);
         }
         return Ok(());

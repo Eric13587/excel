@@ -41,8 +41,8 @@ CREATE VIEW member_overview AS
 SELECT i.id, i.name, i.pf_no, i.id_no, i.phone, i.email, i.employment_status,
        (SELECT count(*) FROM loans l WHERE l.individual_id=i.id AND l.status='Active') AS active_loans,
        coalesce((SELECT sum(l.balance) FROM loans l WHERE l.individual_id=i.id AND l.status='Active'),0.0) AS loan_balance,
-       coalesce((SELECT s.balance FROM savings s WHERE s.individual_id=i.id ORDER BY s.date DESC,s.id DESC LIMIT 1),0.0) AS savings_balance,
-       coalesce((SELECT s.balance FROM christmas_savings s WHERE s.individual_id=i.id ORDER BY s.date DESC,s.id DESC LIMIT 1),0.0) AS christmas_balance
+       coalesce((SELECT sum(CASE WHEN s.transaction_type='Withdrawal' THEN -c.amount ELSE c.amount END)/100.0 FROM savings s JOIN savings_cents c ON c.posting_id=s.id WHERE s.individual_id=i.id),0.0) AS savings_balance,
+       coalesce((SELECT sum(CASE WHEN s.transaction_type='Withdrawal' THEN -c.amount ELSE c.amount END)/100.0 FROM christmas_savings s JOIN christmas_savings_cents c ON c.posting_id=s.id WHERE s.individual_id=i.id),0.0) AS christmas_balance
 FROM individuals i;
 
 CREATE TABLE payout_requests (
@@ -52,3 +52,67 @@ CREATE TABLE payout_requests (
     requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, approved_at TEXT
 );
 CREATE UNIQUE INDEX pending_payout ON payout_requests(member_id) WHERE approved_by IS NULL;
+
+CREATE VIEW posted_ledger AS
+SELECT p.id,
+       p.individual_id,
+       p.date,
+       p.event_type,
+       p.loan_id,
+       c.added/100.0 AS added,
+       c.deducted/100.0 AS deducted,
+       p.balance,
+       p.notes,
+       p.installment_amount,
+       p.batch_id,
+       c.interest_amount/100.0 AS interest_amount,
+       p.principal_balance,
+       p.interest_balance,
+       c.principal_portion/100.0 AS principal_portion,
+       c.interest_portion/100.0 AS interest_portion,
+       p.is_edited,
+       p.previous_state,
+       p.import_id,
+       p.gross_balance,
+       p.loan_pk
+FROM ledger p JOIN ledger_cents c ON c.posting_id=p.id;
+
+CREATE VIEW posted_savings AS
+SELECT p.id,
+       p.individual_id,
+       p.date,
+       p.transaction_type,
+       c.amount/100.0 AS amount,
+       c.balance/100.0 AS balance,
+       p.notes,
+       p.import_id,
+       p.batch_id,
+       p.created_at,
+       c.amount AS amount_cents
+FROM savings p JOIN savings_cents c ON c.posting_id=p.id;
+
+CREATE VIEW posted_christmas_savings AS
+SELECT p.id,
+       p.individual_id,
+       p.date,
+       p.transaction_type,
+       c.amount/100.0 AS amount,
+       c.balance/100.0 AS balance,
+       p.notes,
+       p.batch_id,
+       p.created_at,
+       c.amount AS amount_cents
+FROM christmas_savings p JOIN christmas_savings_cents c ON c.posting_id=p.id;
+
+CREATE VIEW posted_benevolent_ledger AS
+SELECT p.id,
+       p.individual_id,
+       p.date,
+       p.transaction_type,
+       c.amount/100.0 AS amount,
+       c.balance/100.0 AS balance,
+       p.notes,
+       p.batch_id,
+       p.created_at,
+       c.amount AS amount_cents
+FROM benevolent_ledger p JOIN benevolent_ledger_cents c ON c.posting_id=p.id;

@@ -129,10 +129,23 @@ fn text_of(value: &Value) -> String {
 
 /// A report as a PDF, landscape A4 under the letterhead.
 pub fn table(table: &Table, branding: &Branding) -> Result<Vec<u8>> {
+    render_table(table,branding,false)
+}
+
+pub fn custom_table(table: &Table, branding: &Branding) -> Result<Vec<u8>> {
+    render_table(table,branding,true)
+}
+
+fn render_table(table: &Table, branding: &Branding, custom: bool) -> Result<Vec<u8>> {
+    let cell = |v: &Value| match v {
+        Value::Number(n) if custom => n.to_string(),
+        _ => text_of(v),
+    };
     let numeric: Vec<bool> = (0..table.columns.len()).map(|i| table.is_numeric(i)).collect();
-    let rows: Vec<Vec<String>> = table.rows.iter().map(|r| r.iter().map(text_of).collect()).collect();
+    let rows: Vec<Vec<String>> = table.rows.iter().map(|r| r.iter().map(&cell).collect()).collect();
     let data = json!({
         "title": table.title,
+        "custom":custom,
         "subtitle": table.subtitle,
         "generated": generated(),
         "columns": table.columns,

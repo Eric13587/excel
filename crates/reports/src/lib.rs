@@ -122,13 +122,8 @@ pub fn write_custom_table(table: &Table, branding: &Branding, path: &Path) -> Re
     if Format::of(path) == Format::Xlsx {
         return xlsx::report_workbook(table, branding, path, true);
     }
-    let mut printable = table.clone();
-    for value in printable.rows.iter_mut().flatten() {
-        if let loanmaster_core::reports::Value::Number(n) = value {
-            *value = loanmaster_core::reports::Value::text(n.to_string());
-        }
-    }
-    write_table(&printable, branding, path)
+    std::fs::write(path, pdf::custom_table(table,branding)?)?;
+    Ok(())
 }
 
 /// Save a statement as a PDF.

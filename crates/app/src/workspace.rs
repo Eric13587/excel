@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use loanmaster_core::undo::UndoStack;
-use loanmaster_core::{Journal, OpenOptions, Result};
+use loanmaster_core::{Journal, Result};
 
 use crate::app::{Action, Notice};
 use crate::dialogs::Dialog;
@@ -61,9 +61,8 @@ impl Workspace {
     /// Open a journal, taking the on-open backup, and say what needs saying
     /// about the file.
     pub fn open(path: &Path) -> Result<(Workspace, Vec<Notice>)> {
-        let journal = Journal::open(path, OpenOptions { backup_on_open: true })?;
         let user = loanmaster_core::office::principal()?;
-        loanmaster_core::office::session(&journal,&user)?;
+        let journal = Journal::open_for_operator(path,&user)?;
         let reviewer = loanmaster_core::office::role(&journal,&user)? == "reviewer";
         let report = journal.report().clone();
         let mut notices = Vec::new();
