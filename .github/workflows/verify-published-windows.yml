@@ -1,0 +1,48 @@
+name: Verify published Windows applications
+on:
+  push:
+    branches: [ "verify/windows-gui-v2.1.0" ]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+    - uses: actions/checkout@v7
+    - name: Download and check the published executables
+      shell: pwsh
+      run: |
+        Invoke-WebRequest 'https://github.com/Eric13587/loanmaster-sacco/releases/download/v2.1.0/LoanMaster-Portable-v2.1.0.exe' -OutFile 'LoanMaster-Portable-v2.1.0.exe'
+        if ((Get-FileHash 'LoanMaster-Portable-v2.1.0.exe').Hash -ne '589c129c50e9f17481625233c679033eae3dbcb0833ab3f5f8b595519811c739') { throw 'Checksum mismatch for LoanMaster-Portable-v2.1.0.exe' }
+        Invoke-WebRequest 'https://github.com/Eric13587/loanmaster-sacco/releases/download/v2.1.0/LoanMaster-Setup-v2.1.0.exe' -OutFile 'LoanMaster-Setup-v2.1.0.exe'
+        if ((Get-FileHash 'LoanMaster-Setup-v2.1.0.exe').Hash -ne '2d52b5f2ebe0f52cd3f2a3afa2bd34cd504d1a8de41a5420dcd41b89cdd4a53f') { throw 'Checksum mismatch for LoanMaster-Setup-v2.1.0.exe' }
+    - name: Install and exercise both desktop windows
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $dir = Join-Path $env:RUNNER_TEMP InstalledLoanMaster
+        $setup = Start-Process ./LoanMaster-Setup-v2.1.0.exe -ArgumentList "/VERYSILENT /NORESTART /DIR=`"$dir`"" -PassThru -Wait
+        if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode)" }
+        Add-Type 'using System; using System.Runtime.InteropServices; public class GuiProbe { [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); }'
+        foreach ($entry in @(@{name='portable';exe='./LoanMaster-Portable-v2.1.0.exe'},@{name='installed';exe="$dir/LoanMaster.exe"})) {
+          $file = "gui-$($entry.name).db"
+          python -c "import sqlite3,pathlib; c=sqlite3.connect('$file'); c.executescript(pathlib.Path('crates/core/src/schema.sql').read_text(encoding='utf8')); c.close()"
+          if ($LASTEXITCODE) { throw 'Fixture creation failed' }
+          $p = Start-Process $entry.exe -ArgumentList $file -PassThru
+          try {
+            $ready = $false
+            for ($i=0; $i -lt 120; $i++) {
+              Start-Sleep -Milliseconds 500
+              $p.Refresh()
+              if ($p.HasExited) { throw "Exited before presenting journal: $($p.ExitCode)" }
+              if ($p.MainWindowHandle -ne 0 -and [GuiProbe]::IsWindowVisible($p.MainWindowHandle) -and $p.MainWindowTitle.Contains($file) -and $p.Responding) { $ready=$true; break }
+            }
+            if (!$ready) { throw "No responsive journal window. Last title: $($p.MainWindowTitle)" }
+            Start-Sleep -Seconds 2
+            $p.Refresh()
+            Write-Host "$($entry.name) opened visible journal window: $($p.MainWindowTitle)"
+            if (!$p.Responding -or !$p.CloseMainWindow() -or !$p.WaitForExit(30000) -or $p.ExitCode -ne 0) { throw 'Window failed to close cleanly' }
+            Write-Host "$($entry.name) closed successfully"
+          } finally { if (!$p.HasExited) { $p.Kill() } }
+        }
