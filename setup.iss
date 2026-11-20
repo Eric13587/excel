@@ -7,7 +7,7 @@
 ; The installer lands in build\LoanMasterSetup.exe.
 
 #define MyAppName "LoanMaster"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.1.0"
 #define MyAppPublisher "LoanMaster Team"
 #define MyAppExeName "LoanMaster.exe"
 #define MyBuild "target\release"

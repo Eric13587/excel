@@ -17,7 +17,7 @@ mass operations. The general ledger and journal repair tools were removed.
 
 *LoanMaster 2.0 Ledger Grid with demo data.*
 
-## Office workflows (feature branch)
+## Office workflows
 
 - **Reports › Document builder** exports a selected dataset to PDF or Excel. Choose and reorder fields, edit the letterhead, title and subtitle, and toggle the journal logo (the default is `kaswa_n.png`). Member financial overview combines roster, loan and savings balances in one row per member. Transaction datasets retain one row per posting.
 - **Email drafts** open in classic Outlook on Windows or an attachment-capable `xdg-email` client on Linux. The builder attaches the generated document and leaves the recipient for the operator. Under Reports › Statements, select one member with a saved email address to open a private draft, or select several to save one individually addressed .eml draft per member with their own statement attached. The operator reviews the attachment and sends from the mail client.
@@ -29,10 +29,7 @@ mass operations. The general ledger and journal repair tools were removed.
 
 ## Windows downloads
 
-For LoanMaster 2.0 (Rust), open a successful `main` run in the
-[CI workflow](https://github.com/Eric13587/loanmaster-sacco/actions/workflows/ci.yml?query=branch%3Amain)
-and download `LoanMaster-Installer` or `LoanMaster-Portable` under **Artifacts**.
-GitHub Actions artifacts may require signing in and expire.
+Download the [Windows installer or portable executable for LoanMaster 2.1.0](https://github.com/Eric13587/loanmaster-sacco/releases/tag/v2.1.0). The release also includes SHA-256 checksums and upgrade instructions.
 
 The [legacy Windows release](https://github.com/Eric13587/loanmaster-sacco/releases/tag/loan)
 contains the Python version. It can be used to update older journals before

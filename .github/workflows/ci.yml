@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "feature/professional-workflows" ]
+    branches: [ "main", "feature/professional-workflows", "release/v*.*.*" ]
     tags: [ "v*.*.*" ]
   pull_request:
     branches: [ "main" ]
@@ -102,21 +102,27 @@ jobs:
 
   release:
     needs: build-windows
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+    - uses: actions/checkout@v7
     - uses: actions/download-artifact@v7
       with:
         path: artifacts
     - name: Publish versioned Windows downloads
       env:
         GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.ref_name }}
+        RELEASE_REF: ${{ github.ref_name }}
       run: |
         set -eu
+        TAG="${RELEASE_REF#release/}"
+        VERSION=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")
+        test "$TAG" = "v$VERSION"
+        notes="docs/releases/$TAG.md"
+        test -s "$notes"
         cp artifacts/LoanMaster-Installer/LoanMasterSetup.exe "LoanMaster-Setup-$TAG.exe"
         cp artifacts/LoanMaster-Portable/LoanMaster.exe "LoanMaster-Portable-$TAG.exe"
         sha256sum "LoanMaster-Setup-$TAG.exe" "LoanMaster-Portable-$TAG.exe" > SHA256SUMS.txt
-        gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "LoanMaster-Setup-$TAG.exe" "LoanMaster-Portable-$TAG.exe" SHA256SUMS.txt
+        gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "LoanMaster $VERSION" --notes-file "$notes" --latest "LoanMaster-Setup-$TAG.exe" "LoanMaster-Portable-$TAG.exe" SHA256SUMS.txt
