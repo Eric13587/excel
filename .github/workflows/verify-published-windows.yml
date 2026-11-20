@@ -90,3 +90,8 @@ jobs:
         name: LoanMaster-Windows-Screenshot
         path: LoanMaster-Windows.png
         if-no-files-found: error
+    - name: Export captured window for inspection
+      shell: pwsh
+      run: |
+        $encoded=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path 'LoanMaster-Windows.png')))
+        for ($i=0; $i -lt $encoded.Length; $i+=4000) { Write-Host ("PNGCHUNK " + $encoded.Substring($i,[Math]::Min(4000,$encoded.Length-$i))) }
