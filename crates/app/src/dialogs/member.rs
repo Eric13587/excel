@@ -247,6 +247,12 @@ impl Leave {
                 ui.add(egui::Label::new(RichText::new(problem).color(p.danger)).wrap());
             }
             super::footer(ui, |ui| {
+                if ui.button("Request payout approval").clicked() {
+                    match loanmaster_core::office::request_payout(journal,self.id,self.status,&dates::format(self.date)) {
+                        Ok(())=>{actions.push(Action::Notice(Notice::info("Payout requested","A second officer can review and confirm this member, status, date and amount in Retire or Leave.")));open=false;}
+                        Err(e)=>self.problem=Some(e.to_string()),
+                    }
+                }
                 if widgets::primary(ui, "Confirm", p.warning) && self.confirm(journal, actions) {
                     open = false;
                 }

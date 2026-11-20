@@ -62,6 +62,20 @@ impl Journal {
         Ok(Some(dest))
     }
 
+    /// Publish a complete, checked snapshot on a second drive.
+    pub fn secondary_backup(&self, dir: &Path) -> Result<PathBuf> {
+        let source = self.path().ok_or_else(|| Error::Invalid("Save the journal first.".into()))?;
+        let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%f");
+        let target = dir.join(format!("{stem}-{stamp}.db"));
+        let temporary = tempfile::Builder::new().prefix(".loanmaster-").suffix(".partial").tempfile_in(dir)?.into_temp_path();
+        self.backup_to(&temporary)?;
+        verify_secondary(&temporary)?;
+        temporary.persist_noclobber(&target).map_err(|err| Error::Io(err.error))?;
+        self.settings().set("last_secondary_backup", &target.to_string_lossy())?;
+        Ok(target)
+    }
+
     /// Every backup beside this journal, newest first.
     pub fn available_backups(&self) -> Vec<BackupFile> {
         let Some(dir) = self.backups_dir() else { return Vec::new() };
@@ -86,6 +100,10 @@ impl Journal {
     /// additions is given them, as opening it would. Returns the safety copy
     /// of what was here before.
     pub fn restore_from(&mut self, path: &Path) -> Result<Option<PathBuf>> {
+        let operator = crate::office::principal()?;
+        if !matches!(crate::office::role(self,&operator)?.as_str(),"administrator"|"unconfigured") {
+            return Err(Error::invalid("Only an administrator can restore the journal."));
+        }
         let info = inspect_backup(path);
         if !info.ok {
             return Err(Error::Invalid(info.problem.unwrap_or_else(|| "The backup cannot be used.".into())));
@@ -97,9 +115,28 @@ impl Journal {
             backup.run_to_completion(256, std::time::Duration::from_millis(0), None)?;
         }
         self.ensure_schema()?;
+        crate::office::session(self,&operator)?;
         log::warn!("Journal restored from {} (safety copy: {safety:?})", path.display());
         Ok(safety)
     }
+}
+
+/// Verify a secondary snapshot read-only, including persisted posting amounts and balances.
+pub fn verify_secondary(path: &Path) -> Result<()> {
+    let info = inspect_backup(path);
+    if !info.ok { return Err(Error::invalid(info.problem.unwrap_or_default())); }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let broken: bool = conn.query_row("SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_check)",[],|r|r.get(0))?;
+    if broken { return Err(Error::invalid("The backup contains broken member or loan references.")); }
+    if info.schema_version.unwrap_or_default() >= 14 {
+        for (table,columns) in [("ledger", &["added","deducted","balance","principal_portion","interest_portion","interest_amount","installment_amount","principal_balance","interest_balance"][..]),
+            ("savings",&["amount","balance"]),("christmas_savings",&["amount","balance"]),("benevolent_ledger",&["amount","balance"])] {
+            let mismatch = columns.iter().map(|c| format!("c.{c} IS NOT CAST(round(t.{c}*100) AS INTEGER)")).collect::<Vec<_>>().join(" OR ");
+            let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} t LEFT JOIN {table}_cents c ON c.posting_id=t.id WHERE c.posting_id IS NULL OR {mismatch})");
+            if conn.query_row(&sql,[],|r|r.get::<_,bool>(0))? { return Err(Error::invalid(format!("The {table} posting amounts do not match their cent records."))); }
+        }
+    }
+    Ok(())
 }
 
 /// Describe a candidate backup without touching it (opened read-only).

@@ -117,6 +117,20 @@ pub fn write_table(table: &Table, branding: &Branding, path: &Path) -> Result<()
     }
 }
 
+/// Custom documents retain fractional values and include the editable letterhead.
+pub fn write_custom_table(table: &Table, branding: &Branding, path: &Path) -> Result<()> {
+    if Format::of(path) == Format::Xlsx {
+        return xlsx::report_workbook(table, branding, path, true);
+    }
+    let mut printable = table.clone();
+    for value in printable.rows.iter_mut().flatten() {
+        if let loanmaster_core::reports::Value::Number(n) = value {
+            *value = loanmaster_core::reports::Value::text(n.to_string());
+        }
+    }
+    write_table(&printable, branding, path)
+}
+
 /// Save a statement as a PDF.
 pub fn write_statement_pdf(statement: &Statement, config: &StatementConfig, branding: &Branding, path: &Path) -> Result<()> {
     std::fs::write(path, pdf::statement(statement, config, branding)?)?;

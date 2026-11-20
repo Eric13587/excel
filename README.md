@@ -17,6 +17,16 @@ mass operations. The general ledger and journal repair tools were removed.
 
 *LoanMaster 2.0 Ledger Grid with demo data.*
 
+## Office workflows (feature branch)
+
+- **Reports › Document builder** exports a selected dataset to PDF or Excel. Choose and reorder fields, edit the letterhead, title and subtitle, and toggle the journal logo (the default is `kaswa_n.png`). Member financial overview combines roster, loan and savings balances in one row per member. Transaction datasets retain one row per posting.
+- **Email drafts** open in classic Outlook on Windows or an attachment-capable `xdg-email` client on Linux. The builder attaches the generated document and leaves the recipient for the operator. Under Reports › Statements, select one member with a saved email address for a private statement draft. The operator reviews the attachment and sends from the mail client.
+- **Operations › Payroll and month-end close** accepts three workbook columns with a header, or pasted rows without a header: PF number (text, including any leading zeros), expected deduction and actual deduction. Compare these amounts with journal repayments, savings and Christmas deposits, and benevolent contributions for the month. This comparison assumes those deposits are payroll-funded. The bank remittance must equal deductions, and each posted amount must match payroll before sign-off. Record reasons for differences from expectations. Export the signed close as PDF or Excel. Request reopening and have a different officer approve it to change closed postings.
+- **Operator access** uses the signed-in operating system account. An administrator first registers their own account on the Payroll screen and assigns officers. Unlisted accounts then have reviewer access. Exit payouts with funds require a request and confirmation from another officer. Give staff distinct OS accounts and retain file-share permissions on journals and backups. Access rules apply inside this application.
+- **Tools › Configure secondary backup** saves and verifies a snapshot immediately and on subsequent opens by a writer. Choose a different drive or protected share. Verify backup file checks structure, references and cent records. Secondary copies are retained until your organization removes them.
+- **Schema 14** adds payroll decisions, approvals and integer-cent posting records. Payroll uses integer cents. Existing loan calculations and previous statements continue to use the original columns. Test upgrades using a copy. Use the pre-upgrade backup if returning to the previous Rust release.
+- **Windows distribution** builds installer and portable downloads with checksums for version tags matching `v*.*.*`. CI installs the application and runs its journal self-test before publishing the release.
+
 ## Windows downloads
 
 For LoanMaster 2.0 (Rust), open a successful `main` run in the
@@ -152,5 +162,4 @@ setup.iss         Windows installer (Inno Setup)
 
 - Money is stored as SQLite `REAL` (floats) and rounded to cents as 1.x
   rounded it; integer cents would be the long-term fix.
-- No user accounts or roles — anyone who can open the journal file has full
-  access. Restrict access at the file-share level.
+- Operator roles apply to LoanMaster. Direct access to SQLite and backups is governed by operating system permissions.

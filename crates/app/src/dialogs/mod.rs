@@ -11,6 +11,9 @@ pub mod arrears;
 pub mod columns;
 pub mod confirm;
 pub mod files;
+pub mod designer;
+pub mod payroll;
+pub mod mail;
 pub mod fund;
 pub mod imports;
 pub mod loan;
@@ -54,6 +57,8 @@ dialogs! {
     SuspendSavings(fund::SuspendSavings),
     FundReport(reports::FundReport),
     LoanReport(reports::LoanReport),
+    Designer(designer::Designer),
+    Payroll(payroll::Payroll),
     MembersList(reports::MembersList),
     Statements(statements::Statements),
     Settings(settings::SettingsForm),
@@ -87,6 +92,8 @@ impl Dialog {
             Dialog::SuspendSavings(d) => d.show(ctx, journal, actions),
             Dialog::FundReport(d) => d.show(ctx, journal, actions),
             Dialog::LoanReport(d) => d.show(ctx, journal, actions),
+            Dialog::Payroll(d) => d.show(ctx,journal,actions),
+            Dialog::Designer(d) => d.show(ctx, journal, actions),
             Dialog::MembersList(d) => d.show(ctx, journal, actions),
             Dialog::Statements(d) => d.show(ctx, journal, actions),
             Dialog::Settings(d) => d.show(ctx, actions),

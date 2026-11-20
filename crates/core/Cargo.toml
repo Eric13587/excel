@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tempfile = "3.27.0"
 calamine = { version = "0.36.1", features = ["dates"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 log = "0.4.34"
@@ -19,7 +20,7 @@ thiserror = "2.0.21"
 [dev-dependencies]
 rust_xlsxwriter = "0.99.1"
 serde_json = "1.0.151"
-tempfile = "3.27.0"
+
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

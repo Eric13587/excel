@@ -85,7 +85,7 @@ impl Audit<'_> {
     /// Entries, most recent first, optionally for one entity.
     pub fn recent(&self, limit: i64, entity: Option<(&str, i64)>) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.0.prepare(
-            "SELECT ts, operation, entity, entity_id, summary, before_image FROM audit_log \
+            "SELECT ts, operation, entity, entity_id, CASE WHEN operator IS NULL THEN summary ELSE operator || ' · ' || coalesce(summary,'') END AS summary, before_image FROM audit_log \
              WHERE (?1 IS NULL OR (entity=?1 AND entity_id=?2)) ORDER BY id DESC LIMIT ?3",
         )?;
         let (name, id) = entity.map(|(n, i)| (Some(n), Some(i))).unwrap_or((None, None));
@@ -96,7 +96,7 @@ impl Audit<'_> {
     /// the fact, and what it said before.
     pub fn money_changes(&self, limit: i64, since: Option<&str>) -> Result<Vec<AuditEntry>> {
         let mut stmt = self.0.prepare(
-            "SELECT ts, operation, entity, entity_id, summary, before_image FROM audit_log \
+            "SELECT ts, operation, entity, entity_id, CASE WHEN operator IS NULL THEN summary ELSE operator || ' · ' || coalesce(summary,'') END AS summary, before_image FROM audit_log \
              WHERE entity IN ('ledger','savings','christmas_savings','benevolent_ledger') \
              AND (?1 IS NULL OR ts >= ?1) ORDER BY id DESC LIMIT ?2",
         )?;

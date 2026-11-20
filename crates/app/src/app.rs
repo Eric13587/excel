@@ -214,11 +214,18 @@ impl LoanMasterApp {
                 if ui.button("Members List (Excel / PDF)…").clicked() {
                     actions.push(Action::dialog(MembersList::default()));
                 }
+                if ui.button("Document builder…").clicked() { actions.push(Action::dialog(crate::dialogs::designer::Designer::new(journal))); }
                 if ui.button("Statements…").on_hover_text("Generate member statements as PDF or Excel").clicked() {
                     actions.push(Action::dialog(Statements::new(journal)));
                 }
             });
             ui.menu_button("Operations", |ui| {
+                if ui.button("Payroll and month-end close…").clicked() {
+                    match crate::dialogs::payroll::Payroll::new(&ws.journal) {
+                        Ok(d)=>actions.push(Action::dialog(d)),
+                        Err(e)=>actions.push(Action::Notice(Notice::from_error("Payroll",&e)))
+                    }
+                }
                 if ui.add(egui::Button::new("Ledger Grid (bulk edit)…").shortcut_text("Ctrl+G")).clicked() {
                     actions.push(Action::OpenGrid);
                 }
@@ -230,6 +237,35 @@ impl LoanMasterApp {
                 ui.separator();
                 if ui.button("Activity Log…").clicked() {
                     actions.push(Action::dialog(ActivityLog::default()));
+                }
+                if ui.button("Configure secondary backup…").clicked()
+                    && let Some(dir) = crate::dialogs::files::folder("Choose a second backup location") {
+                    let result = ws.journal.secondary_backup(&dir).and_then(|path| {
+                        ws.journal.settings().set("secondary_backup_dir",&dir.to_string_lossy())?;
+                        Ok(path)
+                    });
+                    actions.push(Action::Notice(match result {
+                        Ok(path)=>Notice::info("Backup verified",path.display().to_string()),
+                        Err(e)=>Notice::from_error("Backup failed",&e)
+                    }));
+                }
+                if ui.button("Verify backup file…").clicked()
+                    && let Some(path)=crate::dialogs::files::pick("Verify journal backup",&[("Journal",&["db"])]) {
+                    let result=loanmaster_core::db::backups::verify_secondary(&path);
+                    actions.push(Action::Notice(match result {
+                        Ok(())=>Notice::info("Backup verified",path.display().to_string()),
+                        Err(e)=>Notice::from_error("Backup verification failed",&e)
+                    }));
+                }
+                if ui.button("Disable secondary backups").clicked() {
+                    match ws.journal.settings().set("secondary_backup_dir","") {
+                        Ok(())=>actions.push(Action::Status("Secondary backups disabled.".into())),
+                        Err(e)=>actions.push(Action::Notice(Notice::from_error("Backup settings",&e)))
+                    }
+                }
+                if ui.button("Secondary backup status…").clicked() {
+                    let last = ws.journal.settings().get("last_secondary_backup").unwrap_or_default();
+                    actions.push(Action::Notice(Notice::info("Last verified backup",if last.is_empty() {"No secondary backup recorded.".into()} else {last})));
                 }
                 if ui.button("Restore From Backup…").clicked() {
                     match ws.unsaved() {

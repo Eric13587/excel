@@ -21,3 +21,5 @@ pub mod undo;
 
 pub use db::{Journal, OpenOptions, OpenReport};
 pub use error::{Error, OLDEST_SCHEMA_VERSION, Result, SCHEMA_VERSION};
+pub mod documents;
+pub mod office;

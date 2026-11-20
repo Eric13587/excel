@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "feature/professional-workflows" ]
+    tags: [ "v*.*.*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -87,3 +88,33 @@ jobs:
       with:
         name: LoanMaster-Installer
         path: build/LoanMasterSetup.exe
+
+    - name: Test installed application and journal engine
+      shell: pwsh
+      run: |
+        $dir = Join-Path $env:RUNNER_TEMP 'InstalledLoanMaster'
+        $installer = Start-Process build/LoanMasterSetup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$dir`"" -Wait -PassThru
+        if ($installer.ExitCode) { throw 'Installation failed' }
+        $app = Start-Process "$dir/LoanMaster.exe" -ArgumentList '--journal-self-test' -Wait -PassThru
+        if ($app.ExitCode) { throw 'Installed journal self-test failed' }
+
+  release:
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v7
+      with:
+        path: artifacts
+    - name: Publish versioned Windows downloads
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.ref_name }}
+      run: |
+        set -eu
+        cp artifacts/LoanMaster-Installer/LoanMasterSetup.exe "LoanMaster-Setup-$TAG.exe"
+        cp artifacts/LoanMaster-Portable/LoanMaster.exe "LoanMaster-Portable-$TAG.exe"
+        sha256sum "LoanMaster-Setup-$TAG.exe" "LoanMaster-Portable-$TAG.exe" > SHA256SUMS.txt
+        gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "LoanMaster-Setup-$TAG.exe" "LoanMaster-Portable-$TAG.exe" SHA256SUMS.txt

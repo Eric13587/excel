@@ -21,6 +21,7 @@ struct Person {
     id: i64,
     name: String,
     phone: String,
+    email: String,
     retired: bool,
 }
 
@@ -50,6 +51,7 @@ pub struct Statements {
     loan_columns: Columns,
     savings_columns: Columns,
     excel: bool,
+    email: bool,
 }
 
 impl Statements {
@@ -59,7 +61,7 @@ impl Statements {
             .all()
             .unwrap_or_default()
             .into_iter()
-            .map(|m| Person { id: m.id, retired: !m.is_active(), name: m.name, phone: m.phone })
+            .map(|m| Person { id: m.id, retired: !m.is_active(), name: m.name, phone: m.phone, email: m.email })
             .collect();
         let today = chrono::Local::now().date_naive();
         let this_month = today.with_day(1).unwrap_or(today);
@@ -79,6 +81,7 @@ impl Statements {
             loan_columns: Columns::named(&names(&LOAN_COLUMNS)),
             savings_columns: Columns::named(&names(&SAVINGS_COLUMNS)),
             excel: false,
+            email: false,
         }
     }
 
@@ -118,6 +121,40 @@ impl Statements {
         if self.period == Period::Dates && self.to < self.from {
             actions.push(Action::Notice(Notice::info("Statements", "The period ends before it starts.")));
             return false;
+        }
+        if self.email {
+            let selected = self.people.iter().filter(|p| self.chosen.contains(&p.id)).collect::<Vec<_>>();
+            let [person] = selected.as_slice() else {
+                actions.push(Action::Notice(Notice::info("Email statement","Select one member to compose their private statement email.")));
+                return false;
+            };
+            if person.email.trim().is_empty() {
+                actions.push(Action::Notice(Notice::info("Email statement","Add an email address to this member's record first.")));
+                return false;
+            }
+            let config = self.config();
+            let (from, to) = self.span(journal,person.id);
+            let statement = match statements::prepare(journal,person.id,&dates::format(from),&dates::format(to),&config) {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => { actions.push(Action::Notice(Notice::info("Email statement","No transactions for this period."))); return false; }
+                Err(e) => { actions.push(Action::Notice(Notice::from_error("Statement preparation failed",&e))); return false; }
+            };
+            let ext = if self.excel {"xlsx"} else {"pdf"};
+            let Some(path) = super::files::save_as("Save email attachment",&format!("Statement-{}-{to}.{ext}",person.id),&[("Statement",ext)]) else {return false};
+            let branding = Branding::of(journal);
+            let recipient = person.email.trim().to_owned();
+            let subject = format!("Member statement, {from} to {to}");
+            let excel=self.excel;
+            let task=Task::spawn(ctx,"Preparing statement email",move |_|{
+                let result=if excel {loanmaster_reports::write_statement_xlsx(&statement,&config,&branding,&path)}
+                    else {loanmaster_reports::write_statement_pdf(&statement,&config,&branding,&path)};
+                Box::new(move |actions: &mut Vec<Action>| match result {
+                    Ok(())=>super::mail::draft(actions,&recipient,&subject,&path),
+                    Err(e)=>actions.push(Action::Notice(Notice::warning("Statement export failed",e.to_string())))
+                })
+            });
+            actions.push(Action::Task(Box::new(task)));
+            return true;
         }
         let Some(folder) = super::files::folder("Select Folder to Save Statements") else { return false };
         let config = self.config();
@@ -247,6 +284,7 @@ impl Statements {
                     close = true;
                 }
                 ui.add_space(12.0);
+                ui.checkbox(&mut self.email,"Email draft");
                 ui.radio_value(&mut self.excel, true, "Excel");
                 ui.radio_value(&mut self.excel, false, "PDF");
                 ui.label("Save as");

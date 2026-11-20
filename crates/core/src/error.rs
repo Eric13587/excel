@@ -5,7 +5,7 @@
 //! is. Only `Db` and `Io` are failures of the machine rather than of the input.
 
 /// The version of the journal schema this application reads and writes.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 /// The oldest journal it opens: 1.x's last version, which it brings up to
 /// [`SCHEMA_VERSION`] on opening.
 pub const OLDEST_SCHEMA_VERSION: i64 = 12;

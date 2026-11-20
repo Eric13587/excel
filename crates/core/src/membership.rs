@@ -162,6 +162,7 @@ impl Payout {
 /// on the day they left. Refused when either fund has entries dated later: a
 /// withdrawal before them would run the balance below zero in between.
 fn pay_out(journal: &Journal, id: i64, status: &str, date: &str) -> Result<Payout> {
+    crate::office::approve_payout(journal,id,status,date)?;
     for fund in PAID_OUT {
         let latest = journal.funds().rows(fund, id, None, None)?.iter().map(|r| dates::date_part(&r.date).to_string()).max();
         if let Some(latest) = latest.filter(|latest| latest.as_str() > date) {

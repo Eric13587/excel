@@ -59,6 +59,12 @@ fn main() -> eframe::Result {
         println!("LoanMaster {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::args_os().nth(1).is_some_and(|arg| arg == "--journal-self-test") {
+        if loanmaster_core::Journal::open_in_memory().and_then(|j| j.members().all()).is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let log_file = logging::init();
     logging::install_panic_hook();
     log::info!("LoanMaster {} starting; log at {}", env!("CARGO_PKG_VERSION"), log_file.display());

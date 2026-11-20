@@ -38,19 +38,30 @@ fn write_value(sheet: &mut Worksheet, row: u32, column: u16, value: &Value, text
 
 /// A report as a one-sheet workbook.
 pub fn write_table(table: &Table, branding: &Branding, path: &Path) -> Result<()> {
+    report_workbook(table, branding, path, false)
+}
+
+pub fn report_workbook(table: &Table, branding: &Branding, path: &Path, custom: bool) -> Result<()> {
     let mut workbook = Workbook::new();
     let sheet = workbook.add_worksheet();
     let name: String = table.sheet.chars().filter(|c| !"[]:*?/\\".contains(*c)).take(31).collect();
     sheet.set_name(if name.is_empty() { "Report" } else { &name })?;
 
     let header = Format::new().set_bold().set_border(FormatBorder::Thin).set_background_color(color(&branding.header_bg, HEADER));
-    let number = Format::new().set_num_format(WHOLE);
+    let start = if custom {
+        let first = u16::from(letterhead_logo(sheet, branding));
+        for (row, label) in [&branding.org_name, &table.title, &table.subtitle].iter().enumerate() {
+            sheet.write_string_with_format(row as u32, first, label.as_str(), &Format::new().set_bold())?;
+        }
+        4
+    } else { 0 };
+    let number = Format::new().set_num_format(if custom { "#,##0.00####" } else { WHOLE });
     let plain = Format::new();
     let total_text = Format::new().set_bold().set_border(FormatBorder::Thin).set_background_color(color(&branding.total_bg, TOTAL));
     let total_number = total_text.clone().set_num_format(WHOLE);
 
     for (i, title) in table.columns.iter().enumerate() {
-        sheet.write_string_with_format(0, col(i), title, &header)?;
+        sheet.write_string_with_format(start, col(i), title, &header)?;
         let width = match title.as_str() {
             "Name" | "Member" => 26.0,
             "Employment Status" => 18.0,
@@ -61,11 +72,11 @@ pub fn write_table(table: &Table, branding: &Branding, path: &Path) -> Result<()
     }
     for (r, row) in table.rows.iter().enumerate() {
         for (i, value) in row.iter().enumerate() {
-            write_value(sheet, r as u32 + 1, col(i), value, &plain, &number)?;
+            write_value(sheet, start + r as u32 + 1, col(i), value, &plain, &number)?;
         }
     }
     if let Some(total) = &table.total {
-        let at = table.rows.len() as u32 + 1;
+        let at = start + table.rows.len() as u32 + 1;
         for (i, value) in total.iter().enumerate() {
             write_value(sheet, at, col(i), value, &total_text, &total_number)?;
         }

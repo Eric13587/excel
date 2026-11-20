@@ -44,8 +44,9 @@ const SCHEMA: &str = include_str!("../schema.sql");
 /// Each only adds a table 1.x never reads, and is recorded in
 /// `schema_migrations` as 1.x records its own; 1.x passes over versions it
 /// does not know.
-const UPGRADES: [(i64, &str, &str); 1] =
-    [(13, "savings_suspensions", include_str!("../upgrades/013_savings_suspensions.sql"))];
+const UPGRADES: [(i64, &str, &str); 2] =
+    [(13, "savings_suspensions", include_str!("../upgrades/013_savings_suspensions.sql")),
+     (14, "office", include_str!("../upgrades/014_office.sql"))];
 
 /// How many dated on-open backups to keep per journal.
 pub const BACKUP_KEEP_COUNT: usize = 10;

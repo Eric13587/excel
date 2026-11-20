@@ -62,8 +62,17 @@ impl Workspace {
     /// about the file.
     pub fn open(path: &Path) -> Result<(Workspace, Vec<Notice>)> {
         let journal = Journal::open(path, OpenOptions { backup_on_open: true })?;
+        let user = loanmaster_core::office::principal()?;
+        loanmaster_core::office::session(&journal,&user)?;
+        let reviewer = loanmaster_core::office::role(&journal,&user)? == "reviewer";
         let report = journal.report().clone();
         let mut notices = Vec::new();
+        if !reviewer && !report.created && report.integrity_ok {
+            let dir = journal.settings().get("secondary_backup_dir")?;
+            if !dir.is_empty() && let Err(e) = journal.secondary_backup(Path::new(&dir)) {
+                notices.push(Notice::warning("Secondary backup failed",format!("{dir}: {e}")));
+            }
+        }
         if !report.integrity_ok {
             notices.push(Notice::warning(
                 "This journal file is damaged",
@@ -85,8 +94,8 @@ impl Workspace {
         } else if report.upgraded_from.is_some() {
             let backup = if report.backup.is_some() { " The backup taken on opening holds it as it was." } else { "" };
             workspace.status = Some(format!(
-                "This journal was brought up to date: it can now record savings suspensions, and still opens in \
-                 LoanMaster 1.x.{backup}"
+                "This journal was brought up to date with payroll, period close and operator records. \
+                 {backup}"
             ));
         }
         Ok((workspace, notices))
